@@ -655,6 +655,28 @@ NATIVE_CONTRACT_DESCRIPTOR = BackendDescriptor(
 )
 
 
+# Nemotron-H and MiMo run the one-step MTP contract: their mtp_forward
+# rejects mtp_depth > 1 outright (mtplx/nemotron_h_mtp_patch.py,
+# mtplx/mimo_mtp_patch.py). The depth control every surface renders from
+# draft_semantics must not offer D2/D3 the backend will refuse, and the
+# server default must not resolve to a depth that raises (issue #341).
+# Distinct backend_id: serve startup rewrites args.backend_id to the
+# resolved descriptor's id, and that id must round-trip through
+# descriptor_for_backend_id without laundering the cap away.
+NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR = replace(
+    NATIVE_CONTRACT_DESCRIPTOR,
+    backend_id="native_mtp_single_step",
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=1,
+        minimum=1,
+        maximum=1,
+        unit="depth",
+    ),
+)
+
+
 STEP3P5_MTP_DESCRIPTOR = BackendDescriptor(
     backend_id="step3p5_mtp",
     architecture_id="step3p5-mtp",
@@ -922,8 +944,11 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
     HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
-    "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
-    "nemotron_h_mtp": NATIVE_CONTRACT_DESCRIPTOR,
+    NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR.backend_id: (
+        NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR
+    ),
+    "mimo_mtp": NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR,
+    "nemotron_h_mtp": NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR,
 }
 
 

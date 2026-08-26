@@ -1415,6 +1415,48 @@ def test_nemotron_h_mtp_with_family_sidecar_is_runnable_without_contract(tmp_pat
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
+def test_nemotron_h_mtp_official_block_type_list_config_is_runnable(tmp_path):
+    """Official NVIDIA configs carry mtp_layers_block_type, not
+    mtp_hybrid_override_pattern; the derived pattern must match the runtime
+    routing gate or inspect and serve disagree (issue #341)."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                # Backbone pattern (M/- chars) must not shadow the MTP stack.
+                "hybrid_override_pattern": "M-M-M*-M-M-M*-E",
+                "mtp_layers_block_type": ["attention", "moe"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "mtp.layers.0.enorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.hnorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.eh_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.mixer.q_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.mixer.gate.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.final_layernorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "mtp.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp_pattern == "*E"
+    assert result.compatibility["arch_id"] == "nemotron-h-mtp"
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
 def test_nemotron_h_mtp_rejects_unsupported_mtp_pattern(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(

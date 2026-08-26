@@ -35,9 +35,18 @@ def _mtp_pattern(config: dict[str, Any]) -> str:
     raw = (
         tcfg.get("mtp_hybrid_override_pattern")
         or config.get("mtp_hybrid_override_pattern")
+        # Official NVIDIA Nemotron-H configs (e.g. Nemotron-3.5-Lightning)
+        # describe the MTP stack as a block-type name list, not a pattern
+        # string; consult it before the backbone-wide fallback keys so the
+        # backbone pattern (which carries M/- chars) cannot shadow the MTP
+        # stack (issue #341).
+        or tcfg.get("mtp_layers_block_type")
+        or config.get("mtp_layers_block_type")
         or tcfg.get("hybrid_override_pattern")
         or config.get("hybrid_override_pattern")
     )
+    # Same table as mlx_lm.models.nemotron_h.ModelArgs._block_type_to_char --
+    # the convention the injected blocks are built against.
     mapping = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
     if isinstance(raw, str):
         if "," in raw:

@@ -2121,6 +2121,30 @@ def test_step_descriptor_is_experimental_and_not_qwen_tune():
     )
 
 
+def test_single_step_mtp_backends_offer_depth_one_only():
+    """Nemotron-H and MiMo mtp_forward reject mtp_depth > 1, so the depth
+    control must not offer D2/D3 and the default must not resolve to a
+    depth the backend refuses (issue #341)."""
+
+    for backend_id in ("nemotron_h_mtp", "mimo_mtp"):
+        descriptor = openai.descriptor_for_backend_id(backend_id)
+        controls = openai.model_controls_for_descriptor(descriptor)
+
+        assert controls["draft_control"]["default"] == 1
+        assert controls["draft_control"]["minimum"] == 1
+        assert controls["draft_control"]["maximum"] == 1
+        assert controls["draft_control"]["value_labels"] == ["D1"]
+        # Serve startup rewrites args.backend_id to the resolved
+        # descriptor's id; the cap must survive that round-trip.
+        round_trip = openai.descriptor_for_backend_id(descriptor.backend_id)
+        assert round_trip.draft_semantics.maximum == 1
+        assert round_trip.draft_semantics.default == 1
+
+    # The generic native-contract lane keeps its multi-step range.
+    generic = openai.descriptor_for_backend_id("native_mtp")
+    assert generic.draft_semantics.maximum == 3
+
+
 def test_step_backend_chat_policy_injects_language_anchor():
     state = _fake_state()
     state.backend_descriptor = openai.descriptor_for_backend_id("step3p5_mtp")
