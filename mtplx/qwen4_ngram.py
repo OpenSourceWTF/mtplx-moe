@@ -25,9 +25,11 @@ import tempfile
 import threading
 import unicodedata
 from bisect import bisect_right
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal, Self
 
 try:
@@ -63,6 +65,22 @@ _STORAGES = frozenset(("bf16", "affine-q4-g32"))
 
 class NGramManifestError(ValueError):
     """Raised when n-gram provenance, layout, or integrity is invalid."""
+
+
+class NGramCacheError(RuntimeError):
+    """Base error for the fixed exact-row cache."""
+
+
+class NGramCacheClosed(NGramCacheError):
+    """Raised when a cache or lease is no longer usable."""
+
+
+class NGramCacheFull(NGramCacheError):
+    """Raised when a complete request cannot be reserved atomically."""
+
+
+class NGramCacheIOError(NGramCacheError):
+    """Raised when an exact descriptor-relative read fails."""
 
 
 def _exact_int(value: Any, *, label: str, minimum: int = 0) -> int:
@@ -1254,14 +1272,653 @@ def verify_ngram_manifest(
             raise cleanup_error
 
 
+@dataclass(frozen=True)
+class NGramCacheConfig:
+    """Construction-time resource and eviction policy for exact row streaming."""
+
+    cache_limit_bytes: int
+    transient_limit_bytes: int
+    max_inflight_io_bytes: int
+    max_open_files: int
+    bypass_page_cache: bool
+    eviction: Literal["lru", "frequency"]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "cache_limit_bytes",
+            "transient_limit_bytes",
+            "max_inflight_io_bytes",
+            "max_open_files",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an exact integer")
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+        if type(self.bypass_page_cache) is not bool:
+            raise TypeError("bypass_page_cache must be an exact boolean")
+        if type(self.eviction) is not str or self.eviction not in {
+            "lru",
+            "frequency",
+        }:
+            raise ValueError("eviction must be 'lru' or 'frequency'")
+
+
+@dataclass(frozen=True)
+class SlotTicket:
+    """Generation-qualified ownership of one fixed cache slot."""
+
+    slot: int
+    generation: int
+
+
+@dataclass
+class _CacheSlot:
+    generation: int = 0
+    row: int | None = None
+    pins: int = 0
+    loaded: bool = False
+    frequency: int = 0
+    last_access: int = 0
+
+
+@dataclass
+class _CacheRoute:
+    ticket: SlotTicket
+    future: Future[None] | None = None
+
+
+class _DescriptorReader:
+    """The production descriptor reader selected once during construction."""
+
+    __slots__ = ("_read_impl",)
+
+    def __init__(self, bypass_page_cache: bool) -> None:
+        if bypass_page_cache:
+            if fcntl is None or type(getattr(fcntl, "F_NOCACHE", None)) is not int:
+                raise ValueError(
+                    "bypass_page_cache requires Darwin fcntl.F_NOCACHE support"
+                )
+            command = fcntl.F_NOCACHE
+
+            # Capture the descriptor lookup in the selected lane, not the
+            # common dispatch below.
+            def selected(
+                shard: VerifiedNGramShard, offset: int, length: int
+            ) -> bytes:
+                descriptor = shard.fileno()
+                payload = shard.pread(offset, length)
+                fcntl.fcntl(descriptor, command, 1)
+                return payload
+
+            self._read_impl = selected
+        else:
+            self._read_impl = VerifiedNGramShard.pread
+
+    def read(
+        self,
+        shard: VerifiedNGramShard,
+        offset: int,
+        length: int,
+        *,
+        bypass_page_cache: bool,
+    ) -> bytes:
+        del bypass_page_cache
+        return self._read_impl(shard, offset, length)
+
+
+class NGramLease:
+    """Pinned, generation-qualified access to exact packed row bytes."""
+
+    __slots__ = ("_cache", "_released", "_tickets", "slot_ids")
+
+    def __init__(self, cache: NGramRowCache, tickets: tuple[SlotTicket, ...]) -> None:
+        self._cache = cache
+        self._tickets = tickets
+        self.slot_ids = tuple(ticket.slot for ticket in tickets)
+        self._released = False
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def row_bytes(self, index: int) -> bytes:
+        if type(index) is not int:
+            raise TypeError("row index must be an exact integer")
+        if not 0 <= index < len(self._tickets):
+            raise IndexError("row index is out of range")
+        return self._cache._lease_row_bytes(self, self._tickets[index])
+
+    def release(self) -> None:
+        self._cache._release_lease(self)
+
+    def __enter__(self) -> Self:
+        if self._released:
+            raise NGramCacheClosed("n-gram lease has been released")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.release()
+
+
+class NGramAcquireFuture:
+    """A cancellable acquisition whose workers publish through slot tickets."""
+
+    __slots__ = (
+        "_cache",
+        "_cancelled",
+        "_failed",
+        "_futures",
+        "_lease",
+        "_result_lock",
+        "_tickets",
+        "_unique_tickets",
+    )
+
+    def __init__(
+        self,
+        cache: NGramRowCache,
+        tickets: tuple[SlotTicket, ...],
+        futures: tuple[Future[None], ...],
+    ) -> None:
+        self._cache = cache
+        self._tickets = tickets
+        self._unique_tickets = tuple(dict.fromkeys(tickets))
+        self._futures = futures
+        self._cancelled = False
+        self._failed = False
+        self._lease: NGramLease | None = None
+        self._result_lock = threading.Lock()
+
+    def cancel(self) -> bool:
+        return self._cache._cancel_request(self)
+
+    def cancelled(self) -> bool:
+        with self._cache._lock:
+            return self._cancelled
+
+    def done(self) -> bool:
+        with self._cache._lock:
+            if self._cancelled or self._failed or self._lease is not None:
+                return True
+        return all(future.done() for future in self._futures)
+
+    def result(self, timeout: float | None = None) -> NGramLease:
+        with self._result_lock:
+            with self._cache._lock:
+                if self._cancelled:
+                    raise CancelledError()
+                if self._lease is not None:
+                    return self._lease
+            deadline = None if timeout is None else monotonic() + timeout
+            try:
+                for future in self._futures:
+                    remaining = None if deadline is None else max(0.0, deadline - monotonic())
+                    future.result(timeout=remaining)
+            except TimeoutError:
+                raise
+            except CancelledError:
+                self._cache._fail_request(self)
+                raise
+            except Exception as exc:
+                self._cache._fail_request(self)
+                if isinstance(exc, NGramCacheIOError):
+                    raise
+                raise NGramCacheIOError(f"n-gram row acquisition failed: {exc}") from exc
+            return self._cache._finish_request(self)
+
+
+class NGramRowCache:
+    """Fixed-byte cache backed by retained descriptors owned by the caller."""
+
+    def __init__(
+        self,
+        artifact: VerifiedNGramArtifact,
+        config: NGramCacheConfig,
+        *,
+        reader: Any | None = None,
+        allocator: Callable[[int], Any] | None = None,
+    ) -> None:
+        if type(artifact) is not VerifiedNGramArtifact:
+            raise TypeError("artifact must be an exact VerifiedNGramArtifact")
+        if type(config) is not NGramCacheConfig:
+            raise TypeError("config must be an exact NGramCacheConfig")
+        if artifact.closed:
+            raise NGramCacheClosed("verified n-gram artifact is closed")
+        manifest = artifact.manifest
+        row_bytes = manifest.row_bytes
+        if config.cache_limit_bytes % row_bytes:
+            raise ValueError("cache_limit_bytes must be an exact multiple of row_bytes")
+        if config.transient_limit_bytes < row_bytes:
+            raise ValueError("transient_limit_bytes must hold at least one row")
+        if config.max_inflight_io_bytes < row_bytes:
+            raise ValueError("max_inflight_io_bytes must hold at least one row")
+        if config.max_open_files < len(artifact.shards):
+            raise ValueError(
+                "max_open_files is smaller than the retained verified shard set"
+            )
+        selected_allocator = bytearray if allocator is None else allocator
+        arena_object = selected_allocator(config.cache_limit_bytes)
+        try:
+            arena = memoryview(arena_object).cast("B")
+        except (TypeError, ValueError) as exc:
+            raise TypeError("allocator must return a writable byte-addressable arena") from exc
+        if arena.readonly:
+            raise TypeError("allocator returned a read-only arena")
+        if arena.nbytes != config.cache_limit_bytes:
+            raise ValueError("allocator returned an arena with the wrong byte size")
+
+        self.artifact = artifact
+        self.manifest = manifest
+        self.config = config
+        self._row_bytes = row_bytes
+        self._arena_object = arena_object
+        self._arena = arena
+        self._slots = [
+            _CacheSlot() for _ in range(config.cache_limit_bytes // row_bytes)
+        ]
+        self._routes: dict[int, _CacheRoute] = {}
+        self._shard_indexes = {
+            verified.shard.name: index
+            for index, verified in enumerate(artifact.shards)
+        }
+        if len(self._shard_indexes) != len(artifact.shards):
+            raise ValueError("verified artifact contains duplicate shard names")
+        self._reader = reader if reader is not None else _DescriptorReader(
+            config.bypass_page_cache
+        )
+        if not callable(getattr(self._reader, "read", None)):
+            raise TypeError("reader must provide a callable read method")
+        self._select_victims = (
+            self._lru_victims
+            if config.eviction == "lru"
+            else self._frequency_victims
+        )
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, min(config.max_open_files, len(artifact.shards))),
+            thread_name_prefix="qwen4-ngram",
+        )
+        self._worker_futures: set[Future[None]] = set()
+        self._pending: set[NGramAcquireFuture] = set()
+        self._leases: set[NGramLease] = set()
+        self._inflight_bytes = 0
+        self._transient_bytes = 0
+        self._tick = 0
+        self._closed = False
+        self._accepting = True
+
+    @property
+    def arena_bytes(self) -> int:
+        return self._arena.nbytes
+
+    @property
+    def inflight_bytes(self) -> int:
+        with self._lock:
+            return self._inflight_bytes
+
+    @property
+    def transient_bytes(self) -> int:
+        with self._lock:
+            return self._transient_bytes
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def _lru_victims(self, candidates: list[int]) -> list[int]:
+        return sorted(candidates, key=lambda slot: self._slots[slot].last_access)
+
+    def _frequency_victims(self, candidates: list[int]) -> list[int]:
+        return sorted(
+            candidates,
+            key=lambda slot: (
+                self._slots[slot].frequency,
+                self._slots[slot].last_access,
+            ),
+        )
+
+    def _touch(self, slot: _CacheSlot) -> None:
+        self._tick += 1
+        slot.last_access = self._tick
+        slot.frequency += 1
+
+    def _invalidate_ticket(self, ticket: SlotTicket) -> None:
+        slot = self._slots[ticket.slot]
+        if slot.generation != ticket.generation:
+            return
+        if slot.row is not None:
+            route = self._routes.get(slot.row)
+            if route is not None and route.ticket == ticket:
+                del self._routes[slot.row]
+        slot.generation += 1
+        slot.row = None
+        slot.pins = 0
+        slot.loaded = False
+        slot.frequency = 0
+        slot.last_access = 0
+
+    def _release_ticket_pin(self, ticket: SlotTicket, *, cancel_loading: bool) -> None:
+        slot = self._slots[ticket.slot]
+        if slot.generation != ticket.generation or slot.pins == 0:
+            return
+        slot.pins -= 1
+        if cancel_loading and slot.pins == 0 and not slot.loaded:
+            self._invalidate_ticket(ticket)
+
+    def _read_publish(
+        self,
+        shard_index: int,
+        offset: int,
+        length: int,
+        rows: tuple[tuple[int, SlotTicket], ...],
+    ) -> None:
+        shard = self.artifact.shards[shard_index]
+        try:
+            payload = self._reader.read(
+                shard,
+                offset,
+                length,
+                bypass_page_cache=self.config.bypass_page_cache,
+            )
+            if type(payload) is not bytes or len(payload) != length:
+                raise NGramCacheIOError(
+                    f"short n-gram read: expected {length} bytes, got "
+                    f"{len(payload) if isinstance(payload, bytes) else 'non-bytes'}"
+                )
+            with self._lock:
+                for index, (row, ticket) in enumerate(rows):
+                    slot = self._slots[ticket.slot]
+                    route = self._routes.get(row)
+                    if (
+                        slot.generation != ticket.generation
+                        or slot.row != row
+                        or route is None
+                        or route.ticket != ticket
+                    ):
+                        continue
+                    start = ticket.slot * self._row_bytes
+                    source = index * self._row_bytes
+                    self._arena[start : start + self._row_bytes] = payload[
+                        source : source + self._row_bytes
+                    ]
+                    slot.loaded = True
+        except NGramCacheIOError:
+            with self._lock:
+                for _row, ticket in rows:
+                    self._invalidate_ticket(ticket)
+            raise
+        except Exception as exc:
+            with self._lock:
+                for _row, ticket in rows:
+                    self._invalidate_ticket(ticket)
+            raise NGramCacheIOError(
+                f"descriptor-relative n-gram read failed: {exc}"
+            ) from exc
+        finally:
+            with self._lock:
+                self._inflight_bytes -= length
+                self._transient_bytes -= length
+
+    def _discard_worker(self, future: Future[None]) -> None:
+        with self._lock:
+            self._worker_futures.discard(future)
+
+    def _groups(
+        self, misses: tuple[tuple[int, SlotTicket], ...]
+    ) -> tuple[tuple[int, int, int, tuple[tuple[int, SlotTicket], ...]], ...]:
+        located: list[tuple[int, int, int, SlotTicket]] = []
+        for row, ticket in misses:
+            shard, offset = self.manifest.locate_row(row)
+            try:
+                shard_index = self._shard_indexes[shard.name]
+            except KeyError as exc:  # construction should make this unreachable
+                raise NGramCacheIOError(
+                    f"verified descriptor missing for shard {shard.name}"
+                ) from exc
+            located.append((shard_index, offset, row, ticket))
+        located.sort(key=lambda item: (item[0], item[1]))
+        groups: list[tuple[int, int, int, tuple[tuple[int, SlotTicket], ...]]] = []
+        for shard_index, offset, row, ticket in located:
+            if groups:
+                last_shard, last_offset, last_length, last_rows = groups[-1]
+                if shard_index == last_shard and offset == last_offset + last_length:
+                    groups[-1] = (
+                        last_shard,
+                        last_offset,
+                        last_length + self._row_bytes,
+                        last_rows + ((row, ticket),),
+                    )
+                    continue
+            groups.append((shard_index, offset, self._row_bytes, ((row, ticket),)))
+        return tuple(groups)
+
+    def acquire_rows_async(self, row_ids: Sequence[int]) -> NGramAcquireFuture:
+        if not isinstance(row_ids, Sequence):
+            raise TypeError("row_ids must be a sequence")
+        rows = tuple(row_ids)
+        for row in rows:
+            if type(row) is not int:
+                raise TypeError("row_ids must contain exact integers")
+            if not 0 <= row < self.manifest.padded_rows:
+                raise IndexError(f"n-gram row {row} is out of range")
+        unique_rows = tuple(dict.fromkeys(rows))
+        with self._lock:
+            if self._closed or not self._accepting:
+                raise NGramCacheClosed("n-gram row cache is not accepting requests")
+            missing = tuple(row for row in unique_rows if row not in self._routes)
+            miss_bytes = len(missing) * self._row_bytes
+            if (
+                self._transient_bytes + miss_bytes
+                > self.config.transient_limit_bytes
+                or self._inflight_bytes + miss_bytes
+                > self.config.max_inflight_io_bytes
+            ):
+                raise NGramCacheFull("complete n-gram miss set exceeds I/O budgets")
+
+            free = [index for index, slot in enumerate(self._slots) if slot.row is None]
+            victims = [
+                index
+                for index, slot in enumerate(self._slots)
+                if slot.row is not None and slot.pins == 0
+            ]
+            selected = free + self._select_victims(victims)
+            if len(selected) < len(missing):
+                raise NGramCacheFull("no unpinned slots for complete n-gram miss set")
+            selected = selected[: len(missing)]
+
+            existing_tickets: dict[int, SlotTicket] = {}
+            for row in unique_rows:
+                route = self._routes.get(row)
+                if route is None:
+                    continue
+                slot = self._slots[route.ticket.slot]
+                slot.pins += 1
+                self._touch(slot)
+                existing_tickets[row] = route.ticket
+
+            new_tickets: dict[int, SlotTicket] = {}
+            for row, slot_index in zip(missing, selected, strict=True):
+                slot = self._slots[slot_index]
+                if slot.row is not None:
+                    self._invalidate_ticket(SlotTicket(slot_index, slot.generation))
+                slot.generation += 1
+                slot.row = row
+                slot.pins = 1
+                slot.loaded = False
+                slot.frequency = 0
+                ticket = SlotTicket(slot_index, slot.generation)
+                self._routes[row] = _CacheRoute(ticket)
+                self._touch(slot)
+                new_tickets[row] = ticket
+
+            self._transient_bytes += miss_bytes
+            self._inflight_bytes += miss_bytes
+            new_pairs = tuple((row, new_tickets[row]) for row in missing)
+            groups = self._groups(new_pairs)
+            submitted: list[Future[None]] = []
+            submitted_bytes = 0
+            try:
+                for shard_index, offset, length, group_rows in groups:
+                    future = self._executor.submit(
+                        self._read_publish,
+                        shard_index,
+                        offset,
+                        length,
+                        group_rows,
+                    )
+                    submitted.append(future)
+                    submitted_bytes += length
+                    self._worker_futures.add(future)
+                    future.add_done_callback(self._discard_worker)
+                    for row, _ticket in group_rows:
+                        self._routes[row].future = future
+            except Exception as exc:
+                unsent = miss_bytes - submitted_bytes
+                self._transient_bytes -= unsent
+                self._inflight_bytes -= unsent
+                for ticket in existing_tickets.values():
+                    self._release_ticket_pin(ticket, cancel_loading=False)
+                for ticket in new_tickets.values():
+                    self._invalidate_ticket(ticket)
+                raise NGramCacheIOError(f"could not submit n-gram reads: {exc}") from exc
+
+            waiting = list(submitted)
+            for row in unique_rows:
+                route = self._routes.get(row)
+                if route is not None and route.future is not None:
+                    waiting.append(route.future)
+            futures = tuple(dict.fromkeys(waiting))
+            by_row = existing_tickets | new_tickets
+            request = NGramAcquireFuture(
+                self, tuple(by_row[row] for row in rows), futures
+            )
+            self._pending.add(request)
+            return request
+
+    def acquire_rows(self, row_ids: Sequence[int]) -> NGramLease:
+        return self.acquire_rows_async(row_ids).result()
+
+    def _cancel_request(self, request: NGramAcquireFuture) -> bool:
+        with self._lock:
+            if request._lease is not None or request._cancelled or request._failed:
+                return False
+            request._cancelled = True
+            self._pending.discard(request)
+            for ticket in request._unique_tickets:
+                self._release_ticket_pin(ticket, cancel_loading=True)
+            return True
+
+    def _fail_request(self, request: NGramAcquireFuture) -> None:
+        with self._lock:
+            if request._failed or request._cancelled or request._lease is not None:
+                return
+            request._failed = True
+            self._pending.discard(request)
+            for ticket in request._unique_tickets:
+                self._release_ticket_pin(ticket, cancel_loading=True)
+
+    def _finish_request(self, request: NGramAcquireFuture) -> NGramLease:
+        with self._lock:
+            if request._cancelled or self._closed or not self._accepting:
+                raise CancelledError()
+            if request._failed:
+                raise NGramCacheIOError("n-gram row acquisition failed")
+            for ticket in request._unique_tickets:
+                slot = self._slots[ticket.slot]
+                if slot.generation != ticket.generation or not slot.loaded:
+                    self._fail_request(request)
+                    raise CancelledError()
+            lease = NGramLease(self, request._tickets)
+            request._lease = lease
+            self._pending.discard(request)
+            self._leases.add(lease)
+            return lease
+
+    def _lease_row_bytes(self, lease: NGramLease, ticket: SlotTicket) -> bytes:
+        with self._lock:
+            if lease._released or lease not in self._leases or self._closed:
+                raise NGramCacheClosed("n-gram lease is no longer active")
+            slot = self._slots[ticket.slot]
+            if slot.generation != ticket.generation or not slot.loaded:
+                raise NGramCacheClosed("n-gram lease no longer owns its slot")
+            start = ticket.slot * self._row_bytes
+            return bytes(self._arena[start : start + self._row_bytes])
+
+    def _release_lease(self, lease: NGramLease) -> None:
+        with self._lock:
+            if lease._released:
+                return
+            lease._released = True
+            self._leases.discard(lease)
+            for ticket in dict.fromkeys(lease._tickets):
+                self._release_ticket_pin(ticket, cancel_loading=False)
+
+    def _invalidate_all_locked(self) -> tuple[Future[None], ...]:
+        for request in tuple(self._pending):
+            self._cancel_request(request)
+        for lease in tuple(self._leases):
+            lease._released = True
+        self._leases.clear()
+        for index, slot in enumerate(self._slots):
+            self._invalidate_ticket(SlotTicket(index, slot.generation))
+        return tuple(self._worker_futures)
+
+    @staticmethod
+    def _drain(futures: tuple[Future[None], ...]) -> None:
+        for future in futures:
+            try:
+                future.result()
+            except (CancelledError, NGramCacheError):
+                pass
+
+    def reset(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise NGramCacheClosed("n-gram row cache is closed")
+            self._accepting = False
+            futures = self._invalidate_all_locked()
+        self._drain(futures)
+        with self._lock:
+            self._accepting = True
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._accepting = False
+            futures = self._invalidate_all_locked()
+        self._drain(futures)
+        self._executor.shutdown(wait=True, cancel_futures=False)
+
+    def __enter__(self) -> Self:
+        if self.closed:
+            raise NGramCacheClosed("n-gram row cache is closed")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
 __all__ = [
     "QWEN38_FLASH_NEXT_REPO",
     "QWEN38_FLASH_NEXT_REVISION",
+    "NGramAcquireFuture",
+    "NGramCacheClosed",
+    "NGramCacheConfig",
+    "NGramCacheError",
+    "NGramCacheFull",
+    "NGramCacheIOError",
     "NGramFileIdentity",
     "NGramGeometry",
+    "NGramLease",
     "NGramManifest",
     "NGramManifestError",
+    "NGramRowCache",
     "NGramShard",
+    "SlotTicket",
     "VerifiedNGramArtifact",
     "VerifiedNGramShard",
     "load_ngram_manifest",
