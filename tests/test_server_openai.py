@@ -13194,3 +13194,125 @@ def test_tool_prompt_mode_off_forces_native(monkeypatch):
     )
     assert mode == "hybrid"
     assert resolution["tool_prompt_mode_source"] == "backend:test"
+
+
+# ---------------------------------------------------------------------------
+# Memory governor (issue #305): the plan shapes the default window
+
+
+def _memory_plan_state_harness(monkeypatch):
+    """The standard fake-runtime ServerState harness, plus deterministic
+    plan inputs: flagship-sized weights and a monkeypatched machine RAM
+    (CI runners have 7-14 GB; the plan must not depend on the host)."""
+    monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
+    )
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda model, mtp, contract, **_kwargs: SimpleNamespace(
+            model_path=Path(model),
+            mtp_enabled=mtp,
+            tokenizer=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(
+        openai, "_install_draft_lm_head", lambda *_args, **_kwargs: {"installed": True}
+    )
+    monkeypatch.setattr(openai, "_draft_head_identity", lambda _runtime: "draft-head")
+    monkeypatch.setattr(openai, "_template_hash", lambda _tokenizer: "template")
+    monkeypatch.setattr(
+        openai, "_resolve_context_window", lambda _tokenizer, _model: 262_144
+    )
+    monkeypatch.setattr(
+        openai, "EngineSessionManager", lambda **_kwargs: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        "mtplx.engine_session.model_weights_bytes", lambda _path: 21_313_949_792
+    )
+    monkeypatch.delenv("MTPLX_MEMORY_BUDGET", raising=False)
+    monkeypatch.delenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", raising=False)
+    monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
+    monkeypatch.delenv("MTPLX_PAGED_KV_QUANT", raising=False)
+
+
+def test_server_state_memory_plan_shapes_the_default_window(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 48 * 1024**3
+    )
+    args = parse_args(["--model", "models/example", "--warmup-tokens", "0"])
+    state = openai.ServerState(args)
+    # 36G engine budget - 19.85G weights - transients - bank floor:
+    # 196,608 tokens is what actually fits a 48G Mac at full-window KV.
+    assert state.context_window == 196_608
+    assert state.memory_plan.available
+    assert state.memory_plan.context_machine_bound
+    out = capsys.readouterr().out
+    assert "[5/6] Memory plan: 48G Mac" in out
+    assert "machine-bound" in out
+
+
+def test_server_state_explicit_window_wins_but_is_flagged(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 48 * 1024**3
+    )
+    args = parse_args(
+        [
+            "--model",
+            "models/example",
+            "--warmup-tokens",
+            "0",
+            "--context-window",
+            "262144",
+        ]
+    )
+    state = openai.ServerState(args)
+    # Explicit user choice is never refused (no strangling) ...
+    assert state.context_window == 262_144
+    # ... but the plan says exactly what it costs.
+    assert state.memory_plan.context_overcommitted
+    out = capsys.readouterr().out
+    assert "OVERCOMMITTED" in out
+    assert "exceeds the machine fit" in out
+
+
+def test_server_state_128g_machine_keeps_the_model_max_window(monkeypatch):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 128 * 1024**3
+    )
+    args = parse_args(["--model", "models/example", "--warmup-tokens", "0"])
+    state = openai.ServerState(args)
+    # The no-regression pin at the integration level: big machines see
+    # zero change from the governor.
+    assert state.context_window == 262_144
+    assert not state.memory_plan.context_machine_bound
+    assert state.memory_plan.bank_idle_max_bytes == 48 * 1024**3
+
+
+def test_server_state_memory_budget_simulates_the_small_seat(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 128 * 1024**3
+    )
+    args = parse_args(
+        [
+            "--model",
+            "models/example",
+            "--warmup-tokens",
+            "0",
+            "--memory-budget",
+            "48G",
+        ]
+    )
+    state = openai.ServerState(args)
+    # A 128G dev box declaring --memory-budget 48G resolves the identical
+    # window a real 48G Mac gets — the whole 48G test story hangs on this.
+    assert state.context_window == 196_608
+    assert state.memory_plan.memory_budget_bytes == 48 * 1024**3

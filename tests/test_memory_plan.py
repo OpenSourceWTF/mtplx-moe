@@ -26,7 +26,6 @@ from mtplx.memory_plan import (
     CONTEXT_FLOOR_TOKENS,
     DEFAULT_DENSE_KV_BYTES_PER_TOKEN,
     GIB,
-    MemoryPlan,
     bank_dynamic_ceiling,
     describe_plan,
     detect_total_ram_bytes,

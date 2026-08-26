@@ -767,14 +767,24 @@ def _parse_byte_limit(value: str | int | None) -> int | None:
     text = str(value).strip().lower().replace("_", "")
     if not text:
         return None
+    # Single-letter spellings included: "48G" is the form every MTPLX
+    # budget message advertises ("sizes like 4G"), yet this parser only
+    # took "48GB"/"48GiB" — `--memory-budget 48G` crashed serve startup
+    # with a raw ValueError (found by the memory-governor tests, 2026-08-26).
     multipliers = {
         "b": 1,
+        "k": 1024,
         "kb": 1024,
         "kib": 1024,
+        "m": 1024**2,
         "mb": 1024**2,
         "mib": 1024**2,
+        "g": 1024**3,
         "gb": 1024**3,
         "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
     }
     for suffix, multiplier in sorted(
         multipliers.items(), key=lambda item: -len(item[0])
