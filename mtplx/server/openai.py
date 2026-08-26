@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import asyncio
+import traceback
 import builtins
 import errno
 import gc
@@ -112,6 +113,7 @@ from mtplx.gemma4_pair import (
     resolve_gemma4_pair_paths,
 )
 from mtplx.model_scheduler import ModelWorkScheduler
+from mtplx.server.hyper import HYPER_ADMISSION_CAP, HyperAdmissionGate
 from mtplx.reasoning_effort import (
     REASONING_EFFORT_CHOICES,
     REASONING_EFFORT_LEVELS,
@@ -1925,9 +1927,57 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
     _require_mlx_lm_arrays_cache_fix()
 
 
+def _validate_hyper_settings(args: argparse.Namespace) -> None:
+    """Reject launch flags that contradict hyper's admission contract.
+
+    ``--scheduler-mode hyper`` fixes external admission at 1: one request in
+    flight, simultaneous requests queued FIFO exactly like serial, and any
+    width (H1/H2) spent on self-generated rows for that one request. The
+    multi-admission knobs therefore have no meaning here — an operator
+    passing them asked for two different schedulers, and hyper fails loudly
+    at startup (before model construction) instead of silently ignoring the
+    contradiction. See mtplx/server/hyper.py for the mode contract.
+    """
+
+    if str(getattr(args, "scheduler_mode", "serial")) != SchedulerMode.HYPER:
+        return
+    max_active = getattr(args, "max_active_requests", None)
+    if max_active is not None and int(max_active) != HYPER_ADMISSION_CAP:
+        raise ValueError(
+            "scheduler_mode=hyper fixes external admission at "
+            f"{HYPER_ADMISSION_CAP}; --max-active-requests {int(max_active)} "
+            "contradicts it (hyper width is per-request self-speculation, "
+            "not extra clients)"
+        )
+    decode_batch_max = getattr(args, "decode_batch_max", None)
+    if decode_batch_max is not None and int(decode_batch_max) != 1:
+        raise ValueError(
+            "scheduler_mode=hyper decodes one external request at a time; "
+            f"--decode-batch-max {int(decode_batch_max)} is an ar_batch/"
+            "mtp_batch knob. Hyper widths (H1/H2) install internally and "
+            "are not operator batch knobs."
+        )
+    batch_wait_ms = getattr(args, "batch_wait_ms", None)
+    if batch_wait_ms is not None and float(batch_wait_ms) > 0.0:
+        raise ValueError(
+            "scheduler_mode=hyper never holds a gather window "
+            f"(--batch-wait-ms {float(batch_wait_ms):g}): width comes from "
+            "the request's own speculative rows, so there is nothing to "
+            "wait for (singleton-passthrough contract)"
+        )
+    preset = str(getattr(args, "batching_preset", "latency") or "latency")
+    if preset in {"agent", "throughput"}:
+        raise ValueError(
+            "scheduler_mode=hyper is single-admission; batching preset "
+            f"'{preset}' configures multi-request admission. Use 'latency' "
+            "(default) or 'solo'."
+        )
+
+
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         _validate_mtp_batch_settings(args)
+        _validate_hyper_settings(args)
         self.args = args
         try:
             args.paged_kv_quantization = normalize_paged_kv_quantization(
@@ -1978,6 +2028,14 @@ class ServerState:
         # explicitly for foreground-vs-idle admission.
         self.generation_executor = self.model_scheduler
         self.postcommit_executor = None
+        # Hyper admission gate (scheduler_mode=hyper only): accounting + the
+        # H1/H2 width seam. Never constructed for other modes so the serial
+        # dispatch tail stays untouched (a None check is its whole cost).
+        self.hyper_gate = (
+            HyperAdmissionGate()
+            if str(getattr(args, "scheduler_mode", "serial")) == SchedulerMode.HYPER
+            else None
+        )
         self.rate_limiter = _RateLimiter(args.rate_limit)
         startup_backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
         minimum_resident_bytes = None
@@ -2155,6 +2213,12 @@ class ServerState:
         self.mtp_batch_lane = None
         self.mtp_batch_lanes: dict[int, Any] = {}
         self.mtp_batch_omit_speculative_bonus = False
+        if scheduler_config.mode == SchedulerMode.HYPER:
+            _startup_line(
+                "[4/6] hyper scheduler installed: stage=h0 "
+                f"admission_cap={HYPER_ADMISSION_CAP} width=1 "
+                "passthrough=serial_b1 (singleton chassis; width seam idle)"
+            )
         if scheduler_config.mode == SchedulerMode.MTP_BATCH:
             self.mtp_batch_omit_speculative_bonus = str(
                 os.environ.get("MTPLX_OMIT_SPECULATIVE_BONUS", "")
@@ -12833,6 +12897,22 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     investigation had to reconstruct history from a 32-entry RAM ring; this
     keeps the full trail. Best-effort: telemetry must never fail a request.
     """
+    try:
+        # Route observability (2026-08-26): the packed-SDPA route declines
+        # silently unless its TRACE env is set — the 147.4k decode cliff hid
+        # behind that silence. Cumulative-since-boot module counters; a delta
+        # between consecutive rows isolates one request.
+        from ..attention_split import gqa_packed_route_bail_counts
+        from ..kernels.sdpa_gqa_packed import gqa_packed_bail_counts
+
+        record.setdefault(
+            "gqa_packed_route_bail_counts", dict(gqa_packed_route_bail_counts)
+        )
+        record.setdefault(
+            "gqa_packed_kernel_bail_counts", dict(gqa_packed_bail_counts)
+        )
+    except Exception:
+        pass
     safe = _json_safe(record)
     state.last_metrics.append(safe)
     state.last_metrics = state.last_metrics[-100:]
@@ -13743,7 +13823,7 @@ def _metrics_envelope(
         if prompt_eval_time_s > 0
         else None
     )
-    return {
+    envelope = {
         "prompt_tokens": int(prompt_tokens),
         "cached_tokens": cached_tokens,
         "new_prefill_tokens": max(0, new_prefill_tokens),
@@ -13789,6 +13869,13 @@ def _metrics_envelope(
         "drafted_by_depth": stats.get("drafted_by_depth") or [],
         "mean_accept_probability_by_depth": (
             stats.get("mean_accept_probability_by_depth") or []
+        ),
+        # Fork-EV shadow telemetry (MTPLX_FORKEV_TELEMETRY): present only when
+        # the instrument ran, so request-log rows stay byte-identical when off.
+        **(
+            {"forkev": stats["forkev"]}
+            if isinstance(stats.get("forkev"), dict) and stats.get("forkev")
+            else {}
         ),
         "correction_tokens": int(stats.get("correction_tokens") or 0),
         "bonus_tokens": int(stats.get("bonus_tokens") or 0),
@@ -13873,6 +13960,16 @@ def _metrics_envelope(
         "session_id": session_id,
         **generation_limits,
     }
+    # Adaptive draft-temperature trajectory (MTPLX_ADAPTIVE_DTEMP): stamped
+    # only when the engine produced a summary, so quiet request-log rows stay
+    # byte-stable (same idiom as the draft_sampler truth keys). This is the
+    # harvest surface: draft_sampler_resolved_temperature stays the request-
+    # resolved base, and this block carries current_temperature, the EMA, the
+    # transition count, and the transition log (the per-round trajectory).
+    adaptive_dtemp = stats.get("draft_sampler_adaptive_dtemp")
+    if adaptive_dtemp:
+        envelope["draft_sampler_adaptive_dtemp"] = adaptive_dtemp
+    return envelope
 
 
 def _effective_completion_tokens(
@@ -15237,6 +15334,8 @@ def _scheduler_config_from_args(args: Any) -> BatchSchedulerConfig:
 
 
 def _scheduler_policy_label(config: BatchSchedulerConfig) -> str:
+    if config.mode == SchedulerMode.HYPER:
+        return "hyper_singleton_admission_1"
     if config.mode == SchedulerMode.MTP_BATCH:
         return "fixed_mtp_batch_width_8"
     if (
@@ -15323,7 +15422,13 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
             or int(mtp_batch_stats.get("last_real_width") or 0) > 1
         )
     )
-    if b1_exact_serial and mtp_available:
+    if config.mode == SchedulerMode.HYPER:
+        # Hyper never disables MTP for concurrency: extra requests queue FIFO
+        # behind the singleton exactly like serial, so queued depth must never
+        # be labeled as an AR fallback.
+        active_lane = "hyper_singleton" if mtp_available else "hyper_singleton_ar"
+        mtp_disabled_reason = None if mtp_available else "generation_mode_ar"
+    elif b1_exact_serial and mtp_available:
         active_lane = "mtp_batch_b1_exact_serial"
         mtp_disabled_reason = None
     elif mtp_batch_has_cohort and mtp_available:
@@ -15356,9 +15461,18 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
     else:
         active_lane = "serial_ar" if not mtp_available else "serial_mtp"
         mtp_disabled_reason = None if mtp_available else "generation_mode_ar"
+    hyper_stats: dict[str, Any] = {}
+    hyper_gate = getattr(state, "hyper_gate", None)
+    if hyper_gate is not None and hasattr(hyper_gate, "snapshot"):
+        try:
+            hyper_stats = dict(hyper_gate.snapshot())
+        except Exception as exc:
+            hyper_stats = {"error": str(exc)}
     telemetry = dict(scheduler_stats)
     if config.mode == SchedulerMode.MTP_BATCH:
         telemetry.update(mtp_batch_stats)
+    elif config.mode == SchedulerMode.HYPER:
+        telemetry.update(hyper_stats)
     return {
         "config": config.to_dict(),
         "mode": config.mode.value,
@@ -15400,6 +15514,10 @@ def _mtplx_scheduler_state(state: "ServerState") -> dict[str, Any]:
         "telemetry": telemetry,
         "ar_batch": ar_batch_stats,
         "mtp_batch": mtp_batch_stats,
+        # Hyper chassis stats (empty outside scheduler_mode=hyper). H0 ships
+        # width=1 + admission accounting; the width_stats sub-block is the
+        # stable home for H1/H2 receipts (see mtplx/server/hyper.py).
+        "hyper": hyper_stats,
     }
 
 
@@ -16745,6 +16863,15 @@ def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
     draft_ownership = stats.get("draft_sampler_ownership")
     if draft_ownership is not None:
         public["draft_sampler_ownership"] = str(draft_ownership)
+    # Adaptive draft-temperature summary (MTPLX_ADAPTIVE_DTEMP): non-empty
+    # only when the gate is on, so disabled runs keep byte-stable envelopes.
+    # With the controller active, draft_sampler_resolved_temperature remains
+    # the request-resolved BASE set-point and this block explains any drift
+    # from it (current_temperature + EMA + transition log) — an adaptive
+    # trajectory is provable telemetry, not a desync.
+    adaptive_dtemp = stats.get("draft_sampler_adaptive_dtemp")
+    if adaptive_dtemp:
+        public["draft_sampler_adaptive_dtemp"] = adaptive_dtemp
     postcommit = stats.get("session_postcommit_snapshot")
     if isinstance(postcommit, dict):
         public["session_postcommit_snapshot"] = {
@@ -20360,18 +20487,46 @@ def _run_generation_dispatched(
         kwargs.pop("mtp_batch_finalize_ownership", None)
         return _run_generation(state, prompt_ids, **kwargs)
 
+    # scheduler_mode=hyper (H0 singleton chassis): the SAME `run` closure and
+    # the SAME FIFO submission as serial — the gate only wraps admission
+    # accounting and the H1/H2 width seam around it (mtplx/server/hyper.py).
+    # Hyper must never route width-1 traffic through a batched driver; serial
+    # mode pays exactly one None check here.
+    hyper_gate = getattr(state, "hyper_gate", None)
+    hyper_ticket = None
+    submitted_run = run
+    if hyper_gate is not None:
+        hyper_ticket = hyper_gate.admit(
+            request_id=(
+                response_id or request_observability_for_lane.get("request_id")
+            ),
+            prompt_tokens=len(prompt_ids),
+        )
+        # The admission lane; orthogonal markers (ar_batch_bypass_reason,
+        # constrained flags) stay in the envelope untouched.
+        request_observability_for_lane["scheduler_lane"] = "hyper_singleton"
+        submitted_run = hyper_gate.bind(
+            hyper_ticket, run, generation_mode=effective_mode
+        )
     scheduler = getattr(state, "model_scheduler", None)
-    if (
-        scheduler is not None
-        and hasattr(scheduler, "is_owner_thread")
-        and scheduler.is_owner_thread()
-    ):
-        return run()
-    return _submit_foreground_model_work(
-        state,
-        run,
-        batch_key=batch_key,
-    ).result()
+    try:
+        if (
+            scheduler is not None
+            and hasattr(scheduler, "is_owner_thread")
+            and scheduler.is_owner_thread()
+        ):
+            return submitted_run()
+        return _submit_foreground_model_work(
+            state,
+            submitted_run,
+            batch_key=batch_key,
+        ).result()
+    finally:
+        # Settles hyper tickets whose work item never started (cancelled
+        # futures / submit failures); a no-op for started tickets and for
+        # every non-hyper mode.
+        if hyper_gate is not None and hyper_ticket is not None:
+            hyper_gate.release(hyper_ticket)
 
 
 def _couple_draft_sampler_to_greedy_target(
@@ -21091,6 +21246,11 @@ def _run_generation(
         # Desync receipts (dynamic draft temperature): the resolved draft
         # sampler is visible per response, so a drifted draft is provable
         # from mtplx_stats alone. AR responses carry no draft keys at all.
+        # With MTPLX_ADAPTIVE_DTEMP on, this stamp stays the request-resolved
+        # BASE; the engine's per-round moves ride the accompanying
+        # draft_sampler_adaptive_dtemp block (current temp + EMA + transition
+        # log), which is what distinguishes an adaptive trajectory from a
+        # genuine desync.
         if effective_mode != "ar" and effective_draft_sampler is not None:
             stats["draft_sampler_resolved_temperature"] = float(
                 getattr(effective_draft_sampler, "temperature", 0.0)
@@ -21190,7 +21350,16 @@ def _run_generation(
         request_capture.capture_outcome(
             (request_observability or {}).get("request_id"),
             {
-                "scheduler_lane": "serial",
+                # The solo path serves serial AND hyper-singleton traffic;
+                # mirror the hyper lane stamp instead of mislabeling hyper
+                # capture envelopes as serial. Every other lane keeps the
+                # historical "serial" label byte-for-byte.
+                "scheduler_lane": (
+                    "hyper_singleton"
+                    if (request_observability or {}).get("scheduler_lane")
+                    == "hyper_singleton"
+                    else "serial"
+                ),
                 **request_capture.completion_token_ids(last.get("tokens")),
                 "completion_tokens": last["completion_tokens"],
                 "finish_reason": last.get("finish_reason"),
@@ -21625,6 +21794,9 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
         _startup_line(
             f"[6/6] Warmup failed after {status['elapsed_s']:.1f}s: {status['error']}"
         )
+        # A failed warmup leaves every later request on the same broken
+        # path; the one-line message has no raise site, so surface it.
+        _startup_line(traceback.format_exc())
         if getattr(state.args, "strict_warmup", False):
             raise
         return status
@@ -31923,7 +32095,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "on the solo MTP oracle (measured 2026-07-05: serialized MTP "
             "beats the batched-AR lane end to end on prefill-heavy "
             "concurrent loads); ar_batch opts concurrency into the batched "
-            "AR decode lane, which wins on decode-heavy many-client loads."
+            "AR decode lane, which wins on decode-heavy many-client loads. "
+            "hyper admits ONE request at a time (simultaneous requests "
+            "queue FIFO exactly like serial) and reserves batch width for "
+            "self-speculative rows of that request; at width 1 it rides "
+            "the untouched serial path (see mtplx/server/hyper.py)."
         ),
     )
     parser.add_argument(

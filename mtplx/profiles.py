@@ -43,6 +43,11 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         # able to force it off/on per launch for A/B work.
         "MTPLX_GQA_PACKED_SDPA",
         "MTPLX_GQA_PACKED_SDPA_THRESHOLD",
+        # Dense-decode context ceiling (2026-08-26): past it the auto layout
+        # repages decode and the packed lane is structurally excluded — the
+        # 147.4k decode cliff. Operators must be able to sweep it per launch.
+        "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT",
+        "MTPLX_SUSTAINED_PREFILL_LAYOUT",
         # Compiled-verify commit-first donation (speed-war Lane A2): same
         # A/B requirement — an explicit env must beat the profile default.
         "MTPLX_COMPILED_VERIFY_DONATION",

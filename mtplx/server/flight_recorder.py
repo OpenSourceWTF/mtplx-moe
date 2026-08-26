@@ -423,6 +423,9 @@ class FlightRecorder:
             "new_prefill_tokens",
             "decode_tok_s",
             "ttft_s",
+            # Fork-EV shadow aggregate (MTPLX_FORKEV_TELEMETRY); absent when
+            # the instrument is off, so existing flight rows are unchanged.
+            "forkev",
         ):
             if receipt.get(key) is not None:
                 event[key] = receipt[key]

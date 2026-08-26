@@ -258,12 +258,18 @@ def _install_split_attention_hook(attn: Any) -> bool:
             from .kernel_selfcheck import lane_disabled
 
             gqa_packed_enabled = not lane_disabled("gqa_packed_sdpa")
+        # MTPLX_GQA_PACKED_WIDE (2026-08-25 flat-decode): route q_len 5-16
+        # to the query-group kernel instead of the second-bank path the QL
+        # sweep measured as the depth cliff. Off = shipping behavior.
+        gqa_packed_wide = _env_enabled("MTPLX_GQA_PACKED_WIDE")
         should_use_gqa_packed = (
             gqa_packed_enabled
             and cache is not None
             and not blockwise_enabled
             and not vllm_metal_paged_enabled
-            and 2 <= int(queries.shape[2]) <= 4
+            # 8 rows since 2026-07-21 (second float4 bank): depth 4's
+            # verify window is q_len 5; QL <= 4 compiles identically.
+            and 2 <= int(queries.shape[2]) <= (16 if gqa_packed_wide else 8)
             and can_slice_mask
             and getattr(cache, "keys", None) is not None
             and getattr(cache, "values", None) is not None
@@ -284,7 +290,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and cache is not None
             and not blockwise_enabled
             and not vllm_metal_paged_enabled
-            and 2 <= int(queries.shape[2]) <= 4
+            and 2 <= int(queries.shape[2]) <= 8
         ):
             # F23b: enabled verify-shaped dense-cache window that the packed
             # route declined — record why (bail path only).
@@ -305,6 +311,36 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and hasattr(cache, "paged_attention")
             and can_slice_mask
         )
+        if _env_enabled("MTPLX_ROUTE_DEBUG"):
+            # One line per layer for the first 2 decode-shaped calls: which
+            # branch the ladder takes and why — the 147.4k lane went dark
+            # because every fast branch declined SILENTLY (2026-08-26).
+            dbg_count = int(getattr(self, "_mtplx_route_debug_calls", 0))
+            if dbg_count < 8 and int(queries.shape[2]) <= 16:
+                self._mtplx_route_debug_calls = dbg_count + 1
+                import sys as _sys
+
+                print(
+                    "mtplx_route_debug "
+                    f"layer={getattr(self, '_mtplx_full_attention_index', -1)} "
+                    f"q_len={int(queries.shape[2])} "
+                    f"cache={type(cache).__name__} "
+                    f"blockwise={blockwise_enabled} "
+                    f"vllm_flag={bool(getattr(self, '_mtplx_vllm_metal_paged_enabled', False))} "
+                    f"vllm_enabled={vllm_metal_paged_enabled} "
+                    f"vllm_should={should_use_vllm_metal_paged} "
+                    f"packed_enabled={gqa_packed_enabled} "
+                    f"packed_should={should_use_gqa_packed} "
+                    f"has_uwf={hasattr(cache, 'update_without_fetch')} "
+                    f"has_pa={hasattr(cache, 'paged_attention')} "
+                    f"keys_none={getattr(cache, 'keys', None) is None} "
+                    f"cap={0 if getattr(cache, 'keys', None) is None else int(cache.keys.shape[2])} "
+                    f"mask={type(mask).__name__} "
+                    f"can_slice={can_slice_mask} "
+                    f"twopass={should_use_2pass}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
         should_split = (
             cache is not None
             and getattr(self, "_mtplx_split_full_attention_explicit_enabled", False)
@@ -348,15 +384,52 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     mask=mask,
                 )
         elif should_use_gqa_packed:
-            from .kernels.sdpa_gqa_packed import sdpa_gqa_packed_tail
-
-            output = sdpa_gqa_packed_tail(
-                queries=queries,
-                keys=cache.keys,
-                values=cache.values,
-                offset=cache.offset,
-                scale=self.scale,
+            from .kernels.sdpa_gqa_packed import (
+                sdpa_gqa_packed_tail,
+                sdpa_gqa_packed_tail_grouped,
             )
+
+            output = None
+            # MTPLX_NAX_TILE_ROUTE (2026-08-26 hyper): TensorOps wide-M tile
+            # kernel for q_len >= 6 — the M-curve regime where the scalar
+            # kernels pay (Battery A + spot receipts: QL9 +34%/+45% at
+            # 71k/128k). Bails fall through to the scalar routes unchanged.
+            if _env_enabled("MTPLX_NAX_TILE_ROUTE") and int(queries.shape[2]) >= 6:
+                from .kernels.sdpa_nax_tile import sdpa_nax_tile
+
+                output = sdpa_nax_tile(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
+                if output is not None:
+                    self._mtplx_nax_tile_calls = (
+                        int(getattr(self, "_mtplx_nax_tile_calls", 0)) + 1
+                    )
+            if output is not None:
+                pass
+            # Grouped wins past the second-bank register cliff: 2026-08-25
+            # three-way sweep at 71k — bank2 ahead at QL5-6; grouped ahead
+            # from QL7 (QL8 68.6 vs stock 83.7; QL9 with the mixed 4+5 v3
+            # tail 61.1 vs stock 83.6, -27%).
+            elif gqa_packed_wide and int(queries.shape[2]) >= 7:
+                output = sdpa_gqa_packed_tail_grouped(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
+            else:
+                output = sdpa_gqa_packed_tail(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
             if output is not None:
                 self._mtplx_gqa_packed_sdpa_calls = (
                     int(getattr(self, "_mtplx_gqa_packed_sdpa_calls", 0)) + 1
