@@ -944,6 +944,7 @@ class VerifiedNGramArtifact:
 
     __slots__ = (
         "_cache_owner",
+        "_cache_reuse_error",
         "_lock",
         "_root_fd",
         "manifest",
@@ -961,6 +962,7 @@ class VerifiedNGramArtifact:
         self._root_fd = root_descriptor
         self._lock = threading.RLock()
         self._cache_owner: object | None = None
+        self._cache_reuse_error: str | None = None
         self.shards = shards
         self.report = {
             "shards": len(shards),
@@ -1001,10 +1003,6 @@ class VerifiedNGramArtifact:
 
     def close(self) -> None:
         with self._lock:
-            if self._cache_owner is not None:
-                raise NGramManifestError(
-                    "cannot close a verified artifact while its cache owns it"
-                )
             first_error: NGramManifestError | None = None
             for shard in self.shards:
                 try:
@@ -1319,7 +1317,6 @@ class NGramCacheConfig:
 
 
 _EMPTY_ROW = (1 << 32) - 1
-_TOMBSTONE_ROW = _EMPTY_ROW - 1
 _EMPTY_SLOT = (1 << 32) - 1
 _SLOT_METADATA_BYTES = 8 + 4 + 4 + 1 + 4 + 8
 _ROUTE_ENTRY_BYTES = 4 + 4
@@ -1347,7 +1344,7 @@ def plan_ngram_cache(
         raise TypeError("manifest must be an exact NGramManifest")
     if type(config) is not NGramCacheConfig:
         raise TypeError("config must be an exact NGramCacheConfig")
-    if manifest.padded_rows >= _TOMBSTONE_ROW:
+    if manifest.padded_rows >= _EMPTY_ROW:
         raise ValueError("manifest rows exceed the packed route-key domain")
     slot_count = config.cache_limit_bytes // manifest.row_bytes
     if slot_count == 0:
@@ -1434,18 +1431,24 @@ class _PackedCacheIndex:
 
     def _probe(self, row: int) -> tuple[int, bool]:
         index = (row * 2_654_435_761) & self.route_mask
-        first_tombstone = -1
         for _ in range(self.route_mask + 1):
             key = self.route_keys[index]
             if key == row:
                 return index, True
             if key == _EMPTY_ROW:
-                return (first_tombstone if first_tombstone >= 0 else index), False
-            if key == _TOMBSTONE_ROW and first_tombstone < 0:
-                first_tombstone = index
+                return index, False
             index = (index + 1) & self.route_mask
-        if first_tombstone >= 0:
-            return first_tombstone, False
+        raise NGramCacheFull("fixed n-gram route table is full")
+
+    def lookup_with_probes(self, row: int) -> tuple[int | None, int]:
+        index = (row * 2_654_435_761) & self.route_mask
+        for probes in range(1, self.route_mask + 2):
+            key = self.route_keys[index]
+            if key == row:
+                return int(self.route_slots[index]), probes
+            if key == _EMPTY_ROW:
+                return None, probes
+            index = (index + 1) & self.route_mask
         raise NGramCacheFull("fixed n-gram route table is full")
 
     def lookup(self, row: int) -> int | None:
@@ -1461,9 +1464,20 @@ class _PackedCacheIndex:
 
     def remove(self, row: int) -> None:
         index, found = self._probe(row)
-        if found:
-            self.route_keys[index] = _TOMBSTONE_ROW
-            self.route_slots[index] = _EMPTY_SLOT
+        if not found:
+            return
+        hole = index
+        scan = (hole + 1) & self.route_mask
+        while self.route_keys[scan] != _EMPTY_ROW:
+            key = int(self.route_keys[scan])
+            home = (key * 2_654_435_761) & self.route_mask
+            if ((scan - home) & self.route_mask) >= ((hole - home) & self.route_mask):
+                self.route_keys[hole] = key
+                self.route_slots[hole] = self.route_slots[scan]
+                hole = scan
+            scan = (scan + 1) & self.route_mask
+        self.route_keys[hole] = _EMPTY_ROW
+        self.route_slots[hole] = _EMPTY_SLOT
 
     def clear(self) -> None:
         for slot in range(self.slot_count):
@@ -1628,13 +1642,17 @@ def _restore_page_cache_policy(
         return
     assert fcntl is not None
     command = fcntl.F_NOCACHE
-    try:
-        for route in routes:
+    first_error: str | None = None
+    for route in routes:
+        try:
             fcntl.fcntl(route.retained.fileno(), command, 0)
-    except (NGramManifestError, OSError, TypeError, ValueError) as exc:
+        except (NGramManifestError, OSError, TypeError, ValueError) as exc:
+            if first_error is None:
+                first_error = f"{type(exc).__name__}: {str(exc)[:256]}"
+    if first_error is not None:
         raise NGramCacheIOError(
-            f"could not restore retained n-gram page-cache policy: {exc}"
-        ) from exc
+            f"could not restore retained n-gram page-cache policy: {first_error}"
+        )
 
 
 class _DescriptorReader:
@@ -1700,6 +1718,41 @@ class _TransientPool:
                 self.used[slot] = 1
             reserved.append((start, count))
         return tuple(reserved)
+
+    def reserve_fragmented(
+        self, row_counts: tuple[int, ...]
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """Return (group, group-row-offset, pool-start, count) segments."""
+
+        needed = sum(row_counts)
+        if sum(1 for value in self.used if value == 0) < needed:
+            raise NGramCacheFull("fixed n-gram transient pool is exhausted")
+        planned: list[tuple[int, int, int, int]] = []
+        claimed: set[int] = set()
+        for group_index, row_count in enumerate(row_counts):
+            group_offset = 0
+            while group_offset < row_count:
+                start = next(
+                    slot
+                    for slot in range(self.slots)
+                    if self.used[slot] == 0 and slot not in claimed
+                )
+                count = 0
+                slot = start
+                while (
+                    slot < self.slots
+                    and self.used[slot] == 0
+                    and slot not in claimed
+                    and group_offset + count < row_count
+                ):
+                    claimed.add(slot)
+                    count += 1
+                    slot += 1
+                planned.append((group_index, group_offset, start, count))
+                group_offset += count
+        for slot in claimed:
+            self.used[slot] = 1
+        return tuple(planned)
 
     def release(self, start: int, count: int) -> None:
         for slot in range(start, start + count):
@@ -1829,13 +1882,13 @@ class NGramAcquireFuture:
             with self._cache._lock:
                 poison = self._cache._poison_message
                 cancelled = self._cancelled
-                if self._lease is not None:
-                    return self._lease
             if poison is not None:
                 self._cache._drain_poisoned_workers()
                 raise NGramCacheIOError(
                     f"n-gram cache lane is poisoned: {poison}"
                 )
+            if self._lease is not None:
+                return self._lease
             if cancelled:
                 raise CancelledError()
             deadline = None if timeout is None else monotonic() + timeout
@@ -1854,6 +1907,9 @@ class NGramAcquireFuture:
                 if isinstance(exc, NGramCacheIOError):
                     raise
                 raise NGramCacheIOError(f"n-gram row acquisition failed: {exc}") from exc
+            except BaseException:
+                self._cache._drain_poisoned_workers()
+                raise
             return self._cache._finish_request(self)
 
 
@@ -1885,6 +1941,11 @@ class NGramRowCache:
         plan = plan_ngram_cache(manifest, config)
         token = object()
         with artifact._lock:
+            if artifact._cache_reuse_error is not None:
+                raise NGramCacheIOError(
+                    "verified n-gram artifact is poisoned for cache reuse: "
+                    f"{artifact._cache_reuse_error}"
+                )
             if artifact._cache_owner is not None:
                 raise NGramCacheError("verified n-gram artifact already has a cache owner")
             artifact._cache_owner = token
@@ -1940,14 +2001,17 @@ class NGramRowCache:
                     _restore_page_cache_policy(
                         installed_routes, page_cache_installed
                     )
-            except NGramCacheIOError:
+            except NGramCacheIOError as cleanup_error:
                 cleanup_safe = False
+                with artifact._lock:
+                    artifact._cache_reuse_error = str(cleanup_error)[:512]
                 raise
             finally:
-                if cleanup_safe:
-                    with artifact._lock:
-                        if artifact._cache_owner is token:
-                            artifact._cache_owner = None
+                with artifact._lock:
+                    if not cleanup_safe and artifact._cache_reuse_error is None:
+                        artifact._cache_reuse_error = str(construction_error)[:512]
+                    if artifact._cache_owner is token:
+                        artifact._cache_owner = None
             raise
 
         assert packed is not None and transient_pool is not None
@@ -1979,7 +2043,9 @@ class NGramRowCache:
         self._resetting = False
         self._accepting = True
         self._poison_message: str | None = None
+        self._fatal_cause: BaseException | None = None
         self._page_cache_installed = page_cache_installed
+        self._close_error: str | None = None
 
     @property
     def arena_bytes(self) -> int:
@@ -1988,11 +2054,13 @@ class NGramRowCache:
 
     @property
     def metadata_bytes(self) -> int:
-        return self.plan.slot_metadata_bytes
+        with self._lock:
+            return 0 if self._state == "CLOSED" else self.plan.slot_metadata_bytes
 
     @property
     def route_table_bytes(self) -> int:
-        return self.plan.route_table_bytes
+        with self._lock:
+            return 0 if self._state == "CLOSED" else self.plan.route_table_bytes
 
     @property
     def transient_storage_bytes(self) -> int:
@@ -2089,6 +2157,8 @@ class NGramRowCache:
     ) -> None:
         shard = self._physical_routes[shard_index].retained
         failure: str | None = None
+        fatal: BaseException | None = None
+        target: memoryview | None = None
         try:
             target = self._transient_pool.bytes_view(
                 transient_start, transient_rows
@@ -2118,15 +2188,24 @@ class NGramRowCache:
                         source : source + self._row_bytes
                     ]
                     self._packed.loaded[slot] = 1
-        except Exception as exc:  # noqa: BLE001 - injected workers may raise anything
+        except BaseException as exc:  # noqa: BLE001 - fatal workers must clean up
             with self._lock:
-                self._poison_locked(exc)
+                poison_cause = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+                self._poison_locked(poison_cause)
                 failure = self._poison_message
+                if not isinstance(exc, Exception):
+                    fatal = exc
+                    if self._fatal_cause is None:
+                        self._fatal_cause = exc
         finally:
+            if target is not None:
+                target.release()
             with self._lock:
                 self._inflight_bytes -= length
                 self._transient_pool.release(transient_start, transient_rows)
         if failure is not None:
+            if fatal is not None:
+                raise fatal
             raise NGramCacheIOError(
                 f"descriptor-relative n-gram read failed: {failure}"
             )
@@ -2140,6 +2219,9 @@ class NGramRowCache:
         for request in tuple(self._pending):
             request._cancelled = True
         self._pending.clear()
+        for lease in tuple(self._leases):
+            lease._released = True
+        self._leases.clear()
 
     def _discard_worker(
         self, future: Future[None], rows: tuple[int, ...]
@@ -2228,9 +2310,21 @@ class NGramRowCache:
                 raise NGramCacheFull("complete n-gram miss set exceeds I/O budgets")
             protected = {slot for slot in routed.values() if slot is not None}
             selected = self._choose_slots(len(missing), protected)
-            transient_base = 0
-            if missing:
-                transient_base, _count = self._transient_pool.reserve((len(missing),))[0]
+            predicted_tickets = {
+                row: SlotTicket(
+                    slot,
+                    int(self._packed.generations[slot])
+                    + (2 if self._packed.rows[slot] != _EMPTY_ROW else 1),
+                    self._token,
+                )
+                for row, slot in zip(missing, selected, strict=True)
+            }
+            groups = self._groups(
+                tuple((row, predicted_tickets[row]) for row in missing)
+            )
+            reservations = self._transient_pool.reserve_fragmented(
+                tuple(len(group_rows) for _shard, _offset, _length, group_rows in groups)
+            )
 
             existing_tickets: dict[int, SlotTicket] = {}
             for row in unique_rows:
@@ -2251,20 +2345,26 @@ class NGramRowCache:
                 self._packed.loaded[slot_index] = 0
                 self._packed.frequency[slot_index] = 0
                 ticket = self._ticket(slot_index)
+                if ticket != predicted_tickets[row]:
+                    raise NGramCacheError("predicted slot generation changed")
                 self._packed.insert(row, slot_index)
                 self._touch(slot_index)
                 new_tickets[row] = ticket
 
             self._inflight_bytes += miss_bytes
-            new_pairs = tuple((row, new_tickets[row]) for row in missing)
-            groups = self._groups(new_pairs)
             submitted: list[Future[None]] = []
             submitted_bytes = 0
-            submitted_rows = 0
+            submitted_reservations = 0
             try:
-                for shard_index, offset, length, group_rows in groups:
-                    group_count = len(group_rows)
-                    group_start = transient_base + submitted_rows
+                for group_index, group_offset, group_start, group_count in reservations:
+                    shard_index, base_offset, _base_length, all_group_rows = groups[
+                        group_index
+                    ]
+                    group_rows = all_group_rows[
+                        group_offset : group_offset + group_count
+                    ]
+                    offset = base_offset + group_offset * self._row_bytes
+                    length = group_count * self._row_bytes
                     future = self._executor.submit(
                         self._read_publish,
                         shard_index,
@@ -2276,7 +2376,7 @@ class NGramRowCache:
                     )
                     submitted.append(future)
                     submitted_bytes += length
-                    submitted_rows += group_count
+                    submitted_reservations += 1
                     self._worker_futures.add(future)
                     group_row_ids = tuple(row for row, _ticket in group_rows)
                     future.add_done_callback(
@@ -2289,11 +2389,10 @@ class NGramRowCache:
             except Exception as exc:
                 unsent = miss_bytes - submitted_bytes
                 self._inflight_bytes -= unsent
-                unsent_rows = len(missing) - submitted_rows
-                if unsent_rows:
-                    self._transient_pool.release(
-                        transient_base + submitted_rows, unsent_rows
-                    )
+                for _group, _offset, start, count in reservations[
+                    submitted_reservations:
+                ]:
+                    self._transient_pool.release(start, count)
                 for ticket in existing_tickets.values():
                     self._release_ticket_pin(ticket, cancel_loading=False)
                 for ticket in new_tickets.values():
@@ -2389,6 +2488,10 @@ class NGramRowCache:
                 or not self._ticket_owned(ticket)
             ):
                 raise TypeError("lease or ticket does not belong to this cache")
+            if self._poison_message is not None:
+                raise NGramCacheIOError(
+                    f"n-gram cache lane is poisoned: {self._poison_message}"
+                )
             if (
                 lease._released
                 or lease not in self._leases
@@ -2431,17 +2534,26 @@ class NGramRowCache:
         return tuple(self._worker_futures)
 
     @staticmethod
-    def _drain(futures: tuple[Future[None], ...]) -> None:
+    def _drain(futures: tuple[Future[None], ...]) -> BaseException | None:
+        first_fatal: BaseException | None = None
         for future in futures:
             try:
                 future.result()
             except (CancelledError, NGramCacheError):
                 pass
+            except BaseException as exc:  # noqa: BLE001 - drain before fatal re-raise
+                if first_fatal is None:
+                    first_fatal = exc
+        return first_fatal
 
     def _drain_poisoned_workers(self) -> None:
         with self._lock:
             futures = tuple(self._worker_futures)
-        self._drain(futures)
+        fatal = self._drain(futures)
+        if fatal is None:
+            fatal = self._fatal_cause
+        if fatal is not None:
+            raise fatal
 
     def reset(self) -> None:
         with self._condition:
@@ -2456,7 +2568,9 @@ class NGramRowCache:
             self._resetting = True
             self._accepting = False
             futures = self._invalidate_all_locked()
-        self._drain(futures)
+        fatal = self._drain(futures)
+        if fatal is None:
+            fatal = self._fatal_cause
         with self._condition:
             self._resetting = False
             if self._state == "OPEN" and self._poison_message is None:
@@ -2464,22 +2578,36 @@ class NGramRowCache:
             self._condition.notify_all()
             poison = self._poison_message
         if poison is not None:
+            if fatal is not None:
+                raise fatal
             raise NGramCacheIOError(f"n-gram cache lane is poisoned: {poison}")
+        if fatal is not None:
+            raise fatal
 
     def close(self) -> None:
         with self._condition:
             if self._state == "CLOSED":
+                if self._fatal_cause is not None:
+                    raise self._fatal_cause
+                if self._close_error is not None:
+                    raise NGramCacheIOError(self._close_error)
                 return
             if self._state == "CLOSING":
                 while self._state != "CLOSED":
                     self._condition.wait()
+                if self._fatal_cause is not None:
+                    raise self._fatal_cause
+                if self._close_error is not None:
+                    raise NGramCacheIOError(self._close_error)
                 return
             while self._resetting:
                 self._condition.wait()
             self._state = "CLOSING"
             self._accepting = False
             futures = self._invalidate_all_locked()
-        self._drain(futures)
+        fatal = self._drain(futures)
+        if fatal is None:
+            fatal = self._fatal_cause
         self._executor.shutdown(wait=True, cancel_futures=False)
         restore_error: NGramCacheIOError | None = None
         try:
@@ -2496,12 +2624,16 @@ class NGramRowCache:
             self._transient_pool.close()
             self._physical_routes = ()
             self._physical_starts = ()
-            if restore_error is None:
-                with self.artifact._lock:
-                    if self.artifact._cache_owner is self._token:
-                        self.artifact._cache_owner = None
+            with self.artifact._lock:
+                if restore_error is not None:
+                    self._close_error = str(restore_error)[:512]
+                    self.artifact._cache_reuse_error = self._close_error
+                if self.artifact._cache_owner is self._token:
+                    self.artifact._cache_owner = None
             self._state = "CLOSED"
             self._condition.notify_all()
+        if fatal is not None:
+            raise fatal
         if restore_error is not None:
             raise restore_error
 

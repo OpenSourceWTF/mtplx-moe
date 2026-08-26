@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import threading
 from concurrent.futures import CancelledError
 from copy import copy, deepcopy
@@ -75,6 +76,13 @@ class ControlledReader(RecordingReader):
         self.started.set()
         assert self.release.wait(timeout=5)
         return super().read_into(*args, **kwargs)  # type: ignore[arg-type]
+
+
+class ControlledFatalReader(ControlledReader):
+    def read_into(self, *args: object, **kwargs: object) -> int:
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        raise KeyboardInterrupt("synthetic fatal reader")
 
 
 @dataclass
@@ -827,6 +835,30 @@ def test_worker_failure_poisons_lane_and_drains_storage(tmp_path: Path) -> None:
         fixture.close()
 
 
+def test_failed_future_retains_only_a_released_transient_view(tmp_path: Path) -> None:
+    fixture = fixture_cache(tmp_path, reader=BrokenReader())
+    acquisition = fixture.cache.acquire_rows_async((1,))
+    try:
+        with pytest.raises(NGramCacheIOError):
+            acquisition.result(timeout=5)
+        worker_error = acquisition._futures[0].exception(timeout=5)
+        assert worker_error is not None
+        traceback = worker_error.__traceback__
+        retained_target: memoryview | None = None
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_name == "_read_publish":
+                retained_target = traceback.tb_frame.f_locals.get("target")
+            traceback = traceback.tb_next
+        assert retained_target is not None
+        with pytest.raises(ValueError, match="released memoryview"):
+            _ = retained_target.nbytes
+        fixture.cache.close()
+        assert fixture.cache.transient_storage_bytes == 0
+    finally:
+        fixture.cache.close()
+        fixture.artifact.close()
+
+
 def test_default_allocator_is_imported_lazily_without_mlx_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -874,6 +906,68 @@ def test_route_table_collisions_and_tombstones_do_not_grow(tmp_path: Path) -> No
         fixture.close()
 
 
+def test_route_deletion_churn_has_bounded_absent_probe(tmp_path: Path) -> None:
+    fixture = fixture_cache(tmp_path, slots=2)
+    try:
+        for row in range(ROW_COUNT):
+            fixture.cache.acquire_rows((row,)).release()
+        assert ROW_COUNT > fixture.cache.plan.route_capacity
+        missing, probes = fixture.cache._packed.lookup_with_probes(100)
+        assert missing is None
+        assert probes <= fixture.cache.plan.slot_count + 1
+        for row in (ROW_COUNT - 2, ROW_COUNT - 1):
+            assert fixture.cache._packed.lookup(row) is not None
+    finally:
+        fixture.close()
+
+
+def test_backward_shift_route_table_matches_random_oracle(tmp_path: Path) -> None:
+    fixture = fixture_cache(tmp_path, slots=2)
+    rng = random.Random(38)
+    oracle: dict[int, int] = {}
+    try:
+        for _ in range(500):
+            if oracle and (len(oracle) == 2 or rng.randrange(2) == 0):
+                row = rng.choice(tuple(oracle))
+                fixture.cache._packed.remove(row)
+                del oracle[row]
+            else:
+                row = rng.randrange(200)
+                if row not in oracle:
+                    slot = len(oracle)
+                    fixture.cache._packed.insert(row, slot)
+                    oracle[row] = slot
+            for row, slot in oracle.items():
+                assert fixture.cache._packed.lookup(row) == slot
+            absent = next(row for row in range(200, 400) if row not in oracle)
+            value, probes = fixture.cache._packed.lookup_with_probes(absent)
+            assert value is None
+            assert probes <= len(oracle) + 1
+    finally:
+        fixture.close()
+
+
+def test_fragmented_transient_pool_splits_physical_group_without_rejection(
+    tmp_path: Path,
+) -> None:
+    fixture = fixture_cache(tmp_path, slots=4, transient_rows=8)
+    try:
+        for slot in (1, 3, 5, 7):
+            fixture.cache._transient_pool.used[slot] = 1
+        lease = fixture.cache.acquire_rows((0, 1, 2, 3))
+        assert [lease.row_bytes(index) for index in range(4)] == [
+            fixture_row(row) for row in range(4)
+        ]
+        lease.release()
+        assert sorted(length for _fd, _offset, length in fixture.reader.reads) == [
+            ROW_BYTES
+        ] * 4
+        for slot in (1, 3, 5, 7):
+            fixture.cache._transient_pool.used[slot] = 0
+    finally:
+        fixture.close()
+
+
 def test_two_close_callers_wait_and_release_all_fixed_storage(tmp_path: Path) -> None:
     reader = ControlledReader()
     fixture = fixture_cache(tmp_path, slots=1, reader=reader)
@@ -893,6 +987,8 @@ def test_two_close_callers_wait_and_release_all_fixed_storage(tmp_path: Path) ->
     assert first_done.is_set() and second_done.is_set()
     assert fixture.cache.arena_bytes == 0
     assert fixture.cache.transient_storage_bytes == 0
+    assert fixture.cache.metadata_bytes == 0
+    assert fixture.cache.route_table_bytes == 0
     assert fixture.cache.total_reserved_bytes == 0
     assert fixture.cache._packed.slot_count == 0
     with pytest.raises(CancelledError):
@@ -1017,6 +1113,102 @@ def test_page_cache_policy_rolls_back_when_later_allocation_fails(
         fixture.artifact.close()
 
 
+def test_restore_failure_is_persistent_but_artifact_can_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    assert qwen4_ngram.fcntl is not None
+    monkeypatch.setattr(qwen4_ngram.fcntl, "F_NOCACHE", 48, raising=False)
+
+    def fail_restore(_descriptor: int, _command: int, value: int) -> None:
+        if value == 0:
+            raise OSError("persistent restore failure")
+
+    monkeypatch.setattr(qwen4_ngram.fcntl, "fcntl", fail_restore)
+    cache = NGramRowCache(
+        fixture.artifact,
+        NGramCacheConfig(
+            cache_limit_bytes=ROW_BYTES,
+            transient_limit_bytes=ROW_BYTES,
+            max_inflight_io_bytes=ROW_BYTES,
+            max_open_files=3,
+            bypass_page_cache=True,
+            eviction="lru",
+        ),
+        reader=RecordingReader(),
+        allocator=bytearray,
+    )
+    with pytest.raises(NGramCacheIOError, match="persistent restore failure"):
+        cache.close()
+    with pytest.raises(NGramCacheIOError, match="persistent restore failure"):
+        cache.close()
+    assert fixture.artifact._cache_owner is None
+    with pytest.raises(NGramCacheIOError, match="poisoned for cache reuse"):
+        NGramRowCache(
+            fixture.artifact,
+            cache.config,
+            reader=RecordingReader(),
+            allocator=bytearray,
+        )
+    fixture.artifact.close()
+
+
+def test_poison_revokes_preexisting_materialized_lease_and_future(
+    tmp_path: Path,
+) -> None:
+    fixture = fixture_cache(tmp_path, slots=2)
+    try:
+        materialized = fixture.cache.acquire_rows_async((1,))
+        old_lease = materialized.result(timeout=5)
+        fixture.cache._reader = BrokenReader()
+        with pytest.raises(NGramCacheIOError, match="synthetic read failure"):
+            fixture.cache.acquire_rows((2,))
+        with pytest.raises(NGramCacheIOError, match="synthetic read failure"):
+            old_lease.row_bytes(0)
+        with pytest.raises(NGramCacheIOError, match="synthetic read failure"):
+            materialized.result(timeout=5)
+    finally:
+        fixture.close()
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+def test_fatal_reader_never_leaves_reset_or_close_transition_stuck(
+    tmp_path: Path, operation: str
+) -> None:
+    reader = ControlledFatalReader()
+    fixture = fixture_cache(tmp_path, reader=reader)
+    fixture.cache.acquire_rows_async((1,))
+    assert reader.started.wait(timeout=5)
+    errors: list[BaseException] = []
+    finished = threading.Event()
+
+    def operate() -> None:
+        try:
+            getattr(fixture.cache, operation)()
+        except BaseException as exc:  # noqa: BLE001 - capture fatal thread result
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=operate)
+    worker.start()
+    reader.release.set()
+    worker.join(timeout=5)
+    assert finished.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], KeyboardInterrupt)
+    assert not fixture.cache._resetting
+    if operation == "reset":
+        with pytest.raises(KeyboardInterrupt, match="synthetic fatal reader"):
+            fixture.cache.close()
+    else:
+        assert fixture.cache.closed
+        with pytest.raises(KeyboardInterrupt, match="synthetic fatal reader"):
+            fixture.cache.close()
+    fixture.artifact.close()
+
+
 def test_empty_and_overflowing_acquisitions_are_rejected(tmp_path: Path) -> None:
     fixture = fixture_cache(tmp_path)
     try:
@@ -1051,8 +1243,6 @@ def test_default_reader_capability_and_exclusive_owner_fail_before_allocation(
                 reader=RecordingReader(),
                 allocator=lambda size: (sizes.append(size), bytearray(size))[1],
             )
-        with pytest.raises(Exception, match="cache owns"):
-            fixture.artifact.close()
         assert sizes == []
         fixture.cache.close()
         monkeypatch.setattr(qwen4_ngram.os, "preadv", None)
