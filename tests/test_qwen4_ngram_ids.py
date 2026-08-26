@@ -59,7 +59,7 @@ EXPECTED_OFFSETS = (
 
 
 def test_qwen38_geometry_is_exact_and_frozen() -> None:
-    geometry = NGramGeometry.qwen38_flash_next()
+    geometry = NGramGeometry.qwen38()
 
     assert geometry.vocab_size == 248_320
     assert geometry.eos_token_id == 248_044
@@ -78,6 +78,19 @@ def test_qwen38_geometry_is_exact_and_frozen() -> None:
     assert geometry.padded_rows == 320_001_536
     with pytest.raises(FrozenInstanceError):
         geometry.seed = 0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"seed": 0},
+        {"vocab_size": 10},
+        {"eos_token_id": 1, "ngram_size": 2, "heads_per_ngram": 1},
+    ],
+)
+def test_geometry_rejects_public_parameterization(kwargs: dict[str, int]) -> None:
+    with pytest.raises(TypeError):
+        NGramGeometry(**kwargs)
 
 
 def test_row_ids_match_official_examples() -> None:
@@ -281,16 +294,65 @@ def test_manifest_rejects_noncontiguous_shards(tmp_path: Path, kind: str) -> Non
         replace(manifest, shards=(first, second)).validate_structure()
 
 
-@pytest.mark.parametrize("name", ["../escape.bin", "/tmp/escape.bin", "a/b.bin", "."])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        ".",
+        "..",
+        "part.bin/",
+        "./part.bin",
+        "part/../part.bin",
+        "part//alias.bin",
+        "a/b.bin",
+        "a\\b.bin",
+        "/tmp/escape.bin",
+        "\x00part.bin",
+        "part\x00.bin",
+        "ngram-e\u0301.bin",
+    ],
+)
 def test_manifest_rejects_unsafe_single_component_names(
     tmp_path: Path, name: str
 ) -> None:
     manifest = _tiny_manifest(tmp_path)
 
     with pytest.raises(NGramManifestError):
-        replace(
-            manifest, shards=(replace(manifest.shards[0], name=name),)
-        ).validate_structure()
+        replace(manifest.shards[0], name=name)
+
+
+def test_manifest_accepts_plain_unicode_single_component_name(tmp_path: Path) -> None:
+    shard = _shard(
+        tmp_path,
+        name="ngram-数据.bin",
+        start_row=0,
+        rows=[b"aa", b"bb", b"cc"],
+    )
+    manifest = NGramManifest(
+        source_repo="example/repo",
+        source_revision="a" * 40,
+        storage="bf16",
+        row_width=1,
+        row_bytes=2,
+        padded_rows=3,
+        shards=(shard,),
+    ).with_digest()
+
+    assert verify_ngram_manifest(tmp_path, manifest)["rows"] == 3
+
+
+@pytest.mark.parametrize("name", ["part.bin/", "part\x00.bin", "ngram-e\u0301.bin"])
+def test_load_rejects_unsafe_shard_name_as_manifest_error(
+    tmp_path: Path, name: str
+) -> None:
+    value = _tiny_manifest(tmp_path).to_dict()
+    value["shards"][0]["name"] = name
+    value.pop("digest")
+    path = tmp_path / "unsafe-manifest.json"
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(NGramManifestError, match="shard name"):
+        load_ngram_manifest(path, verify_digest=False)
 
 
 def test_verify_rejects_symlink(tmp_path: Path) -> None:

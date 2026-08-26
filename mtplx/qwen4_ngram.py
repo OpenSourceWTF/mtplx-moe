@@ -15,10 +15,11 @@ import os
 import re
 import stat
 import tempfile
+import unicodedata
 from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -138,14 +139,14 @@ def _token_matrix(tokens: Any, *, label: str) -> np.ndarray:
 class NGramGeometry:
     """Construction-validated immutable geometry for the pinned Qwen4 PLE."""
 
-    vocab_size: int = 248_320
-    eos_token_id: int = 248_044
-    ngram_size: int = 3
-    heads_per_ngram: int = 8
-    ngram_vocab_size_base: int = 20_000_000
-    divisor: int = 128
-    ple_layer_index: int = 0
-    seed: int = 1234
+    vocab_size: int = field(default=248_320, init=False)
+    eos_token_id: int = field(default=248_044, init=False)
+    ngram_size: int = field(default=3, init=False)
+    heads_per_ngram: int = field(default=8, init=False)
+    ngram_vocab_size_base: int = field(default=20_000_000, init=False)
+    divisor: int = field(default=128, init=False)
+    ple_layer_index: int = field(default=0, init=False)
+    seed: int = field(default=1234, init=False)
     multipliers: tuple[int, ...] = field(init=False)
     head_vocab_sizes: tuple[int, ...] = field(init=False)
     head_offsets: tuple[int, ...] = field(init=False)
@@ -205,10 +206,16 @@ class NGramGeometry:
         )
 
     @classmethod
-    def qwen38_flash_next(cls) -> NGramGeometry:
+    def qwen38(cls) -> NGramGeometry:
         """Return the exact revision-pinned Qwen3.8 Flash-Next geometry."""
 
         return cls()
+
+    @classmethod
+    def qwen38_flash_next(cls) -> NGramGeometry:
+        """Compatibility spelling for the pinned Qwen3.8 geometry."""
+
+        return cls.qwen38()
 
     def _context_matrix(
         self, prior_context: Any, *, batch_size: int
@@ -305,10 +312,13 @@ class NGramGeometry:
 
 def _safe_component(name: Any, *, label: str) -> str:
     value = _exact_string(name, label=label)
-    if "\\" in value:
-        raise NGramManifestError(f"{label} must use POSIX naming")
-    pure = PurePosixPath(value)
-    if pure.is_absolute() or len(pure.parts) != 1 or pure.parts[0] in {"", ".", ".."}:
+    if (
+        value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+        or unicodedata.normalize("NFC", value) != value
+    ):
         raise NGramManifestError(f"unsafe {label}: {value!r}")
     return value
 
