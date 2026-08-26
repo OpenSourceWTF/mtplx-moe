@@ -747,6 +747,21 @@ def _apply_runtime_compatibility_mode(
             setattr(args, "depth", 0)
         setattr(args, "load_mtp", False)
         return None
+    if runtime_compatibility == "native-ar-only-mtp-unsupported":
+        # Same directive, generalized 2026-08-26: an MTP head this build
+        # cannot attach (unsupported family, failed tensor gate, pending
+        # backend) is unavailable, never a blocker. The head is left
+        # untouched on disk; the trunk serves autoregressive.
+        if _generation_mode_from_args(args) != GENERATION_MODE_AR:
+            printer(
+                "MTP unavailable in this MTPLX build -> mtp_off: serving "
+                "autoregressive (trunk loads natively; speculative "
+                "acceleration for this model lands with a runtime update)."
+            )
+            _set_generation_mode_on_args(args, GENERATION_MODE_AR)
+            setattr(args, "depth", 0)
+        setattr(args, "load_mtp", False)
+        return None
     if runtime_compatibility != "native-ar-only":
         return None
     if _generation_mode_from_args(args) != GENERATION_MODE_AR:

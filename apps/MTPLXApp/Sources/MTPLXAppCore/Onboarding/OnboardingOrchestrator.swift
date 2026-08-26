@@ -120,10 +120,6 @@ public final class OnboardingOrchestrator: ObservableObject {
         tuneCandidatesLanded = [:]
     }
 
-    public func acknowledgeOtherWarning() {
-        state.hasAcknowledgedOtherWarning = true
-    }
-
     // MARK: - Hardware detection
 
     public func detectHardware() {

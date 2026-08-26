@@ -107,15 +107,16 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Ready probe allows advance")
     }
 
-    func testModelPickNoMTPRequiresExplicitAcknowledgement() {
-        var s = OnboardingFeatureState(
+    func testModelPickNoMTPAdvancesWithoutAcknowledgement() {
+        // Founder directive 2026-08-26: MTP unavailable is informational,
+        // never a gate. The engine serves MTP-less checkpoints AR, so the
+        // wizard advances the same way the CLI runs them.
+        let s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
-            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "No MTP")
+            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "MTP unavailable")
         )
-        XCTAssertFalse(s.canAdvance, "noMTP blocks until acknowledged")
-        s.hasAcknowledgedOtherWarning = true
-        XCTAssertTrue(s.canAdvance, "Acknowledged noMTP allows advance")
+        XCTAssertTrue(s.canAdvance, "noMTP is informational and advances")
     }
 
     func testModelPickLocalRequiresReadyProbe() {
@@ -138,36 +139,29 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Complete MTPLX local folders allow advance")
     }
 
-    // MARK: select(_:) wipes stale probe + acknowledgement
+    // MARK: select(_:) wipes stale probes
 
-    func testSelectChoiceClearsProbeAndAcknowledgement() {
+    func testSelectChoiceClearsProbes() {
         var s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
             otherProbe: OtherModelProbe(verdict: .ready, hfRepo: "Foo/Bar", message: "OK"),
-            localProbe: LocalModelProbe(verdict: .ready, path: "/models/qwen", message: "Ready"),
-            hasAcknowledgedOtherWarning: true
+            localProbe: LocalModelProbe(verdict: .ready, path: "/models/qwen", message: "Ready")
         )
         s.select(.curatedSpeed)
         XCTAssertEqual(s.pick, .curatedSpeed)
         XCTAssertNil(s.otherProbe)
         XCTAssertNil(s.localProbe)
-        XCTAssertFalse(s.hasAcknowledgedOtherWarning)
     }
 
-    func testRecordProbeWipesAcknowledgement() {
+    func testRecordProbeReplacesPrevious() {
         var s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
-            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "No MTP"),
-            hasAcknowledgedOtherWarning: true
+            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "MTP unavailable")
         )
         s.record(OtherModelProbe(verdict: .ready, hfRepo: "Foo/Bar", message: "OK"))
         XCTAssertEqual(s.otherProbe?.verdict, .ready)
-        XCTAssertFalse(
-            s.hasAcknowledgedOtherWarning,
-            "A new probe must force a fresh acknowledgement"
-        )
     }
 
     // MARK: resolvedModel applies M1/M2 FP16 routing

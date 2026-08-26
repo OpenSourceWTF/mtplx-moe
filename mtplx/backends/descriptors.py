@@ -1009,8 +1009,17 @@ def _text_markers(model_ref: str | None, inspection: dict[str, Any] | None) -> s
 # parameter count, not a version, and must not claim the qwen3_8 family.
 _QWEN3_8_MARKER = re.compile(r"qwen3[._-]?8(?!\d*b)")
 
+# Qwen4-generation previews carry "3.8" in their public names
+# (Qwen3.8-Flash-Next) but are a different architecture generation with
+# their own sampler/reasoning contract; the dense-27B qwen3_8 behavior
+# contract must not claim them by name. They resolve to the generic default
+# descriptor until a dedicated qwen4 contract exists.
+_QWEN4_PREVIEW_MARKER = re.compile(r"flash[._-]?next|qwen[._-]?4")
+
 
 def _explicit_qwen_family_marker(text: str) -> str | None:
+    if _QWEN4_PREVIEW_MARKER.search(text):
+        return None
     if _QWEN3_8_MARKER.search(text):
         return "qwen3_8"
     if "qwen3.6" in text or "qwen3_6" in text or "qwen36" in text or "qwen3-6" in text:

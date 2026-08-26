@@ -452,8 +452,11 @@ def _no_mtp_probe_message(diagnostic: str | None) -> str:
             "target/, and assistant/. Point Forge at the bundle root instead."
         )
     return (
-        "Source does not contain runnable MTP weights; Forge refuses "
-        "to brand AR-only or config-only artifacts."
+        "Source has no MTP head, and Forge currently builds speculative "
+        "MTP artifacts only. This does NOT block running the model: MTPLX "
+        "serves MTP-less checkpoints autoregressive directly (mtplx run / "
+        "mtplx serve — MTP unavailable, mtp_off). AR-only Forge "
+        "conversion/quantization lands in a later update."
     )
 
 
