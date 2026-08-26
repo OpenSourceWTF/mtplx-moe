@@ -132,6 +132,21 @@ def test_q4_route_refuses_sliding_window_and_bad_geometry(monkeypatch):
     )
 
 
+def test_packed_quant_static_blocks_from_ceiling():
+    """Blocks derive from the STATIC ceiling (compiled bucket), clamped to
+    capacity — the shape-stability contract of the compiled adapter."""
+    from mtplx.kernels.sdpa_gqa_packed import _blocks_for_capacity
+    from mtplx.kernels.sdpa_gqa_packed_quant import _static_blocks
+
+    assert _static_blocks(131072, None) == _blocks_for_capacity(131072)
+    assert _static_blocks(131072, 4096) == _blocks_for_capacity(4096)
+    assert _static_blocks(2048, 131072) == _blocks_for_capacity(2048)  # clamp
+    assert _static_blocks(2048, 0) == _blocks_for_capacity(1)  # floor
+    for capacity, max_offset in ((64, 64), (32768, 8192), (262144, 32768)):
+        blocks = _static_blocks(capacity, max_offset)
+        assert blocks > 0 and blocks % 32 == 0
+
+
 def test_packed_quant_safe_q_len_geometry_table():
     cache = _build_cache("q4")
     _prefill(cache, 32, seed=51)
