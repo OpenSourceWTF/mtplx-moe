@@ -1409,7 +1409,11 @@ def test_kv_quant_q8_kernel_engages_and_matches_dequant_path(monkeypatch):
     assert float(diff.item()) <= 5e-3
 
 
-def test_kv_quant_q4_never_routes_to_q8_kernel(monkeypatch):
+def test_kv_quant_q4_kernel_route_matches_dequant(monkeypatch):
+    """2026-08-26 route flip: q4 now takes the v5 bits=4 kernel when the
+    geometry allows. Guard the NEW invariants: the kernel route engages
+    exactly once, and its output matches the legacy dequant route (the old
+    "never kernels" behavior, reachable via the revert lever)."""
     if not mx.metal.is_available():
         pytest.skip("Metal is unavailable")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "mlx_vector_paged")
@@ -1421,18 +1425,40 @@ def test_kv_quant_q4_never_routes_to_q8_kernel(monkeypatch):
     queries = 0.3 * mx.random.normal((1, 8, 2, dim), dtype=mx.bfloat16)
     keys = 0.5 * mx.random.normal((1, 2, 200, dim), dtype=mx.bfloat16)
     values = 0.5 * mx.random.normal((1, 2, 200, dim), dtype=mx.bfloat16)
-    cache = VllmMetalPagedKVCache(
-        block_size=16,
-        num_blocks=16,
-        kv_quant_config=PagedKVQuantConfig("q4"),
+
+    def _make_cache():
+        cache = VllmMetalPagedKVCache(
+            block_size=16,
+            num_blocks=16,
+            kv_quant_config=PagedKVQuantConfig("q4"),
+        )
+        cache.update_without_fetch(keys, values)
+        return cache
+
+    monkeypatch.setenv("MTPLX_KV_QUANT_Q4_KERNEL", "1")
+    kernel_cache = _make_cache()
+    kernel_out = kernel_cache.paged_attention(
+        queries, scale=dim**-0.5, mask="causal"
     )
-    cache.update_without_fetch(keys, values)
+    assert kernel_out is not None
+    mx.eval(kernel_out)
+    assert kernel_cache.kv_quant_kernel_calls == 1
+    assert kernel_cache.kv_quant_attention_calls == 1
 
-    out = cache.paged_attention(queries, scale=dim**-0.5, mask="causal")
+    monkeypatch.setenv("MTPLX_KV_QUANT_Q4_KERNEL", "0")
+    dequant_cache = _make_cache()
+    dequant_out = dequant_cache.paged_attention(
+        queries, scale=dim**-0.5, mask="causal"
+    )
+    assert dequant_out is not None
+    mx.eval(dequant_out)
+    assert dequant_cache.kv_quant_kernel_calls == 0
 
-    assert out is not None
-    assert cache.kv_quant_kernel_calls == 0
-    assert cache.kv_quant_attention_calls == 1
+    diff = mx.max(
+        mx.abs(kernel_out.astype(mx.float32) - dequant_out.astype(mx.float32))
+    )
+    mx.eval(diff)
+    assert float(diff.item()) <= 5e-3
 
 
 def test_install_hybrid_cache_counts_attention_entries_and_skips_rest(monkeypatch):
@@ -1904,7 +1930,10 @@ def test_promote_default_still_follows_env_for_paged_entries(monkeypatch):
     assert isinstance(cache[0], TensorOffsetVllmMetalPagedKVCache)
 
 
-def test_promote_preserve_paged_refuses_quantized_paged_entries(monkeypatch):
+def test_promote_preserve_paged_refuses_out_of_class_quantized_entries(monkeypatch):
+    """2026-08-26: quantized paged entries in the supported v5 geometry now
+    PROMOTE (see the quantized-adapter tests); an out-of-class geometry
+    (D=16 here) must still fail closed with the geometry reason."""
     from mtplx.graphbank import promote_kv_cache_offsets
 
     monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
@@ -1924,7 +1953,7 @@ def test_promote_preserve_paged_refuses_quantized_paged_entries(monkeypatch):
     )
 
     assert promoted == 0
-    assert failures == {"quantized_paged_kv_cache": 1}
+    assert failures == {"quantized_paged_kv_geometry": 1}
     assert cache[0] is quantized
 
 
