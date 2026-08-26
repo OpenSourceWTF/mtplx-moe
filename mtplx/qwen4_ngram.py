@@ -153,6 +153,10 @@ class NGramGeometry:
     total_vocab_size: int = field(init=False)
     padded_rows: int = field(init=False)
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        del cls, kwargs
+        raise TypeError("NGramGeometry is pinned and cannot be subclassed")
+
     def __post_init__(self) -> None:
         for name in (
             "vocab_size",
@@ -205,17 +209,17 @@ class NGramGeometry:
             self, "padded_rows", math.ceil(total / self.divisor) * self.divisor
         )
 
-    @classmethod
-    def qwen38(cls) -> NGramGeometry:
+    @staticmethod
+    def qwen38() -> NGramGeometry:
         """Return the exact revision-pinned Qwen3.8 Flash-Next geometry."""
 
-        return cls()
+        return NGramGeometry()
 
-    @classmethod
-    def qwen38_flash_next(cls) -> NGramGeometry:
+    @staticmethod
+    def qwen38_flash_next() -> NGramGeometry:
         """Compatibility spelling for the pinned Qwen3.8 geometry."""
 
-        return cls.qwen38()
+        return NGramGeometry()
 
     def _context_matrix(
         self, prior_context: Any, *, batch_size: int

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -61,6 +61,8 @@ EXPECTED_OFFSETS = (
 def test_qwen38_geometry_is_exact_and_frozen() -> None:
     geometry = NGramGeometry.qwen38()
 
+    assert NGramGeometry() == geometry
+    assert NGramGeometry.qwen38_flash_next() == geometry
     assert geometry.vocab_size == 248_320
     assert geometry.eos_token_id == 248_044
     assert geometry.ngram_size == 3
@@ -91,6 +93,23 @@ def test_qwen38_geometry_is_exact_and_frozen() -> None:
 def test_geometry_rejects_public_parameterization(kwargs: dict[str, int]) -> None:
     with pytest.raises(TypeError):
         NGramGeometry(**kwargs)
+
+
+def test_geometry_rejects_frozen_dataclass_subclass_drift() -> None:
+    def define_drifted_geometry() -> None:
+        @dataclass(frozen=True)
+        class DriftedGeometry(NGramGeometry):
+            vocab_size: int = 10
+            eos_token_id: int = 1
+            ngram_size: int = 2
+            heads_per_ngram: int = 1
+            seed: int = 0
+
+        assert DriftedGeometry().seed == 0
+        assert DriftedGeometry.qwen38().vocab_size == 10
+
+    with pytest.raises(TypeError, match="subclass"):
+        define_drifted_geometry()
 
 
 def test_row_ids_match_official_examples() -> None:
