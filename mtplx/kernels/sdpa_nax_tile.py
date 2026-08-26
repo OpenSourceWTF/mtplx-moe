@@ -1,0 +1,365 @@
+"""TensorOps (NAX) wide-M tail-causal SDPA — Phase 2.2 of the hyper campaign.
+
+The whole verify walk for one KV head is a matrix problem: GQA_F(6) x QL(4)
+query rows = M=24 rows sharing one K/V stream.  This kernel feeds that M block
+through the M5 per-core Neural Accelerators via Metal 4 TensorOps
+(``mpp::tensor_ops::matmul2d``), reading each K/V tile ONCE per simdgroup pair
+instead of once per scalar row-chain.
+
+Contract: identical to :func:`mtplx.kernels.sdpa_gqa_packed.sdpa_gqa_packed_tail`
+(tail-causal, ``row j`` attends to ``n <= offset - q_len + j``; whole-capacity
+buffers; bf16/fp16 in, same dtype out).  Split-KV partials are emitted in the
+packed kernel's exact ``[1, HQ, QL, BLOCKS, D]`` layout so its reduce kernel is
+reused verbatim — the fp32 LSE merge contract is shared, not reimplemented.
+
+Fragment/coordinate mapping follows the proven M5 pattern from
+Mininglamp-AI/cider (w8a8_matmul.metal, Apache-2.0): descriptor
+``matmul2d_descriptor(16, 32, 16, false, true, true, multiply_accumulate)``
+with the NAXFrag 8-elements-per-thread register layout.  PV reuses the SAME
+transposed-right descriptor by staging V transposed in threadgroup memory.
+
+Requires macOS >= 26.2 (bf16 TensorOps).  Gated: returns None on any contract
+miss; env kill-switch MTPLX_NAX_TILE=0.
+"""
+
+from __future__ import annotations
+
+import os
+from functools import lru_cache
+
+import mlx.core as mx
+
+from .sdpa_gqa_packed import _blocks_for_capacity, _paged_reduce_kernel
+
+_HEADER = r"""
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+
+constant constexpr short kElemsPerFrag = 8;
+constant constexpr short kElemCols = 4;
+constant constexpr short kElemRowsJump = 8;
+
+// NAXFrag lane -> (col, row) coordinate map (cider convention, M5 G17G).
+inline short2 nax_get_coord(ushort lid) {
+  short qid = short(lid >> 2);
+  short fm = ((qid & 4) | ((short(lid) >> 1) & 3));
+  short fn = ((qid & 2) | (short(lid) & 1)) * 4;
+  return short2{fn, fm};
+}
+"""
+
+# Template params injected by mx.fast.metal_kernel: InT, D, QL, GQA_F.
+# Inputs: queries, keys, values, offset(i32[1]), kcap(int), scale(f32), blocks(int)
+# Outputs: partials [1, HQ, QL, blocks, D] InT, sums/maxs [1, HQ, QL, blocks] f32
+_SOURCE = r"""
+    constexpr int TK = 32;               // keys per tile
+    constexpr int MROWS = 16;            // M rows per simdgroup
+    constexpr int LIVE = GQA_F * QL;     // live M rows per KV head (24)
+    constexpr int DFRAGS = D / 16;       // 16 K-frags along head dim
+    constexpr int NGROUPS = D / 32;      // 8 PV output column groups
+
+    const uint lid64 = thread_position_in_threadgroup.x;      // 0..63
+    const uint sg = lid64 >> 5;                               // simdgroup 0/1
+    const ushort lane = ushort(lid64 & 31);
+    const int kv_head = int(threadgroup_position_in_grid.x);
+    const int block_idx = int(threadgroup_position_in_grid.z);
+    const int n_blocks = int(blocks[0]);
+
+    const int n_kv = static_cast<int>(offset[0]);
+    const int tail_lo = n_kv - QL;
+
+    // Contiguous chunk per block, tile-aligned (32).
+    const int chunk = ((n_kv + n_blocks - 1) / n_blocks + TK - 1) / TK * TK;
+    const int kv_start = block_idx * chunk;
+    const int kv_end = metal::min(kv_start + chunk, n_kv);
+
+    const short2 sc = nax_get_coord(lane);
+    const int m_base = int(sg) * MROWS;   // rows [m_base, m_base+16) of the 32-pad
+
+    // Threadgroup staging: V transposed tile [D][TK] bf16-class + P + factors.
+    threadgroup InT tg_vT[D * TK];        // 16 KB at D=256
+    threadgroup float tg_S[2 * MROWS * TK];   // 4 KB
+    threadgroup InT tg_P[2 * MROWS * TK];     // 2 KB
+    threadgroup float tg_f[2 * MROWS];
+
+    const device InT* k_head = keys + (size_t)kv_head * kcap * D;
+    const device InT* v_head = values + (size_t)kv_head * kcap * D;
+    // Q rows for this KV head start at global q-row kv_head*LIVE (row-major
+    // [HQ*QL, D] flatten of [1, HQ, QL, D]).
+    const device InT* q_head = queries + (size_t)kv_head * LIVE * D;
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> mm;
+
+    auto ct_a = mm.get_left_input_cooperative_tensor<InT, InT, float>();
+    auto ct_b = mm.get_right_input_cooperative_tensor<InT, InT, float>();
+    auto ct_c = mm.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+
+    // Per-thread state: online softmax (row-owner threads) + O fragments.
+    float row_m = -1e38f;   // owned row max (threads 0..15 of each sg)
+    float row_l = 0.0f;     // owned row sumexp
+    float o_frag[NGROUPS][2][kElemsPerFrag];
+    for (int g = 0; g < NGROUPS; g++)
+      for (int h = 0; h < 2; h++)
+        for (int i = 0; i < kElemsPerFrag; i++) o_frag[g][h][i] = 0.0f;
+
+    for (int t0 = kv_start; t0 < kv_end; t0 += TK) {
+      // ── stage V^T tile (all 64 threads, coalesced read) ──
+      for (int idx = int(lid64); idx < TK * D; idx += 64) {
+        const int p = idx / D;           // key row in tile
+        const int d = idx % D;
+        const int gp = t0 + p;
+        tg_vT[d * TK + p] = (gp < kv_end)
+            ? v_head[(size_t)gp * D + d] : InT(0);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // ── QK: S[16,32] += Q[16,256] x Ktile[32,256]^T ──
+      float s_frag[2][kElemsPerFrag];
+      for (int h = 0; h < 2; h++)
+        for (int i = 0; i < kElemsPerFrag; i++) s_frag[h][i] = 0.0f;
+
+      for (int kk = 0; kk < DFRAGS; kk++) {
+        // left: Q fragment [16,16] at rows m_base+, dims kk*16 (zero-pad dead rows)
+        for (short i = 0; i < 2; i++) {
+          for (short j = 0; j < kElemCols; j++) {
+            const int mr = m_base + sc.y + i * kElemRowsJump;
+            ct_a[i * kElemCols + j] = (mr < LIVE)
+                ? q_head[(size_t)mr * D + kk * 16 + sc.x + j] : InT(0);
+          }
+        }
+        // right: K tile halves [16,16] rows t0+, dims kk*16 (transpose_b)
+        for (short hh = 0; hh < 2; hh++) {
+          for (short i = 0; i < 2; i++) {
+            for (short j = 0; j < kElemCols; j++) {
+              const int kr = t0 + hh * 16 + sc.y + i * kElemRowsJump;
+              ct_b[hh * kElemsPerFrag + i * kElemCols + j] = (kr < kv_end)
+                  ? k_head[(size_t)kr * D + kk * 16 + sc.x + j] : InT(0);
+            }
+          }
+        }
+        for (short i = 0; i < 2 * kElemsPerFrag; i++)
+          ct_c[i] = (kk == 0) ? 0.0f
+              : ((i < kElemsPerFrag) ? s_frag[0][i] : s_frag[1][i - kElemsPerFrag]);
+        mm.run(ct_a, ct_b, ct_c);
+        for (short i = 0; i < kElemsPerFrag; i++) {
+          s_frag[0][i] = ct_c[i];
+          s_frag[1][i] = ct_c[kElemsPerFrag + i];
+        }
+      }
+
+      // S fragments -> threadgroup (scaled)
+      for (short hh = 0; hh < 2; hh++) {
+        for (short i = 0; i < 2; i++) {
+          for (short j = 0; j < kElemCols; j++) {
+            const int r = sc.y + i * kElemRowsJump;           // 0..15
+            const int c = hh * 16 + sc.x + j;                 // 0..31
+            tg_S[(m_base + r) * TK + c] = s_frag[hh][i * kElemCols + j] * scale;
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // ── per-row online softmax (threads 0..15 of each sg own a row) ──
+      if (lane < MROWS) {
+        const int m_local = m_base + int(lane);
+        const int j_row = m_local % QL;                 // QL index of this row
+        const int row_limit = tail_lo + j_row;          // visible: n <= row_limit
+        float tmax = -1e38f;
+        for (int c = 0; c < TK; c++) {
+          const int gp = t0 + c;
+          float s = (gp < kv_end && gp <= row_limit && m_local < LIVE)
+              ? tg_S[m_local * TK + c] : -1e38f;
+          tg_S[m_local * TK + c] = s;
+          tmax = metal::max(tmax, s);
+        }
+        const float new_m = metal::max(row_m, tmax);
+        const float f = metal::exp(row_m - new_m);
+        float tsum = 0.0f;
+        for (int c = 0; c < TK; c++) {
+          const float s = tg_S[m_local * TK + c];
+          const float p = (s > -1e37f) ? metal::exp(s - new_m) : 0.0f;
+          tg_P[m_local * TK + c] = InT(p);
+          tsum += p;
+        }
+        row_m = new_m;
+        row_l = row_l * f + tsum;
+        tg_f[m_local] = f;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // ── O rescale by this tile's factor ──
+      for (short i = 0; i < 2; i++) {
+        const float f = tg_f[m_base + sc.y + i * kElemRowsJump];
+        for (int g = 0; g < NGROUPS; g++)
+          for (short hh = 0; hh < 2; hh++)
+            for (short j = 0; j < kElemCols; j++)
+              // elements (i, j) of half hh share the row sc.y + i*8
+              o_frag[g][hh][i * kElemCols + j] *= f;
+      }
+
+      // ── PV: O[16, 32g..] += P[16,32] x (V^T)[32dims,32keys]^T ──
+      for (int g = 0; g < NGROUPS; g++) {
+        for (int kk = 0; kk < 2; kk++) {          // 32 keys = 2 K-frags
+          for (short i = 0; i < 2; i++) {
+            for (short j = 0; j < kElemCols; j++) {
+              const int r = m_base + sc.y + i * kElemRowsJump;
+              ct_a[i * kElemCols + j] = tg_P[r * TK + kk * 16 + sc.x + j];
+            }
+          }
+          for (short hh = 0; hh < 2; hh++) {
+            for (short i = 0; i < 2; i++) {
+              for (short j = 0; j < kElemCols; j++) {
+                const int dcol = g * 32 + hh * 16 + sc.y + i * kElemRowsJump;
+                ct_b[hh * kElemsPerFrag + i * kElemCols + j] =
+                    tg_vT[dcol * TK + kk * 16 + sc.x + j];
+              }
+            }
+          }
+          for (short i = 0; i < kElemsPerFrag; i++) {
+            ct_c[i] = o_frag[g][0][i];
+            ct_c[kElemsPerFrag + i] = o_frag[g][1][i];
+          }
+          mm.run(ct_a, ct_b, ct_c);
+          for (short i = 0; i < kElemsPerFrag; i++) {
+            o_frag[g][0][i] = ct_c[i];
+            o_frag[g][1][i] = ct_c[kElemsPerFrag + i];
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── store partials [1, HQ, QL, blocks, D] + stats [1, HQ, QL, blocks] ──
+    for (short i = 0; i < 2; i++) {
+      const int m_local = m_base + sc.y + i * kElemRowsJump;
+      if (m_local >= LIVE) continue;
+      const int hq_row = kv_head * LIVE + m_local;     // == h*QL + j global
+      device InT* prow = partials
+          + ((size_t)hq_row * n_blocks + block_idx) * D;
+      for (int g = 0; g < NGROUPS; g++)
+        for (short hh = 0; hh < 2; hh++)
+          for (short j = 0; j < kElemCols; j++)
+            prow[g * 32 + hh * 16 + sc.x + j] = InT(o_frag[g][hh][i * kElemCols + j]);
+    }
+    if (lane < MROWS) {
+      const int m_local = m_base + int(lane);
+      if (m_local < LIVE) {
+        const int hq_row = kv_head * LIVE + m_local;
+        sums[hq_row * n_blocks + block_idx] = row_l;
+        maxs[hq_row * n_blocks + block_idx] = (row_l > 0.0f) ? row_m : -1e38f;
+      }
+    }
+"""
+
+
+@lru_cache(maxsize=4)
+def _nax_tile_kernel():
+    try:
+        return mx.fast.metal_kernel(
+            name="mtplx_nax_tile_partials",
+            input_names=["queries", "keys", "values", "offset", "kcap",
+                         "scale", "blocks"],
+            output_names=["partials", "sums", "maxs"],
+            header=_HEADER,
+            source=_SOURCE,
+        )
+    except Exception:  # noqa: BLE001 — toolchain without Metal4/MPP support
+        return None
+
+
+def _bail(reason: str):
+    if os.environ.get("MTPLX_NAX_TILE_DEBUG"):
+        print(f"[nax-tile bail] {reason}")
+    return None
+
+
+def sdpa_nax_tile(
+    *,
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    offset: int | mx.array,
+    scale: float,
+) -> mx.array | None:
+    """TensorOps wide-M tail-causal SDPA. Same contract as the packed kernel."""
+    if os.environ.get("MTPLX_NAX_TILE", "1") == "0":
+        return _bail("env_disabled")
+    if not mx.metal.is_available():
+        return _bail("metal_unavailable")
+    if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
+        return _bail("ndim")
+    bsz, hq, q_len, d = (int(x) for x in queries.shape)
+    if bsz != 1 or d != 256:
+        return _bail("shape_gate")
+    hk = int(keys.shape[1])
+    capacity = int(keys.shape[2])
+    if hk <= 0 or hq % hk:
+        return _bail("gqa_heads")
+    gqa_factor = hq // hk
+    if gqa_factor * q_len > 32:
+        return _bail("m_rows_gt_32")
+    if q_len < 1 or q_len > 8:
+        return _bail("q_len")
+    if queries.dtype not in (mx.bfloat16, mx.float16):
+        return _bail("query_dtype")
+    if keys.dtype != queries.dtype or values.dtype != queries.dtype:
+        return _bail("kv_dtype_mismatch")
+    if int(values.shape[1]) != hk or int(values.shape[2]) != capacity \
+            or int(keys.shape[3]) != d or int(values.shape[3]) != d:
+        return _bail("kv_layout_mismatch")
+
+    if isinstance(offset, mx.array):
+        if offset.size != 1:
+            return _bail("offset_shape")
+        offset_arr = offset.astype(mx.int32).reshape(1)
+    else:
+        offset_int = int(offset)
+        if offset_int <= 0 or offset_int > capacity:
+            return _bail("offset_range")
+        offset_arr = mx.array([offset_int], dtype=mx.int32)
+
+    blocks = _blocks_for_capacity(capacity)
+    if blocks <= 0 or blocks % 32:
+        return _bail("blocks_geometry")
+    blocks_arr = mx.array([blocks], dtype=mx.int32)
+
+    kernel = _nax_tile_kernel()
+    reduce_kernel = _paged_reduce_kernel()
+    if kernel is None or reduce_kernel is None:
+        return _bail("kernel_unavailable")
+
+    partial_shape = (bsz, hq, q_len, blocks, d)
+    stats_shape = (bsz, hq, q_len, blocks)
+    try:
+        partials, sums, maxs = kernel(
+            inputs=[queries, keys, values, offset_arr, capacity,
+                    float(scale), blocks_arr],
+            template=[
+                ("InT", queries.dtype),
+                ("D", d),
+                ("QL", q_len),
+                ("GQA_F", gqa_factor),
+            ],
+            grid=(hk * 64, 1, blocks),
+            threadgroup=(64, 1, 1),
+            output_shapes=[partial_shape, stats_shape, stats_shape],
+            output_dtypes=[queries.dtype, mx.float32, mx.float32],
+        )
+    except Exception:  # noqa: BLE001 — dispatch/compile failure => stock fallback
+        return _bail("dispatch_failed")
+
+    (out,) = reduce_kernel(
+        inputs=[partials, sums, maxs, int(blocks)],
+        template=[
+            ("InT", queries.dtype),
+            ("V", d),
+        ],
+        grid=(bsz * hq * 1024, q_len, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(bsz, hq, q_len, d)],
+        output_dtypes=[queries.dtype],
+    )
+    return out
