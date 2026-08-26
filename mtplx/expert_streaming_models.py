@@ -880,9 +880,10 @@ QWEN38_FLASH_NEXT_Q4 = ExpertStreamingModelSpec(
     source_model="Qwen/Qwen3.8-Flash-Next",
     source_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     quant_model="OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-Q4",
-    # This artifact is constructed locally rather than fetched from an HF
-    # commit. Its deterministic identifier is SHA-256 over the pinned source,
-    # target artifact name, and affine-q4/group64/BF16-parameter contract.
+    # UNPUBLISHED CANDIDATE: this deterministic construction digest is SHA-256
+    # over the pinned source, target artifact name, and affine-q4/group64/BF16
+    # parameter contract. Task 12 MUST replace it with the derivative's actual
+    # immutable HF commit before adding this candidate to MODEL_SPECS.
     quant_revision="09dbf9fa47543c707eb50e6d27f929c989be54eb14cd386f0d0bb3c98564f2c6",
     # Source tensor payload minus its BF16 routed bank plus the affine-Q4 bank.
     total_tensor_bytes=182_738_190_328,
@@ -925,7 +926,6 @@ MODEL_SPECS: dict[str, ExpertStreamingModelSpec] = {
         GLM52_EXPERT_Q1T,
         GLM52_EXPERT_Q1B1,
         KIMI_K3_EXPERT_Q1T,
-        QWEN38_FLASH_NEXT_Q4,
     )
 }
 

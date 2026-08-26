@@ -29,10 +29,17 @@ def _text_config() -> dict[str, object]:
     ]
     return {
         "model_type": "qwen4_exp_text",
+        "dtype": "bfloat16",
+        "hidden_act": "silu",
         "hidden_size": 2560,
         "num_hidden_layers": 48,
+        "full_attention_interval": 4,
         "layer_types": layer_types,
+        "attention_bias": False,
+        "attention_dropout": 0.0,
         "ple_layer_ids": [2],
+        "ple_embed_dim": 2560,
+        "ple_conv_kernel_size": 4,
         "num_experts": 512,
         "num_experts_per_tok": 10,
         "moe_intermediate_size": 640,
@@ -44,6 +51,7 @@ def _text_config() -> dict[str, object]:
         "linear_key_head_dim": 128,
         "linear_value_head_dim": 128,
         "linear_conv_kernel_dim": 4,
+        "mamba_ssm_dtype": "float32",
         "num_attention_heads": 24,
         "num_key_value_heads": 2,
         "head_dim": 256,
@@ -68,6 +76,10 @@ def _text_config() -> dict[str, object]:
         },
         "vocab_size": 248_320,
         "eos_token_id": 248_044,
+        "rms_norm_eps": 0.000001,
+        "output_gate_type": "sigmoid",
+        "tie_word_embeddings": False,
+        "use_cache": True,
         "max_position_embeddings": 262_144,
         "partial_rotary_factor": 0.25,
         "rope_parameters": {
@@ -94,10 +106,16 @@ def _assert_pinned_args(args: ModelArgs) -> None:
         for layer in range(48)
     )
     assert args.model_type == "qwen4_exp_text"
+    assert args.dtype == "bfloat16"
+    assert args.hidden_act == "silu"
     assert args.hidden_size == 2560
     assert args.num_hidden_layers == 48
+    assert args.full_attention_interval == 4
     assert args.layer_types == expected_layers
+    assert args.attention_bias is False
+    assert args.attention_dropout == 0.0
     assert args.ple_layer_ids == (2,)
+    assert (args.ple_embed_dim, args.ple_conv_kernel_size) == (2560, 4)
     assert args.num_experts == 512
     assert args.num_experts_per_tok == 10
     assert args.moe_intermediate_size == 640
@@ -110,6 +128,7 @@ def _assert_pinned_args(args: ModelArgs) -> None:
         args.linear_value_head_dim,
         args.linear_conv_kernel_dim,
     ) == (16, 48, 128, 128, 4)
+    assert args.mamba_ssm_dtype == "float32"
     assert (
         args.num_attention_heads,
         args.num_key_value_heads,
@@ -137,6 +156,10 @@ def _assert_pinned_args(args: ModelArgs) -> None:
     assert args.mtp.num_hidden_layers == 1
     assert args.mtp.rope_theta == 10_000_000
     assert (args.vocab_size, args.eos_token_id) == (248_320, 248_044)
+    assert args.rms_norm_eps == 1e-6
+    assert args.output_gate_type == "sigmoid"
+    assert args.tie_word_embeddings is False
+    assert args.use_cache is True
     assert args.max_position_embeddings == 262_144
     assert args.partial_rotary_factor == 0.25
     assert args.rope_parameters.mrope_interleaved is True
@@ -144,7 +167,55 @@ def _assert_pinned_args(args: ModelArgs) -> None:
     assert args.rope_parameters.partial_rotary_factor == 0.25
     assert args.rope_parameters.rope_theta == 10_000_000
     assert args.rope_parameters.rope_type == "default"
+    assert args.streamed_layer_ids == tuple(range(49))
     assert args.seed == 1234
+
+
+def _set_path(
+    config: dict[str, object], path: tuple[object, ...], value: object
+) -> None:
+    target: object = config
+    for part in path[:-1]:
+        if isinstance(part, int):
+            assert isinstance(target, list)
+            target = target[part]
+        else:
+            assert isinstance(target, dict)
+            target = target[part]
+    leaf = path[-1]
+    if isinstance(leaf, int):
+        assert isinstance(target, list)
+        target[leaf] = value
+    else:
+        assert isinstance(target, dict)
+        target[leaf] = value
+
+
+def _pinned_scalar_mutations() -> list[tuple[tuple[object, ...], object]]:
+    mutations: list[tuple[tuple[object, ...], object]] = []
+
+    def visit(value: object, path: tuple[object, ...]) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(child, (*path, key))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, (*path, index))
+        elif type(value) is bool:
+            mutations.append((path, not value))
+        elif type(value) is int:
+            mutations.append((path, value + 1))
+        elif type(value) is float:
+            mutations.append((path, value + 0.5))
+        elif type(value) is str:
+            mutations.append((path, f"{value}-changed"))
+        elif value is None:
+            mutations.append((path, 0))
+        else:
+            raise AssertionError(f"uncovered fixture type at {path}: {type(value)}")
+
+    visit(_text_config(), ())
+    return mutations
 
 
 @pytest.mark.parametrize("config", [_root_config(), _text_config()])
@@ -188,11 +259,64 @@ def test_model_args_are_frozen_and_reject_geometry_drift() -> None:
         ModelArgs.from_dict(changed)
 
 
-def test_qwen38_flash_next_q4_streaming_geometry_is_exact() -> None:
-    spec = get_model_spec("qwen38-flash-next-q4")
+@pytest.mark.parametrize(("path", "changed_value"), _pinned_scalar_mutations())
+def test_every_pinned_config_scalar_rejects_drift(
+    path: tuple[object, ...], changed_value: object
+) -> None:
+    changed = _text_config()
+    _set_path(changed, path, changed_value)
 
-    assert spec is QWEN38_FLASH_NEXT_Q4
-    assert MODEL_SPECS[spec.key] is spec
+    with pytest.raises(
+        (TypeError, ValueError), match="pinned Qwen3.8 Flash-Next geometry"
+    ):
+        ModelArgs.from_dict(changed)
+
+
+@pytest.mark.parametrize(
+    ("path", "malformed"),
+    (
+        (("indexer_kv_heads",), True),
+        (("mtp_num_hidden_layers",), True),
+        (("mtp", "num_hidden_layers"), True),
+        (("eos_token_id",), 248_044.0),
+        (("mtp_use_dedicated_embeddings",), 0),
+        (("mtp", "rope_theta"), 10_000_000.0),
+        (("rope_parameters", "rope_theta"), 10_000_000.0),
+        (("attention_bias",), 0),
+        (("use_cache",), 1),
+        (("mtp", "hybrid"), 1),
+        (("rope_parameters", "mrope_interleaved"), 1),
+        (("hidden_act",), 1),
+        (("layer_types",), "linear_attention"),
+        (("layer_types", 0), 0),
+        (("ple_layer_ids", 0), True),
+        (("mtp",), []),
+        (("rope_parameters",), []),
+        (("rope_parameters", "mrope_section", 0), 11.0),
+        (("attention_dropout",), 0),
+        (("rms_norm_eps",), 0),
+        (("partial_rotary_factor",), 0),
+        (("rope_parameters", "partial_rotary_factor"), 0),
+    ),
+)
+def test_pinned_config_rejects_wrong_runtime_types(
+    path: tuple[object, ...], malformed: object
+) -> None:
+    changed = _text_config()
+    _set_path(changed, path, malformed)
+
+    with pytest.raises(TypeError, match="exact"):
+        ModelArgs.from_dict(changed)
+
+
+def test_qwen38_flash_next_q4_streaming_geometry_is_exact() -> None:
+    spec = QWEN38_FLASH_NEXT_Q4
+
+    # Task 12 must publish the derivative and replace the construction digest
+    # with its immutable HF commit before this candidate can enter the registry.
+    assert spec.key not in MODEL_SPECS
+    with pytest.raises(ValueError, match="unknown model"):
+        get_model_spec(spec.key)
     assert spec.total_tensor_bytes == 182_738_190_328
     assert spec.total_layers == 49
     assert spec.routed_layer_indices == tuple(range(49))
