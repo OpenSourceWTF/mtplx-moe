@@ -4,6 +4,13 @@ This module is deliberately independent of MLX.  Geometry and artifact
 invariants are checked before an address plan or storage lane is used; the
 planning path then contains only the official signed-int64 multiply/XOR and
 head modulus operations.
+
+N-gram installation has an explicit immutable-file finalization contract:
+the installer closes every writer, removes all write permission bits, and
+publishes each shard with exactly one hard link before verification.  The
+verified owner then retains the hashed descriptors and nonblocking shared
+``flock`` claims where the platform supplies them.  Readers reuse those
+descriptors without hot-path pathname or metadata revalidation.
 """
 
 from __future__ import annotations
@@ -15,12 +22,18 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import unicodedata
 from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Self
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - unavailable on non-POSIX hosts
+    fcntl = None  # type: ignore[assignment]
 
 import numpy as np
 
@@ -354,7 +367,6 @@ def _scan_json_bounds(text: str) -> None:
     depth = 0
     in_string = False
     escaped = False
-    string_chars = 0
     structural_nodes = 1
     collection_items: list[int] = []
     for character in text:
@@ -365,16 +377,9 @@ def _scan_json_bounds(text: str) -> None:
                 escaped = True
             elif character == '"':
                 in_string = False
-            else:
-                string_chars += 1
-                if string_chars > MAX_JSON_STRING_CHARS:
-                    raise NGramManifestError(
-                        "manifest JSON string exceeds the character limit"
-                    )
             continue
         if character == '"':
             in_string = True
-            string_chars = 0
         elif character in "[{":
             depth += 1
             structural_nodes += 1
@@ -833,12 +838,14 @@ class NGramFileIdentity:
     device: int
     inode: int
     size: int
+    mtime_ns: int
+    ctime_ns: int
 
 
 class VerifiedNGramShard:
     """One verified immutable shard whose descriptor remains authoritative."""
 
-    __slots__ = ("_fd", "identity", "shard")
+    __slots__ = ("_fd", "_lock", "identity", "shard")
 
     def __init__(
         self, shard: NGramShard, descriptor: int, identity: NGramFileIdentity
@@ -846,15 +853,27 @@ class VerifiedNGramShard:
         self.shard = shard
         self.identity = identity
         self._fd = descriptor
+        self._lock = threading.RLock()
+
+    def __copy__(self) -> None:
+        raise TypeError("copy is forbidden for verified descriptor owners")
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> None:
+        del memo
+        raise TypeError("deepcopy is forbidden for verified descriptor owners")
 
     @property
     def closed(self) -> bool:
-        return self._fd < 0
+        with self._lock:
+            return self._fd < 0
 
     def fileno(self) -> int:
-        if self.closed:
-            raise NGramManifestError(f"verified shard {self.shard.name} is closed")
-        return self._fd
+        with self._lock:
+            if self.closed:
+                raise NGramManifestError(
+                    f"verified shard {self.shard.name} is closed"
+                )
+            return self._fd
 
     def pread(self, offset: int, length: int) -> bytes:
         """Read an exact descriptor-relative byte range from the retained file."""
@@ -863,45 +882,47 @@ class VerifiedNGramShard:
         _exact_int(length, label="pread length")
         if offset + length > self.identity.size:
             raise NGramManifestError("pread range exceeds the verified shard size")
-        descriptor = self.fileno()
-        chunks: list[bytes] = []
-        remaining = length
-        cursor = offset
-        try:
-            while remaining:
-                chunk = os.pread(descriptor, remaining, cursor)
-                if not chunk:
-                    raise NGramManifestError(
-                        f"short descriptor read from shard {self.shard.name}"
-                    )
-                chunks.append(chunk)
-                remaining -= len(chunk)
-                cursor += len(chunk)
-        except NGramManifestError:
-            raise
-        except OSError as exc:
-            raise NGramManifestError(
-                f"could not read verified shard {self.shard.name}: {exc}"
-            ) from exc
-        return b"".join(chunks)
+        with self._lock:
+            descriptor = self.fileno()
+            chunks: list[bytes] = []
+            remaining = length
+            cursor = offset
+            try:
+                while remaining:
+                    chunk = os.pread(descriptor, remaining, cursor)
+                    if not chunk:
+                        raise NGramManifestError(
+                            f"short descriptor read from shard {self.shard.name}"
+                        )
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                    cursor += len(chunk)
+            except NGramManifestError:
+                raise
+            except OSError as exc:
+                raise NGramManifestError(
+                    f"could not read verified shard {self.shard.name}: {exc}"
+                ) from exc
+            return b"".join(chunks)
 
     def close(self) -> None:
-        if self.closed:
-            return
-        descriptor = self._fd
-        self._fd = -1
-        try:
-            os.close(descriptor)
-        except OSError as exc:
-            raise NGramManifestError(
-                f"could not close verified shard {self.shard.name}: {exc}"
-            ) from exc
+        with self._lock:
+            if self.closed:
+                return
+            descriptor = self._fd
+            self._fd = -1
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise NGramManifestError(
+                    f"could not close verified shard {self.shard.name}: {exc}"
+                ) from exc
 
 
 class VerifiedNGramArtifact:
     """Retained directory and shard descriptors for one verified artifact."""
 
-    __slots__ = ("_root_fd", "manifest", "report", "shards")
+    __slots__ = ("_lock", "_root_fd", "manifest", "report", "shards")
 
     def __init__(
         self,
@@ -911,6 +932,7 @@ class VerifiedNGramArtifact:
     ) -> None:
         self.manifest = manifest
         self._root_fd = root_descriptor
+        self._lock = threading.RLock()
         self.shards = shards
         self.report = {
             "shards": len(shards),
@@ -918,14 +940,23 @@ class VerifiedNGramArtifact:
             "bytes": sum(shard.shard.data_bytes for shard in shards),
         }
 
+    def __copy__(self) -> None:
+        raise TypeError("copy is forbidden for verified descriptor owners")
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> None:
+        del memo
+        raise TypeError("deepcopy is forbidden for verified descriptor owners")
+
     @property
     def closed(self) -> bool:
-        return self._root_fd < 0
+        with self._lock:
+            return self._root_fd < 0
 
     def root_fileno(self) -> int:
-        if self.closed:
-            raise NGramManifestError("verified n-gram artifact is closed")
-        return self._root_fd
+        with self._lock:
+            if self.closed:
+                raise NGramManifestError("verified n-gram artifact is closed")
+            return self._root_fd
 
     def pread(self, shard_index: int, offset: int, length: int) -> bytes:
         _exact_int(shard_index, label="shard index")
@@ -941,25 +972,26 @@ class VerifiedNGramArtifact:
         raise NGramManifestError(f"verified artifact has no shard for row {row}")
 
     def close(self) -> None:
-        first_error: NGramManifestError | None = None
-        for shard in self.shards:
-            try:
-                shard.close()
-            except NGramManifestError as exc:
-                if first_error is None:
-                    first_error = exc
-        if not self.closed:
-            descriptor = self._root_fd
-            self._root_fd = -1
-            try:
-                os.close(descriptor)
-            except OSError as exc:
-                if first_error is None:
-                    first_error = NGramManifestError(
-                        f"could not close verified artifact directory: {exc}"
-                    )
-        if first_error is not None:
-            raise first_error
+        with self._lock:
+            first_error: NGramManifestError | None = None
+            for shard in self.shards:
+                try:
+                    shard.close()
+                except NGramManifestError as exc:
+                    if first_error is None:
+                        first_error = exc
+            if not self.closed:
+                descriptor = self._root_fd
+                self._root_fd = -1
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    if first_error is None:
+                        first_error = NGramManifestError(
+                            f"could not close verified artifact directory: {exc}"
+                        )
+            if first_error is not None:
+                raise first_error
 
     def __enter__(self) -> Self:
         if self.closed:
@@ -1043,7 +1075,14 @@ def _hash_descriptor_payload(descriptor: int, shard: NGramShard) -> str:
 def verify_ngram_manifest(
     root: Path | str, manifest: NGramManifest
 ) -> VerifiedNGramArtifact:
-    """Verify and retain immutable, descriptor-anchored shard ownership."""
+    """Verify and retain immutable, descriptor-anchored shard ownership.
+
+    Installation must have closed every writer, removed all write permission
+    bits, and reduced each shard to one hard link.  Verification acquires and
+    retains a nonblocking shared ``flock`` on platforms that provide it.  A
+    cooperating installer or mutator must acquire the exclusive counterpart;
+    serving performs no repeated metadata checks.
+    """
 
     if type(manifest) is not NGramManifest:
         raise TypeError("manifest must be an exact NGramManifest")
@@ -1070,18 +1109,39 @@ def verify_ngram_manifest(
                     raise NGramManifestError(
                         f"shard {shard.name} must have exactly one hard link"
                     )
+                if metadata.st_mode & (
+                    stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+                ):
+                    raise NGramManifestError(
+                        f"shard {shard.name} has write permission bits; "
+                        "installation must finalize it read-only"
+                    )
                 if metadata.st_size != shard.file_size:
                     raise NGramManifestError(
                         f"shard size mismatch for {shard.name}: "
                         f"expected {shard.file_size}, got {metadata.st_size}"
                     )
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(
+                            descriptor,
+                            fcntl.LOCK_SH | fcntl.LOCK_NB,
+                        )
+                    except OSError as exc:
+                        raise NGramManifestError(
+                            f"could not acquire immutable shared lock for "
+                            f"{shard.name}: {exc}"
+                        ) from exc
                 payload_digest = _hash_descriptor_payload(descriptor, shard)
                 verified_metadata = os.fstat(descriptor)
                 if (
                     verified_metadata.st_dev != metadata.st_dev
                     or verified_metadata.st_ino != metadata.st_ino
                     or verified_metadata.st_size != metadata.st_size
+                    or verified_metadata.st_mode != metadata.st_mode
                     or verified_metadata.st_nlink != 1
+                    or verified_metadata.st_mtime_ns != metadata.st_mtime_ns
+                    or verified_metadata.st_ctime_ns != metadata.st_ctime_ns
                 ):
                     raise NGramManifestError(
                         f"shard identity changed during verification: {shard.name}"
@@ -1098,6 +1158,8 @@ def verify_ngram_manifest(
                             device=verified_metadata.st_dev,
                             inode=verified_metadata.st_ino,
                             size=verified_metadata.st_size,
+                            mtime_ns=verified_metadata.st_mtime_ns,
+                            ctime_ns=verified_metadata.st_ctime_ns,
                         ),
                     )
                 )

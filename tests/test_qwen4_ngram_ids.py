@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import copy
+import fcntl
 import hashlib
 import json
 import os
+import resource
+import tempfile
+import threading
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 
@@ -243,7 +248,9 @@ def _shard(
 ) -> NGramShard:
     payload = b"".join(rows)
     contents = prefix + payload
-    (root / name).write_bytes(contents)
+    path = root / name
+    path.write_bytes(contents)
+    path.chmod(0o444)
     return NGramShard(
         name=name,
         tensor=f"tensor-{start_row}",
@@ -282,6 +289,8 @@ def test_manifest_roundtrip_verify_and_locate_exact_offsets(tmp_path: Path) -> N
         retained_fd = artifact.shards[0].fileno()
         assert artifact.shards[0].pread(4, 2) == b"aa"
         assert os.fstat(retained_fd).st_size == 8
+        assert artifact.shards[0].identity.mtime_ns > 0
+        assert artifact.shards[0].identity.ctime_ns > 0
 
     assert artifact.closed
     assert all(shard.closed for shard in artifact.shards)
@@ -516,6 +525,99 @@ def test_verify_rejects_hardlinked_shard(tmp_path: Path) -> None:
         verify_ngram_manifest(tmp_path, manifest)
 
 
+def test_verify_rejects_writable_shard(tmp_path: Path) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    (tmp_path / manifest.shards[0].name).chmod(0o644)
+    artifact = None
+    try:
+        with pytest.raises(NGramManifestError, match="read-only|write permission"):
+            artifact = verify_ngram_manifest(tmp_path, manifest)
+    finally:
+        if artifact is not None:
+            artifact.close()
+
+
+def test_verify_detects_equal_length_same_inode_mutation_during_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    path = tmp_path / "part-1.bin"
+    path.chmod(0o444)
+    (tmp_path / "part-2.bin").chmod(0o444)
+    original_pread = os.pread
+    mutated = False
+
+    def mutating_pread(descriptor: int, length: int, offset: int) -> bytes:
+        nonlocal mutated
+        data = original_pread(descriptor, length, offset)
+        if not mutated and offset == manifest.shards[0].data_offset:
+            mutated = True
+            path.chmod(0o644)
+            with path.open("r+b") as handle:
+                handle.seek(manifest.shards[0].data_offset)
+                handle.write(b"zzzz")
+                handle.flush()
+                os.fsync(handle.fileno())
+            path.chmod(0o444)
+        return data
+
+    monkeypatch.setattr(qwen4_ngram.os, "pread", mutating_pread)
+    artifact = None
+    try:
+        with pytest.raises(NGramManifestError, match="identity changed"):
+            artifact = verify_ngram_manifest(tmp_path, manifest)
+    finally:
+        if artifact is not None:
+            artifact.close()
+
+
+def test_verified_artifact_refuses_competing_exclusive_lock(tmp_path: Path) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    for shard in manifest.shards:
+        (tmp_path / shard.name).chmod(0o444)
+
+    competitor = os.open(tmp_path / manifest.shards[0].name, os.O_RDONLY)
+    try:
+        with verify_ngram_manifest(tmp_path, manifest) as artifact:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(
+                    competitor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            assert artifact.read_row(0) == b"aa"
+        fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(competitor, fcntl.LOCK_UN)
+    finally:
+        os.close(competitor)
+
+
+def test_verify_rejects_shard_with_active_exclusive_writer_lock(
+    tmp_path: Path,
+) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    writer = os.open(tmp_path / manifest.shards[0].name, os.O_RDONLY)
+    try:
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(NGramManifestError, match="shared lock"):
+            verify_ngram_manifest(tmp_path, manifest)
+    finally:
+        fcntl.flock(writer, fcntl.LOCK_UN)
+        os.close(writer)
+
+
+def test_verified_descriptor_owners_reject_copy_and_deepcopy(tmp_path: Path) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    for shard in manifest.shards:
+        (tmp_path / shard.name).chmod(0o444)
+
+    with verify_ngram_manifest(tmp_path, manifest) as artifact:
+        for owner in (artifact, artifact.shards[0]):
+            with pytest.raises(TypeError, match="copy"):
+                copy.copy(owner)
+            with pytest.raises(TypeError, match="copy"):
+                copy.deepcopy(owner)
+
+
 def test_verified_reads_survive_post_verification_path_replacement(
     tmp_path: Path,
 ) -> None:
@@ -537,11 +639,81 @@ def test_verified_reads_survive_post_verification_path_replacement(
         artifact.close()
 
 
+def test_close_waits_for_concurrent_pread(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    for shard in manifest.shards:
+        (tmp_path / shard.name).chmod(0o444)
+    artifact = verify_ngram_manifest(tmp_path, manifest)
+    original_pread = os.pread
+    entered = threading.Event()
+    release = threading.Event()
+    result: list[bytes] = []
+    errors: list[Exception] = []
+
+    def blocking_pread(descriptor: int, length: int, offset: int) -> bytes:
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_pread(descriptor, length, offset)
+
+    def read() -> None:
+        try:
+            result.append(artifact.read_row(0))
+        except (AssertionError, NGramManifestError) as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(qwen4_ngram.os, "pread", blocking_pread)
+    reader = threading.Thread(target=read)
+    closer = threading.Thread(target=artifact.close)
+    reader.start()
+    assert entered.wait(timeout=5)
+    closer.start()
+    closer.join(timeout=0.05)
+    close_waited = closer.is_alive()
+    release.set()
+    reader.join(timeout=5)
+    closer.join(timeout=5)
+
+    assert close_waited, "close must wait for the active descriptor read"
+    assert not errors
+    assert result == [b"aa"]
+    assert artifact.closed
+
+
+def test_fd_limit_failure_is_domain_error_and_closes_partial_construction() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="qwen4-ngram-fd-", dir="/private/tmp"
+    ) as raw:
+        root = Path(raw)
+        manifest = _tiny_manifest(root)
+        for shard in manifest.shards:
+            (root / shard.name).chmod(0o444)
+        before = len(os.listdir("/dev/fd"))
+        old_soft, old_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        limited_soft = min(old_soft, before + 2)
+        if limited_soft <= before:
+            pytest.skip("process FD limit has no safe test headroom")
+        limited_artifact = None
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (limited_soft, old_hard))
+            with pytest.raises(NGramManifestError):
+                limited_artifact = verify_ngram_manifest(root, manifest)
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (old_soft, old_hard))
+            if limited_artifact is not None:
+                limited_artifact.close()
+
+        with verify_ngram_manifest(root, manifest) as artifact:
+            assert artifact.read_row(2) == b"cc"
+
+
 def test_verify_closes_every_fd_after_mid_verification_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest = _tiny_manifest(tmp_path)
-    (tmp_path / "part-2.bin").write_bytes(b"HEADxx")
+    failing_path = tmp_path / "part-2.bin"
+    failing_path.chmod(0o644)
+    failing_path.write_bytes(b"HEADxx")
+    failing_path.chmod(0o444)
     original_open = os.open
     opened: list[int] = []
 
@@ -578,10 +750,12 @@ def test_verify_rejects_short_or_corrupt_payload(
 ) -> None:
     manifest = _tiny_manifest(tmp_path)
     path = tmp_path / "part-1.bin"
+    path.chmod(0o644)
     if corruption == "short":
         path.write_bytes(path.read_bytes()[:-1])
     else:
         path.write_bytes(b"HEADaXbb")
+    path.chmod(0o444)
 
     with pytest.raises(NGramManifestError):
         verify_ngram_manifest(tmp_path, manifest)
@@ -639,6 +813,21 @@ def test_load_rejects_too_many_shards_before_materialization(tmp_path: Path) -> 
 
     with pytest.raises(NGramManifestError, match="shard|collection"):
         load_ngram_manifest(path, verify_digest=False)
+
+
+def test_load_accepts_bounded_string_written_with_unicode_escapes(
+    tmp_path: Path,
+) -> None:
+    manifest = replace(_tiny_manifest(tmp_path), source_repo="a" * 2_000).with_digest()
+    value = manifest.to_dict()
+    payload = json.dumps(value, separators=(",", ":"))
+    literal = '"source_repo":"' + "a" * 2_000 + '"'
+    escaped = '"source_repo":"' + "\\u0061" * 2_000 + '"'
+    assert literal in payload
+    path = tmp_path / "escaped.json"
+    path.write_text(payload.replace(literal, escaped))
+
+    assert load_ngram_manifest(path) == manifest
 
 
 def test_load_missing_manifest_is_domain_error(tmp_path: Path) -> None:
