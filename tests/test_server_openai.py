@@ -4244,6 +4244,11 @@ def _stream_payloads(response_text: str) -> list[dict]:
     ]
 
 
+def _sse_frames(response_text: str) -> list[str]:
+    """Non-empty SSE frames in wire order; comment frames start with ':'."""
+    return [frame for frame in response_text.split("\n\n") if frame.strip()]
+
+
 def _anthropic_events(response_text: str) -> list[tuple[str, dict]]:
     events: list[tuple[str, dict]] = []
     for frame in response_text.split("\n\n"):
@@ -11464,6 +11469,291 @@ def test_chat_stream_emits_heartbeat_during_alive_silence(monkeypatch):
     assert content == "ok"
     assert final_chunks
     assert "data: [DONE]" in response.text
+
+
+def _slow_start_generation(text: str, *, delay_s: float):
+    """Streaming generation stub whose first token arrives after delay_s.
+
+    Stands in for a long silent prefill (#358): the stream loop polls an
+    empty token queue for the whole delay.
+    """
+    tokens = [ord(char) for char in text]
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        time.sleep(delay_s)
+        kwargs["token_callback"](tokens)
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    return fake_run_generation
+
+
+def test_sse_keepalive_interval_env_parsing(monkeypatch):
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT", raising=False)
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", raising=False)
+    assert openai._sse_keepalive_interval_s() == 5.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "2.5")
+    assert openai._sse_keepalive_interval_s() == 2.5
+    # Clamp: sub-second intervals would spam the wire.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "0.2")
+    assert openai._sse_keepalive_interval_s() == 1.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "-3")
+    assert openai._sse_keepalive_interval_s() == 1.0
+    # Garbage falls back to the default instead of crashing the stream.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "garbage")
+    assert openai._sse_keepalive_interval_s() == 5.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "0")
+    assert openai._sse_keepalive_interval_s() is None
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "false")
+    assert openai._sse_keepalive_interval_s() is None
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "1")
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", raising=False)
+    assert openai._sse_keepalive_interval_s() == 5.0
+
+
+def test_chat_stream_emits_sse_keepalive_before_first_token(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        # ~2.5s of pre-first-token silence spans at least two 1s keep-alive
+        # windows even on slow CI runners.
+        _slow_start_generation("ok\n", delay_s=2.5),
+    )
+
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "stream": True,
+                "max_tokens": 16,
+                "enable_thinking": False,
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    comment_indices = [
+        idx for idx, frame in enumerate(frames) if frame.startswith(":")
+    ]
+    content_indices = [
+        idx
+        for idx, frame in enumerate(frames)
+        if frame.startswith("data: {")
+        and json.loads(frame.removeprefix("data: "))["choices"][0]
+        .get("delta", {})
+        .get("content")
+    ]
+    assert comment_indices, response.text
+    assert frames[comment_indices[0]] == ": keep-alive"
+    assert content_indices, response.text
+    # Scope (#358): comments live only in the silent pre-first-token window.
+    assert comment_indices[-1] < content_indices[0]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "ok"
+    assert any(
+        payload["choices"][0].get("finish_reason") == "stop" for payload in payloads
+    )
+    assert "data: [DONE]" in response.text
+
+
+def test_chat_stream_sse_keepalive_kill_switch(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    # Same silent window that provably emits comments above, but disabled.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "0")
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("ok\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "stream": True,
+                "max_tokens": 16,
+                "enable_thinking": False,
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    assert not [frame for frame in _sse_frames(response.text) if frame.startswith(":")]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "ok"
+    assert "data: [DONE]" in response.text
+
+
+def test_chat_stream_fast_start_emits_no_sse_keepalive(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation("OK"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Reply OK only."}],
+            "stream": True,
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    assert not [frame for frame in _sse_frames(response.text) if frame.startswith(":")]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "OK"
+    assert "data: [DONE]" in response.text
+
+
+def test_completions_stream_emits_sse_keepalive_before_first_token(monkeypatch):
+    state = _fake_streaming_session_state()
+    client = TestClient(create_app(state))
+
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("alpha\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/completions",
+            json={"prompt": "count", "max_tokens": 8, "stream": True},
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    comment_indices = [
+        idx for idx, frame in enumerate(frames) if frame.startswith(":")
+    ]
+    text_indices = [
+        idx
+        for idx, frame in enumerate(frames)
+        if frame.startswith("data: {")
+        and json.loads(frame.removeprefix("data: "))["choices"][0].get("text")
+    ]
+    # The completions stream has no role-delta preamble at all, so without
+    # the comments the wire is byte-silent for the whole prefill (#358).
+    assert comment_indices, response.text
+    assert frames[comment_indices[0]] == ": keep-alive"
+    assert text_indices, response.text
+    assert comment_indices[-1] < text_indices[0]
+    texts = [
+        payload["choices"][0]["text"]
+        for payload in _stream_payloads(response.text)
+        if payload["choices"][0].get("text")
+    ]
+    assert texts == ["alpha\n"]
+    assert "data: [DONE]" in response.text
+
+
+def test_anthropic_messages_stream_forwards_sse_keepalive(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("ok\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/messages",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "model": "mtplx-test-model",
+                "max_tokens": 16,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Say ok."}],
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    comment_indices = [
+        idx for idx, frame in enumerate(frames) if frame.startswith(":")
+    ]
+    delta_indices = [
+        idx
+        for idx, frame in enumerate(frames)
+        if frame.startswith("event: content_block_delta")
+    ]
+    # The Anthropic translation drops the inner progress frames, so the
+    # forwarded comments are the only pre-first-token bytes (#358).
+    assert comment_indices, response.text
+    assert frames[comment_indices[0]] == ": keep-alive"
+    assert delta_indices, response.text
+    assert comment_indices[-1] < delta_indices[0]
+    events = _anthropic_events(response.text)
+    event_names = [event for event, _payload in events]
+    assert event_names[0] == "message_start"
+    assert "content_block_delta" in event_names
+    assert "message_stop" in event_names
+    text = "".join(
+        payload.get("delta", {}).get("text", "")
+        for event, payload in events
+        if event == "content_block_delta"
+        and payload.get("delta", {}).get("type") == "text_delta"
+    )
+    assert "ok" in text
 
 
 def test_chat_tools_malformed_tool_call_falls_back_to_content(monkeypatch):

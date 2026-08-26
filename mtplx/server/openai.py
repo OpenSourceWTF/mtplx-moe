@@ -365,6 +365,17 @@ CHAT_TEMPLATE_SENTINEL_RE = re.compile(
 STREAM_HEARTBEAT_INTERVAL_S = 10.0
 STREAM_SILENCE_WARN_S = 30.0
 STREAM_SILENCE_WARN_INTERVAL_S = 60.0
+# Pre-first-token SSE comment heartbeats (#358). A long prefill (minutes at
+# >32k-token prompts) used to put zero bytes on the wire before the first
+# token payload, so strict client/proxy read-timeouts (Claude Code, Cursor,
+# Open WebUI, nginx, cloudflared) killed the connection while the engine was
+# still computing. Any SSE line starting with ":" is a spec-level comment
+# that compliant parsers (official OpenAI SDKs included) ignore, yet it still
+# resets those read-timeouts. Once real payload chunks flow, token cadence is
+# the liveness signal and the comments stop.
+SSE_KEEPALIVE_COMMENT = ": keep-alive\n\n"
+SSE_KEEPALIVE_DEFAULT_INTERVAL_S = 5.0
+SSE_KEEPALIVE_MIN_INTERVAL_S = 1.0
 # Stall containment (#86): a stream that receives nothing while the model
 # owner's progress heartbeat is frozen for this long is failed with a
 # structured error instead of hanging forever. Healthy work ticks the
@@ -4476,6 +4487,12 @@ async def _iter_sse_data(body_iterator: Any):
             ]
             if data_lines:
                 yield "\n".join(data_lines)
+            elif frame.startswith(":"):
+                # SSE comment-only frame — the pre-first-token keep-alive
+                # (#358). Yield it verbatim so the Anthropic translator can
+                # forward the liveness bytes; the leading ":" is unambiguous
+                # because data payloads here are JSON or "[DONE]".
+                yield frame
     if buffer.strip():
         data_lines = [
             line.removeprefix("data:").strip()
@@ -4532,6 +4549,14 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
 
     try:
         async for data in _iter_sse_data(body_iterator):
+            if data.startswith(":"):
+                # Keep-alive comment from the inner OpenAI stream (#358):
+                # forward it untranslated. SSE comments are protocol-neutral,
+                # and every other inner frame the translator drops (e.g.
+                # progress chunks) leaves the Anthropic wire silent through
+                # the whole prefill.
+                yield f"{data}\n\n"
+                continue
             if data == "[DONE]":
                 break
             try:
@@ -16226,6 +16251,26 @@ def _stream_heartbeat_payload(
         "elapsed_s": max(0.0, float(now_s) - float(stream_started_s)),
         "seconds_since_last_token": max(0.0, float(now_s) - float(last_activity_s)),
     }
+
+
+def _sse_keepalive_interval_s() -> float | None:
+    """Interval for pre-first-token SSE comment heartbeats (#358); None = off.
+
+    MTPLX_SSE_HEARTBEAT=0 disables the comments; MTPLX_SSE_HEARTBEAT_INTERVAL_S
+    overrides the cadence (clamped to >= 1s; unparseable values fall back to
+    the default). Read at stream start — cheap, and tunable without a daemon
+    restart.
+    """
+    if not _env_bool_setting("MTPLX_SSE_HEARTBEAT", default=True):
+        return None
+    raw = os.environ.get("MTPLX_SSE_HEARTBEAT_INTERVAL_S")
+    if raw is None:
+        return SSE_KEEPALIVE_DEFAULT_INTERVAL_S
+    try:
+        interval_s = float(raw)
+    except ValueError:
+        return SSE_KEEPALIVE_DEFAULT_INTERVAL_S
+    return max(SSE_KEEPALIVE_MIN_INTERVAL_S, interval_s)
 
 
 @contextmanager
@@ -28088,6 +28133,7 @@ def create_app(state: ServerState) -> FastAPI:
                 latest_token_enqueue_s: float | None = None
                 next_silence_warn_s = stream_started_s + STREAM_SILENCE_WARN_S
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
+                sse_keepalive_interval_s = _sse_keepalive_interval_s()
 
                 def mark_sse_sent(chunk: str) -> str:
                     nonlocal last_sse_sent_s
@@ -29947,6 +29993,23 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield mark_sse_sent("data: [DONE]\n\n")
                                 return
                             if (
+                                sse_keepalive_interval_s is not None
+                                and streamed_decode_started_s is None
+                                and not generation_future.done()
+                                and now_s - last_sse_sent_s
+                                >= sse_keepalive_interval_s
+                            ):
+                                # Pre-first-token liveness (#358): during long
+                                # prefills the only bytes so far are the role
+                                # delta, so strict client/proxy read-timeouts
+                                # see a dead wire. SSE comments are invisible
+                                # to parsers and cannot disturb chunk layout;
+                                # once decode starts, token cadence takes
+                                # over. At the default cadence (5s < 10s)
+                                # this also keeps the progress-chunk check
+                                # below idle until decode starts.
+                                yield mark_sse_sent(SSE_KEEPALIVE_COMMENT)
+                            if (
                                 not generation_future.done()
                                 and now_s - last_sse_sent_s
                                 >= STREAM_HEARTBEAT_INTERVAL_S
@@ -31462,6 +31525,12 @@ def create_app(state: ServerState) -> FastAPI:
                 generated: dict[str, Any] | None = None
                 stop_hit = False
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
+                sse_keepalive_interval_s = _sse_keepalive_interval_s()
+                # This stream sends no bytes at all before the first text
+                # chunk, so "last byte sent" starts at the stream start and
+                # only the keep-alive comments below can advance it in the
+                # pre-first-token window (#358).
+                last_sse_sent_s = time.perf_counter()
 
                 def on_tokens(new_tokens: list[int]) -> None:
                     _raise_if_stream_cancelled(cancel_event)
@@ -31637,6 +31706,19 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 yield "data: [DONE]\n\n"
                                 return
+                            now_s = time.perf_counter()
+                            if (
+                                sse_keepalive_interval_s is not None
+                                and streamed_completion_tokens == 0
+                                and not generation_future.done()
+                                and now_s - last_sse_sent_s
+                                >= sse_keepalive_interval_s
+                            ):
+                                # Pre-first-token liveness (#358): see the
+                                # chat stream loop. Comments stop as soon as
+                                # the first token batch arrives.
+                                last_sse_sent_s = now_s
+                                yield SSE_KEEPALIVE_COMMENT
                             continue
                         if kind == "tokens":
                             streamed_completion_tokens += len(item)

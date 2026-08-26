@@ -8,6 +8,16 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Added
 
+- Streaming endpoints (`/v1/chat/completions`, `/v1/completions`,
+  `/v1/messages`) emit a `: keep-alive` SSE comment every 5 seconds
+  while a stream is still silent before its first token (#358). Long
+  prefills — minutes at 32k+ prompts — previously put zero liveness
+  bytes on the wire, so strict client/proxy read-timeouts (Claude
+  Code, Cursor, Open WebUI, nginx, cloudflared) dropped the
+  connection mid-compute. SSE comments are ignored by every compliant
+  parser; once tokens flow the comments stop. Disable with
+  `MTPLX_SSE_HEARTBEAT=0`; tune the cadence with
+  `MTPLX_SSE_HEARTBEAT_INTERVAL_S` (minimum 1s).
 - **Machine memory governor** (issue #305). MTPLX now plans its memory
   against the Mac it is actually on instead of assuming a 128 GB studio
   machine. At startup the serve banner prints the machine plan (engine
@@ -106,6 +116,18 @@ All notable user-facing changes to MTPLX. The format is based on
   `MTPLX_NAX_TILE_ROUTE` (first M5 tensor-unit attention kernel at decode
   shapes), `MTPLX_ADAPTIVE_DTEMP`, `MTPLX_CCOPY_BANK_ROUTE`,
   `MTPLX_FORKEV_TELEMETRY`.
+=======
+- Streaming endpoints (`/v1/chat/completions`, `/v1/completions`,
+  `/v1/messages`) emit a `: keep-alive` SSE comment every 5 seconds
+  while a stream is still silent before its first token (#358). Long
+  prefills — minutes at 32k+ prompts — previously put zero liveness
+  bytes on the wire, so strict client/proxy read-timeouts (Claude
+  Code, Cursor, Open WebUI, nginx, cloudflared) dropped the
+  connection mid-compute. SSE comments are ignored by every compliant
+  parser; once tokens flow the comments stop. Disable with
+  `MTPLX_SSE_HEARTBEAT=0`; tune the cadence with
+  `MTPLX_SSE_HEARTBEAT_INTERVAL_S` (minimum 1s).
+>>>>>>> b4806042 (server: pre-first-token SSE keep-alive comments on every streaming endpoint (#358))
 
 ## [2.9.2] - 2026-08-25
 
