@@ -50,7 +50,10 @@ NGRAM_MANIFEST_FORMAT = "mtplx-qwen4-ngram-manifest-v1"
 MAX_MANIFEST_BYTES = 1 * 1024 * 1024
 MAX_MANIFEST_SHARDS = 128
 MAX_JSON_DEPTH = 32
-MAX_JSON_NODES = 4_096
+# Source-native oQ4 manifests carry three exact component descriptors for each
+# of 128 logical shards. 32K bounds that fixed schema without admitting an
+# unbounded document.
+MAX_JSON_NODES = 32_768
 MAX_JSON_COLLECTION_ITEMS = 256
 MAX_JSON_STRING_CHARS = 4_096
 MAX_JSON_INTEGER_DIGITS = 20

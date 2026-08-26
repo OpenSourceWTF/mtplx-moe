@@ -2217,9 +2217,16 @@ def validate_expert_manifest_spec(
             f"manifest model key {manifest.model_key!r} does not match "
             f"descriptor {spec.key!r}"
         )
+    source_native_qwen4 = (
+        spec.key == _QWEN4_STREAMING_MODEL_KEY and manifest.sidecar is None
+    )
+    expected_repo = spec.source_model if source_native_qwen4 else spec.quant_model
+    expected_revision = (
+        spec.source_revision if source_native_qwen4 else spec.quant_revision
+    )
     if (
-        manifest.source_repo != spec.quant_model
-        or manifest.source_revision != spec.quant_revision
+        manifest.source_repo != expected_repo
+        or manifest.source_revision != expected_revision
     ):
         raise ExpertManifestError(
             "manifest source identity does not match the pinned descriptor"

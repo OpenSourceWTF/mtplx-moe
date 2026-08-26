@@ -32,6 +32,7 @@ from mtplx.expert_manifest import (
     verify_expert_manifest,
 )
 from mtplx.expert_streaming_models import ExpertStreamingModelSpec, get_model_spec
+from mtplx.qwen4_oq4 import externalize_source_residents
 
 COMPONENTS = (
     "gate_proj.weight",
@@ -101,7 +102,6 @@ def test_qwen4_native_mtp_experts_map_to_synthetic_streaming_layer() -> None:
         mtp_layer_index=None,
         mtp_included=True,
     )
-
     assert _classify_expert_name(
         "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight",
         spec,
@@ -120,6 +120,73 @@ def test_qwen4_native_mtp_experts_map_to_synthetic_streaming_layer() -> None:
         )
         is None
     )
+
+
+def test_qwen4_source_native_manifest_pins_published_oq4_identity(
+    tmp_path: Path,
+) -> None:
+    spec, _expected = _make_checkpoint(tmp_path / "source")
+    manifest = build_expert_manifest(tmp_path / "source", spec)
+    qwen_spec = replace(
+        spec,
+        key="qwen38-flash-next-q4",
+        source_model="Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP",
+        source_revision="published-revision",
+        quant_model="user/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP",
+        quant_revision="upload-revision",
+    )
+    source_native = replace(
+        manifest,
+        model_key=qwen_spec.key,
+        source_repo=qwen_spec.source_model,
+        source_revision=qwen_spec.source_revision,
+        manifest_sha256=None,
+    ).with_digest()
+
+    validate_expert_manifest_spec(source_native, qwen_spec)
+
+
+def test_source_native_external_residents_are_removed_from_runtime_bytes(
+    tmp_path: Path,
+) -> None:
+    spec, _expected = _make_checkpoint(tmp_path / "source")
+    manifest = build_expert_manifest(tmp_path / "source", spec)
+    resident = manifest.resident_tensors[0]
+    external = replace(
+        resident,
+        tensor="external.ngram.weight",
+        length=4,
+        dtype="U8",
+        shape=(4,),
+    )
+    kept = replace(
+        resident,
+        tensor="model.embed_tokens.weight",
+        offset=resident.offset + 4,
+        length=4,
+        dtype="U8",
+        shape=(4,),
+    )
+    source = replace(
+        manifest,
+        resident_tensors=(external, kept),
+        manifest_sha256=None,
+    ).with_digest()
+    target_spec = replace(
+        spec,
+        total_tensor_bytes=spec.total_tensor_bytes - 4,
+    )
+
+    result = externalize_source_residents(
+        source,
+        external_tensor_names=frozenset({external.tensor}),
+        external_bytes=4,
+        target_spec=target_spec,
+    )
+
+    assert result.artifact_tensor_bytes == target_spec.total_tensor_bytes
+    assert result.resident_tensor_bytes == target_spec.resident_bytes
+    assert result.resident_tensors == (kept,)
 
 
 def _component_info(
