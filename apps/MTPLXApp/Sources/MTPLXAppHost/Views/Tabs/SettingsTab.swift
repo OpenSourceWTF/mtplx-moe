@@ -126,7 +126,7 @@ struct SettingsTab: View {
             VStack(alignment: .leading, spacing: 6) {
                 FormRow(
                     label: "Mode",
-                    caption: "Auto picks the best mode for what you're using. Pick a mode below to use it everywhere."
+                    caption: "Auto picks the best mode for what you're using. Pick a mode below to use it everywhere. Benchmark runs keep their own single-stream setup."
                 ) {
                     Picker("Mode", selection: schedulerPresetBinding) {
                         Text("Auto").tag("target-default")

@@ -1685,6 +1685,9 @@ final class MTPLXAppCoreTests: XCTestCase {
     }
 
     func testCommandBuilderHermesPresetUsesFastSingleAgentLane() throws {
+        // Auto scheduling ("target-default") keeps Hermes on the measured
+        // single-agent latency lane. An explicit Settings Performance mode
+        // now overrides it (#325) — that case is pinned separately below.
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: [
             "PATH": fake.deletingLastPathComponent().path,
@@ -1694,13 +1697,7 @@ final class MTPLXAppCoreTests: XCTestCase {
             configuration: MTPLXAppConfiguration(
                 executablePath: fake.path,
                 model: "/models/qwen",
-                profile: "sustained",
-                schedulerMode: "ar_batch",
-                batchingPreset: "agent",
-                schedulingPreset: "agent",
-                maxActiveRequests: 4,
-                decodeBatchMax: 4,
-                batchWaitMs: 50
+                profile: "sustained"
             ),
             target: .hermes,
             launchID: "hermes-launch"
@@ -1733,6 +1730,125 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(command.environment["MTPLX_CLIENT"], "hermes")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE"], "async_per_head")
         XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "32")
+    }
+
+    func testCommandBuilderHermesHonorsExplicitSchedulingPreset() throws {
+        // #325 contract: an explicit Settings Performance mode wins over
+        // the Hermes target preset; only Auto keeps the latency lane.
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "MTPLX_APP_TEST_PHYSICAL_MEMORY_BYTES": "137438953472",
+        ])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained",
+                schedulerMode: "ar_batch",
+                batchingPreset: "agent",
+                schedulingPreset: "agent",
+                maxActiveRequests: 4,
+                decodeBatchMax: 4,
+                batchWaitMs: 50
+            ),
+            target: .hermes,
+            launchID: "hermes-agent-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "agent"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "50.0"]))
+        // The rest of the Hermes lane identity is untouched by the
+        // scheduling override.
+        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache", "on"]))
+        XCTAssertEqual(command.environment["MTPLX_CLIENT"], "hermes")
+    }
+
+    // Issue #325: Settings -> Performance mode "Handle multiple at once"
+    // (scheduling_preset "throughput", max_active_requests 2 in
+    // settings.json) was silently discarded by the native Chat launch
+    // target — /health reported serial/solo/1 while the same saved
+    // settings launched ar_batch/throughput/2 under the "Other" target.
+    // An explicit Settings mode now wins on every serving target; the
+    // chat preset only fills the Auto case.
+    func testCommandBuilderChatHonorsExplicitThroughputSchedulingPreset() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained",
+                schedulerMode: "ar_batch",
+                batchingPreset: "throughput",
+                schedulingPreset: "throughput",
+                maxActiveRequests: 2
+            ),
+            target: .chat,
+            launchID: "chat-throughput-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "throughput"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "2"]))
+        // Knobs the user left unset fall to the throughput preset's own
+        // daemon defaults, exactly as they do for the "Other" target.
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "8"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "20.0"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--prefill-chunk-tokens", "2048"]))
+    }
+
+    func testCommandBuilderChatAutoKeepsSingleStreamSerialLane() throws {
+        // Auto ("target-default", no numeric overrides) keeps the chat
+        // preset byte-identical to the pre-#325 launch: solo serial MTP
+        // with no batching knobs on the argv.
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained"
+            ),
+            target: .chat,
+            launchID: "chat-auto-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "solo"]))
+        XCTAssertFalse(command.arguments.contains("--max-active-requests"))
+        XCTAssertFalse(command.arguments.contains("--decode-batch-max"))
+        XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
+        XCTAssertFalse(command.arguments.contains("--prefill-chunk-tokens"))
+    }
+
+    func testCommandBuilderOpenWebUIHonorsExplicitSchedulingPreset() throws {
+        // Web UI is chat's sibling single-stream surface and shared the
+        // same silent discard (#325); explicit Settings modes win there
+        // too, with unset knobs on the preset's daemon defaults.
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained",
+                schedulerMode: "ar_batch",
+                batchingPreset: "agent",
+                schedulingPreset: "agent"
+            ),
+            target: .openWebUI,
+            launchID: "webui-agent-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "agent"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "50.0"]))
     }
 
     func testCommandBuilderBenchmarkPresetStartsSoloBenchmarkDaemon() throws {
@@ -2502,7 +2618,13 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
     }
 
-    func testCommandBuilderChatIgnoresExplicitBatchingOverrides() throws {
+    func testCommandBuilderChatHonorsExplicitAgentSchedulingOverrides() throws {
+        // Until #325 this pinned the opposite: chat silently discarded an
+        // explicit Settings scheduling preset and its numeric overrides.
+        // The Settings picker must never lie — explicit wins; only the
+        // legacy scheduler_mode pair without a scheduling_preset key (see
+        // testCommandBuilderChatPresetMigratesLegacyAgentPairToSolo)
+        // still resolves to the Auto lane.
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
         let command = try builder.buildServeCommand(
@@ -2520,14 +2642,18 @@ final class MTPLXAppCoreTests: XCTestCase {
             target: .chat
         )
 
-        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "solo"]))
-        XCTAssertFalse(command.arguments.contains("--max-active-requests"))
-        XCTAssertFalse(command.arguments.contains("--decode-batch-max"))
-        XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "agent"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "50.0"]))
     }
 
-    func testCommandBuilderOpenWebUIUsesAppOwnedSamplerButKeepsSoloScheduling() throws {
+    func testCommandBuilderOpenWebUIUsesAppOwnedSamplerAndHonorsExplicitScheduling() throws {
+        // Sampler and reasoning stay app-owned exactly as before; the
+        // scheduling half flipped with #325 — an explicit Settings
+        // throughput preset (plus explicit numeric overrides) now reaches
+        // the Web UI daemon instead of being silently reset to solo.
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
         let command = try builder.buildServeCommand(
@@ -2549,11 +2675,11 @@ final class MTPLXAppCoreTests: XCTestCase {
             target: .openWebUI
         )
 
-        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "solo"]))
-        XCTAssertFalse(command.arguments.contains("--max-active-requests"))
-        XCTAssertFalse(command.arguments.contains("--decode-batch-max"))
-        XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "throughput"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "8"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "8"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "20.0"]))
         XCTAssertFalse(command.arguments.contains("--tool-prompt-mode"))
         XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "1.0"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--top-p", "1.0"]))

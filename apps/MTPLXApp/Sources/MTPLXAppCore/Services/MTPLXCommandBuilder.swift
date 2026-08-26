@@ -719,11 +719,18 @@ struct ResolvedDaemonArgs {
             processEnvironment: processEnvironment
         )
 
-        let targetOwnsScheduling =
-            target == .chat
-            || target == .openWebUI
-            || target == .hermes
-            || target == .benchmark
+        // Issue #325: Settings' Performance mode promises "use it
+        // everywhere", so every serving target honors an EXPLICIT
+        // scheduling choice (schedulingPreset != "target-default", or an
+        // overridden numeric knob). The per-target preset only fills the
+        // Auto case — Auto launches are byte-identical to before.
+        // Benchmark is the one deliberate exception: the AIME overlay
+        // spawns a measurement daemon whose serial single-stream lane
+        // keeps scores comparable across users, and a leftover
+        // throughput experiment in Settings must not contaminate
+        // benchmark numbers. The Settings caption names that exception
+        // so nothing is silently discarded.
+        let targetOwnsScheduling = target == .benchmark
         let scheduling = targetOwnsScheduling
             ? .targetDefault
             : SchedulingOverridePreset(configuration.schedulingPreset)
@@ -1541,7 +1548,8 @@ private struct TargetPreset {
             // In-app chat is one foreground stream. Keep its daemon launch
             // aligned with the old browser WebUI path; coding-agent runtime
             // extras belong to Pi/OpenCode/custom-client targets, not plain
-            // chat.
+            // chat. Auto-mode default only: an explicit Settings
+            // Performance mode overrides this preset (#325).
             return TargetPreset(
                 schedulerMode: "serial",
                 batchingPreset: "solo",
@@ -1635,9 +1643,10 @@ private struct TargetPreset {
             )
         case .hermes:
             // Hermes is a foreground coding agent, not a generic batch client.
-            // Keep it on the measured OpenCode latency lane so Settings'
-            // throughput/agent batching experiments cannot silently slow the
-            // agent chat path. Draft sampler stays model/stamp-owned — never
+            // Auto keeps it on the measured OpenCode latency lane so target
+            // drift cannot silently slow the agent chat path; an explicit
+            // Settings Performance mode overrides it like every serving
+            // target (#325). Draft sampler stays model/stamp-owned — never
             // target-pinned (see the openCode case).
             var env = codingAgentRuntimeEnvironment(
                 processEnvironment: processEnvironment
