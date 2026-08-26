@@ -3875,6 +3875,44 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
     }
 
+    func testModelInstallDetectionAcceptsThirdPartyRepoWithoutMTPLXBranding() throws {
+        // Issue #359: mtplx_runtime.json and the MTP sidecar are MTPLX
+        // branding, not load requirements — a byte-complete third-party
+        // repo (which never ships them) is a complete install and the
+        // engine serves it (AR when no MTP head can attach).
+        let root = temporaryDirectory()
+        let model = root.appendingPathComponent("Tiel-Coder-35B-A3B-MLX-oQ4e-MTP", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try "{}".write(to: model.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: model.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: model.appendingPathComponent("model.safetensors"))
+        try """
+        {"repo_id": "peculiar-ragdoll/Tiel-Coder-35B-A3B-MLX-oQ4e-MTP", "files": {"config.json": {}, "tokenizer.json": {}, "model.safetensors": {}}}
+        """.write(to: model.appendingPathComponent(".mtplx-source.json"), atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
+    }
+
+    func testModelInstallDetectionStillRequiresMarkerListedFiles() throws {
+        // True download completeness: a curated repo's source marker lists
+        // mtplx_runtime.json because the repo actually ships it — its
+        // absence is a genuinely incomplete download, not optional branding.
+        let root = temporaryDirectory()
+        let model = root.appendingPathComponent("Qwen3.8-27B-MTPLX-Optimized-Speed", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try "{}".write(to: model.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: model.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: model.appendingPathComponent("model.safetensors"))
+        try """
+        {"repo_id": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed", "files": {"config.json": {}, "tokenizer.json": {}, "model.safetensors": {}, "mtplx_runtime.json": {}}}
+        """.write(to: model.appendingPathComponent(".mtplx-source.json"), atomically: true, encoding: .utf8)
+
+        XCTAssertFalse(MTPLXModelOption.hasCompleteInstall(at: model.path))
+
+        try "{}".write(to: model.appendingPathComponent("mtplx_runtime.json"), atomically: true, encoding: .utf8)
+        XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
+    }
+
     func testModelInstallDetectionCanBeDisabledForFreshUserQA() throws {
         unsetenv("MTPLX_APP_DISABLE_LOCAL_MODEL_SCAN")
         let root = temporaryDirectory()

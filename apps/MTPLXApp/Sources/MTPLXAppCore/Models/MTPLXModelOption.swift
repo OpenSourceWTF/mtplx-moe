@@ -200,18 +200,49 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 && Self.hasCompleteModelDirectory(at: assistant)
         }
 
-        let coreFiles = ["config.json", "tokenizer.json", "mtplx_runtime.json"]
-        for name in coreFiles {
+        // Core completeness: a runnable checkpoint needs its config, a
+        // tokenizer in any standard form, and every trunk shard.
+        // mtplx_runtime.json and the MTP sidecar are MTPLX branding, not
+        // load requirements — the engine serves unbranded checkpoints
+        // autoregressive. Requiring them here turned byte-complete
+        // third-party downloads into fake "incomplete download" failures
+        // whose Retry could never succeed (issue #359).
+        if !fm.fileExists(atPath: url.appendingPathComponent("config.json").path) {
+            return false
+        }
+        let tokenizerForms = ["tokenizer.json", "tokenizer_config.json", "tokenizer.model"]
+        let hasTokenizer = tokenizerForms.contains { name in
+            fm.fileExists(atPath: url.appendingPathComponent(name).path)
+        }
+        if !hasTokenizer {
+            return false
+        }
+
+        // True download completeness: every file the source repo is known
+        // to ship (recorded in .mtplx-source.json at pull time) must
+        // exist. A curated MTPLX repo therefore still requires its
+        // runtime contract and MTP sidecar — because the repo actually
+        // contains them — while a repo that never shipped them is not
+        // punished for their absence.
+        for name in Self.sourceMarkerFileList(at: url) {
             if !fm.fileExists(atPath: url.appendingPathComponent(name).path) {
                 return false
             }
         }
 
-        if !Self.hasMTPSidecar(at: url) {
-            return false
-        }
-
         return Self.hasCompleteWeightSet(at: url)
+    }
+
+    private static func sourceMarkerFileList(at url: URL) -> [String] {
+        let markerURL = url.appendingPathComponent(".mtplx-source.json")
+        guard
+            let data = try? Data(contentsOf: markerURL),
+            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let files = parsed["files"] as? [String: Any]
+        else {
+            return []
+        }
+        return Array(files.keys)
     }
 
     private static func hasMTPSidecar(at url: URL) -> Bool {

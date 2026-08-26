@@ -2561,7 +2561,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     isComplete: false,
                     statusMessage: "Incomplete"
                 )
-                modelDownloadFailure = "Download finished, but the model folder is missing required MTPLX files. Press Retry to resume the Hugging Face download."
+                modelDownloadFailure = "Download finished, but files the source repo ships are still missing from the model folder. Press Retry to resume the Hugging Face download."
                 isModelDownloading = false
                 modelDownloadTask = nil
                 return
