@@ -22,6 +22,7 @@ from mtplx.qwen4_ngram import (
     NGramFileIdentity,
     NGramLease,
     NGramManifest,
+    NGramManifestError,
     NGramRowCache,
     NGramShard,
     SlotTicket,
@@ -1256,3 +1257,39 @@ def test_default_reader_capability_and_exclusive_owner_fail_before_allocation(
     finally:
         fixture.cache.close()
         fixture.artifact.close()
+
+
+def test_artifact_close_rejects_active_cache_without_closing_descriptors(
+    tmp_path: Path,
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    descriptors = [shard.fileno() for shard in fixture.artifact.shards]
+    with pytest.raises(NGramManifestError, match="cache owns"):
+        fixture.artifact.close()
+    assert [shard.fileno() for shard in fixture.artifact.shards] == descriptors
+    lease = fixture.cache.acquire_rows((1,))
+    assert lease.row_bytes(0) == fixture_row(1)
+    lease.release()
+    fixture.cache.close()
+    fixture.artifact.close()
+    assert all(shard.closed for shard in fixture.artifact.shards)
+
+
+def test_artifact_close_rejects_during_active_read_then_drain_succeeds(
+    tmp_path: Path,
+) -> None:
+    reader = ControlledReader()
+    fixture = fixture_cache(tmp_path, reader=reader)
+    pending = fixture.cache.acquire_rows_async((2,))
+    assert reader.started.wait(timeout=5)
+    descriptors = [shard.fileno() for shard in fixture.artifact.shards]
+    with pytest.raises(NGramManifestError, match="cache owns"):
+        fixture.artifact.close()
+    assert [shard.fileno() for shard in fixture.artifact.shards] == descriptors
+    reader.release.set()
+    lease = pending.result(timeout=5)
+    assert lease.row_bytes(0) == fixture_row(2)
+    lease.release()
+    fixture.cache.close()
+    fixture.artifact.close()
+    assert all(shard.closed for shard in fixture.artifact.shards)

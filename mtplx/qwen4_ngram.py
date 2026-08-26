@@ -1003,6 +1003,10 @@ class VerifiedNGramArtifact:
 
     def close(self) -> None:
         with self._lock:
+            if self._cache_owner is not None:
+                raise NGramManifestError(
+                    "cannot close verified n-gram artifact while its cache owns it"
+                )
             first_error: NGramManifestError | None = None
             for shard in self.shards:
                 try:
