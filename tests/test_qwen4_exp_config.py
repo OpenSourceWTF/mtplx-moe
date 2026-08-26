@@ -154,6 +154,19 @@ def test_from_dict_accepts_root_or_text_config_and_pins_geometry(
     _assert_pinned_args(ModelArgs.from_dict(config))
 
 
+@pytest.mark.parametrize(
+    "root_fields",
+    ({}, {"model_type": None}, {"model_type": "qwen4_exp_text"}),
+)
+def test_root_wrapper_requires_exact_qwen4_exp_model_type(
+    root_fields: dict[str, object],
+) -> None:
+    wrapper = {**root_fields, "text_config": _text_config()}
+
+    with pytest.raises(ValueError, match="root model_type must be qwen4_exp"):
+        ModelArgs.from_dict(wrapper)
+
+
 def test_cached_pinned_config_matches_repository_fixture_when_available() -> None:
     if not CACHED_CONFIG.exists():
         pytest.skip("pinned Hugging Face config is not cached on this machine")

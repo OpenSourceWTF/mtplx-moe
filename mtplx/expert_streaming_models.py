@@ -60,13 +60,16 @@ def proj_quant_covers(path: str, *, model_key: str | None = None) -> bool:
 
     if model_key == "kimi-k3-q1t":
         normalized = path
-        normalized = normalized.removeprefix("language_model.")
+        if normalized.startswith("language_model."):
+            normalized = normalized[len("language_model.") :]
         normalized = normalized.replace(".block_sparse_moe.", ".mlp.")
         if normalized in {"model.embed_tokens", "lm_head"}:
             return True
         if normalized == "mtp" or normalized.startswith("mtp."):
             return False
-        if normalized.endswith(("_res_proj", ".self_attn.kv_b_proj")):
+        if normalized.endswith("_res_proj") or normalized.endswith(
+            ".self_attn.kv_b_proj"
+        ):
             return False
         return normalized.endswith("_proj")
     if ".self_attn." in path and path.endswith(_ATTENTION_PROJ_SUFFIXES):

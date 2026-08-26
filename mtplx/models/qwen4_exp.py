@@ -209,7 +209,7 @@ class ModelArgs:
 
         root = _mapping(params, name="config")
         if "text_config" in root:
-            if root.get("model_type") not in (None, "qwen4_exp"):
+            if root.get("model_type") != "qwen4_exp":
                 raise ValueError("root model_type must be qwen4_exp")
             config = _mapping(root["text_config"], name="text_config")
         else:
