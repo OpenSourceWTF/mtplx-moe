@@ -316,7 +316,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
             # branch the ladder takes and why — the 147.4k lane went dark
             # because every fast branch declined SILENTLY (2026-08-26).
             dbg_count = int(getattr(self, "_mtplx_route_debug_calls", 0))
-            if dbg_count < 2 and int(queries.shape[2]) <= 16:
+            if dbg_count < 8 and int(queries.shape[2]) <= 16:
                 self._mtplx_route_debug_calls = dbg_count + 1
                 import sys as _sys
 
@@ -334,6 +334,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     f"has_uwf={hasattr(cache, 'update_without_fetch')} "
                     f"has_pa={hasattr(cache, 'paged_attention')} "
                     f"keys_none={getattr(cache, 'keys', None) is None} "
+                    f"cap={0 if getattr(cache, 'keys', None) is None else int(cache.keys.shape[2])} "
                     f"mask={type(mask).__name__} "
                     f"can_slice={can_slice_mask} "
                     f"twopass={should_use_2pass}",
