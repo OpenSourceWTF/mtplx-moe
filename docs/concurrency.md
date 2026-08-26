@@ -19,10 +19,26 @@ random-number state, stop state, and logical KV ownership.
 | `ar_batch` | Batch target-only autoregressive decode on a compatible backend |
 | `mtp_batch` | Batch native-MTP decode using a model-specific installed MTP lane |
 | `mtp_cohort_experimental` | Opt into experimental native-MTP cohort scheduling |
+| `hyper` | Serve one request at a time (extra requests queue FIFO like `serial`) and reserve batch width for that request's own speculative rows |
 
 The mode name is generic. It does not define a batch width, speculative depth,
 context limit, tensor shape, or numerical policy. Those are properties of the
 installed model/backend implementation.
+
+### `hyper`
+
+`hyper` is not a concurrency mode: external admission is fixed at 1, and
+simultaneous requests queue FIFO behind the active one with exactly the
+semantics `serial` gives. What distinguishes it is where width goes — when the
+width machinery is installed, batch rows hold self-generated speculative
+branches of the one admitted request, never a second client. At width 1 (the
+current singleton chassis) a request rides the untouched serial generation
+path: solo MTP oracle, paged KV cache, custom kernels, compiled verify bank,
+no padded batch object, no gather window. Because admission is definitional,
+the server refuses `--max-active-requests`, `--decode-batch-max`, a positive
+`--batch-wait-ms`, and the `agent`/`throughput` presets in this mode at
+startup. The health payload reports the chassis under `scheduler.hyper`
+(admission cap, queue depth, width, and width receipts).
 
 ## Ownership contract
 
@@ -52,7 +68,7 @@ additional flags:
 ```bash
 mtplx serve \
   --model <model-or-path> \
-  --scheduler-mode <serial|cooperative|ar_batch|mtp_batch|mtp_cohort_experimental>
+  --scheduler-mode <serial|cooperative|ar_batch|mtp_batch|mtp_cohort_experimental|hyper>
 ```
 
 Or save the scheduler choice:
