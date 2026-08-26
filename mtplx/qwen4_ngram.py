@@ -497,6 +497,122 @@ def _canonical_json(value: Any) -> bytes:
 
 
 @dataclass(frozen=True)
+class NGramComponent:
+    """One exact tensor segment backing a source-native affine row."""
+
+    component: Literal["weight", "scales", "biases"]
+    name: str
+    tensor: str
+    data_offset: int
+    row_bytes: int
+    data_bytes: int
+    file_size: int
+    file_sha256: str
+    dtype: Literal["U32", "BF16"]
+    shape: tuple[int, int]
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if type(self.component) is not str or self.component not in {
+            "weight",
+            "scales",
+            "biases",
+        }:
+            raise NGramManifestError("unsupported affine n-gram component")
+        _safe_component(self.name, label="component shard name")
+        _exact_string(self.tensor, label="component tensor")
+        _exact_int(self.data_offset, label="component data_offset")
+        _exact_int(self.row_bytes, label="component row_bytes", minimum=1)
+        _exact_int(self.data_bytes, label="component data_bytes", minimum=1)
+        _exact_int(self.file_size, label="component file_size", minimum=1)
+        _sha256(self.file_sha256, label="component file_sha256")
+        expected_dtype = "U32" if self.component == "weight" else "BF16"
+        if type(self.dtype) is not str or self.dtype != expected_dtype:
+            raise NGramManifestError(
+                f"{self.component} component dtype must be {expected_dtype}"
+            )
+        if (
+            type(self.shape) is not tuple
+            or len(self.shape) != 2
+            or any(type(size) is not int or size <= 0 for size in self.shape)
+        ):
+            raise NGramManifestError(
+                "component shape must be an exact pair of positive integers"
+            )
+        dtype_bytes = 4 if self.dtype == "U32" else 2
+        if self.row_bytes != self.shape[1] * dtype_bytes:
+            raise NGramManifestError("component row_bytes does not match its shape")
+        if self.data_bytes != self.shape[0] * self.row_bytes:
+            raise NGramManifestError("component data_bytes does not match its shape")
+        if self.data_offset + self.data_bytes > self.file_size:
+            raise NGramManifestError("component payload exceeds its exact file size")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "component": self.component,
+            "name": self.name,
+            "tensor": self.tensor,
+            "data_offset": self.data_offset,
+            "row_bytes": self.row_bytes,
+            "data_bytes": self.data_bytes,
+            "file_size": self.file_size,
+            "file_sha256": self.file_sha256,
+            "dtype": self.dtype,
+            "shape": list(self.shape),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> NGramComponent:
+        obj = _object(value, label="component")
+        _keys(
+            obj,
+            label="component",
+            required=(
+                "component",
+                "name",
+                "tensor",
+                "data_offset",
+                "row_bytes",
+                "data_bytes",
+                "file_size",
+                "file_sha256",
+                "dtype",
+                "shape",
+            ),
+        )
+        raw_shape = obj["shape"]
+        if type(raw_shape) is not list or len(raw_shape) != 2:
+            raise NGramManifestError("component shape must contain two integers")
+        return cls(
+            component=_exact_string(  # type: ignore[arg-type]
+                obj["component"], label="component kind"
+            ),
+            name=_safe_component(obj["name"], label="component shard name"),
+            tensor=_exact_string(obj["tensor"], label="component tensor"),
+            data_offset=_exact_int(obj["data_offset"], label="component data_offset"),
+            row_bytes=_exact_int(
+                obj["row_bytes"], label="component row_bytes", minimum=1
+            ),
+            data_bytes=_exact_int(
+                obj["data_bytes"], label="component data_bytes", minimum=1
+            ),
+            file_size=_exact_int(
+                obj["file_size"], label="component file_size", minimum=1
+            ),
+            file_sha256=_sha256(
+                obj["file_sha256"], label="component file_sha256"
+            ),
+            dtype=_exact_string(obj["dtype"], label="component dtype"),  # type: ignore[arg-type]
+            shape=(
+                _exact_int(raw_shape[0], label="component shape[0]", minimum=1),
+                _exact_int(raw_shape[1], label="component shape[1]", minimum=1),
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class NGramShard:
     name: str
     tensor: str
@@ -506,6 +622,7 @@ class NGramShard:
     data_bytes: int
     file_size: int
     sha256: str
+    components: tuple[NGramComponent, ...] = ()
 
     def __post_init__(self) -> None:
         self.validate()
@@ -521,9 +638,48 @@ class NGramShard:
         _sha256(self.sha256, label="shard sha256")
         if self.data_offset + self.data_bytes > self.file_size:
             raise NGramManifestError("shard payload exceeds its exact file size")
+        if type(self.components) is not tuple:
+            raise NGramManifestError("shard components must be an exact tuple")
+        if self.components:
+            if tuple(component.component for component in self.components) != (
+                "weight",
+                "scales",
+                "biases",
+            ):
+                raise NGramManifestError(
+                    "segmented shard components must be weight, scales, biases"
+                )
+            for component in self.components:
+                if type(component) is not NGramComponent:
+                    raise NGramManifestError(
+                        "shard components must contain exact NGramComponent values"
+                    )
+                component.validate()
+                if component.shape[0] != self.row_count:
+                    raise NGramManifestError(
+                        "component row count does not match its logical shard"
+                    )
+            expected_bytes = self.row_count * sum(
+                component.row_bytes for component in self.components
+            )
+            if self.data_offset != 0 or self.data_bytes != expected_bytes:
+                raise NGramManifestError(
+                    "segmented shard logical byte range does not match its components"
+                )
+            if self.file_size != self.data_bytes:
+                raise NGramManifestError(
+                    "segmented shard logical file_size must equal data_bytes"
+                )
+            component_digest = hashlib.sha256(
+                _canonical_json(
+                    [component.to_dict() for component in self.components]
+                )
+            ).hexdigest()
+            if self.sha256 != component_digest:
+                raise NGramManifestError("segmented shard component digest mismatch")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "name": self.name,
             "tensor": self.tensor,
             "start_row": self.start_row,
@@ -533,6 +689,11 @@ class NGramShard:
             "file_size": self.file_size,
             "sha256": self.sha256,
         }
+        if self.components:
+            result["components"] = [
+                component.to_dict() for component in self.components
+            ]
+        return result
 
     @classmethod
     def from_dict(cls, value: Any) -> NGramShard:
@@ -550,7 +711,11 @@ class NGramShard:
                 "file_size",
                 "sha256",
             ),
+            optional=("components",),
         )
+        raw_components = obj.get("components", [])
+        if type(raw_components) is not list:
+            raise NGramManifestError("shard components must be an array")
         shard = cls(
             name=_safe_component(obj["name"], label="shard name"),
             tensor=_exact_string(obj["tensor"], label="shard tensor"),
@@ -562,9 +727,45 @@ class NGramShard:
             ),
             file_size=_exact_int(obj["file_size"], label="shard file_size", minimum=1),
             sha256=_sha256(obj["sha256"], label="shard sha256"),
+            components=tuple(
+                NGramComponent.from_dict(component) for component in raw_components
+            ),
         )
         shard.validate()
         return shard
+
+
+def segmented_ngram_shard(
+    *,
+    name: str,
+    tensor: str,
+    start_row: int,
+    row_count: int,
+    components: tuple[NGramComponent, ...],
+) -> NGramShard:
+    """Create one logical row range backed by exact safetensors components."""
+
+    if type(components) is not tuple:
+        raise NGramManifestError("shard components must be an exact tuple")
+    if any(type(component) is not NGramComponent for component in components):
+        raise NGramManifestError(
+            "shard components must contain exact NGramComponent values"
+        )
+    data_bytes = row_count * sum(component.row_bytes for component in components)
+    digest = hashlib.sha256(
+        _canonical_json([component.to_dict() for component in components])
+    ).hexdigest()
+    return NGramShard(
+        name=name,
+        tensor=tensor,
+        start_row=start_row,
+        row_count=row_count,
+        data_offset=0,
+        data_bytes=data_bytes,
+        file_size=data_bytes,
+        sha256=digest,
+        components=components,
+    )
 
 
 @dataclass(frozen=True)
@@ -611,6 +812,8 @@ class NGramManifest:
         cursor = 0
         names: set[str] = set()
         tensors: set[str] = set()
+        segmented_layout: bool | None = None
+        component_tensors: set[str] = set()
         for shard in self.shards:
             if type(shard) is not NGramShard:
                 raise NGramManifestError("shards must contain exact NGramShard values")
@@ -621,6 +824,30 @@ class NGramManifest:
                 )
             names.add(shard.name)
             tensors.add(shard.tensor)
+            current_segmented = bool(shard.components)
+            if segmented_layout is None:
+                segmented_layout = current_segmented
+            elif segmented_layout != current_segmented:
+                raise NGramManifestError(
+                    "manifest cannot mix contiguous and segmented shards"
+                )
+            if shard.components:
+                if self.storage != "affine-q4-g32":
+                    raise NGramManifestError(
+                        "segmented n-gram shards require affine-q4-g32 storage"
+                    )
+                if sum(
+                    component.row_bytes for component in shard.components
+                ) != self.row_bytes:
+                    raise NGramManifestError(
+                        "segmented component row bytes do not match the manifest"
+                    )
+                for component in shard.components:
+                    if component.tensor in component_tensors:
+                        raise NGramManifestError(
+                            "manifest contains a duplicate component tensor"
+                        )
+                    component_tensors.add(component.tensor)
             if shard.start_row != cursor:
                 relation = "overlap" if shard.start_row < cursor else "gap"
                 raise NGramManifestError(f"manifest row coverage has a {relation}")
@@ -865,17 +1092,103 @@ class NGramFileIdentity:
     ctime_ns: int
 
 
+class _VerifiedNGramFile:
+    """One unique source safetensors descriptor shared by logical shards."""
+
+    __slots__ = ("_fd", "_lock", "identity", "name")
+
+    def __init__(
+        self,
+        name: str,
+        descriptor: int,
+        identity: NGramFileIdentity,
+    ) -> None:
+        self.name = name
+        self.identity = identity
+        self._fd = descriptor
+        self._lock = threading.RLock()
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._fd < 0
+
+    def fileno(self) -> int:
+        with self._lock:
+            if self.closed:
+                raise NGramManifestError(
+                    f"verified source file {self.name} is closed"
+                )
+            return self._fd
+
+    def pread(self, offset: int, length: int) -> bytes:
+        if offset + length > self.identity.size:
+            raise NGramManifestError("pread range exceeds the verified source file")
+        descriptor = self.fileno()
+        chunks: list[bytes] = []
+        remaining = length
+        cursor = offset
+        while remaining:
+            try:
+                chunk = os.pread(descriptor, remaining, cursor)
+            except OSError as exc:
+                raise NGramManifestError(
+                    f"could not read verified source file {self.name}: {exc}"
+                ) from exc
+            if not chunk:
+                raise NGramManifestError(
+                    f"short descriptor read from source file {self.name}"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            cursor += len(chunk)
+        return b"".join(chunks)
+
+    def close(self) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            descriptor = self._fd
+            self._fd = -1
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise NGramManifestError(
+                    f"could not close verified source file {self.name}: {exc}"
+                ) from exc
+
+
+@dataclass(frozen=True)
+class _VerifiedNGramComponent:
+    component: NGramComponent
+    source: _VerifiedNGramFile
+
+
 class VerifiedNGramShard:
     """One verified immutable shard whose descriptor remains authoritative."""
 
-    __slots__ = ("_fd", "_lock", "identity", "shard")
+    __slots__ = (
+        "_components",
+        "_fd",
+        "_lock",
+        "_segmented_closed",
+        "identity",
+        "shard",
+    )
 
     def __init__(
-        self, shard: NGramShard, descriptor: int, identity: NGramFileIdentity
+        self,
+        shard: NGramShard,
+        descriptor: int,
+        identity: NGramFileIdentity,
+        *,
+        components: tuple[_VerifiedNGramComponent, ...] = (),
     ) -> None:
         self.shard = shard
         self.identity = identity
         self._fd = descriptor
+        self._components = components
+        self._segmented_closed = False
         self._lock = threading.RLock()
 
     def __copy__(self) -> None:
@@ -888,10 +1201,14 @@ class VerifiedNGramShard:
     @property
     def closed(self) -> bool:
         with self._lock:
-            return self._fd < 0
+            return self._segmented_closed if self._components else self._fd < 0
 
     def fileno(self) -> int:
         with self._lock:
+            if self._components:
+                raise NGramManifestError(
+                    f"segmented shard {self.shard.name} has no single descriptor"
+                )
             if self.closed:
                 raise NGramManifestError(
                     f"verified shard {self.shard.name} is closed"
@@ -928,9 +1245,36 @@ class VerifiedNGramShard:
                 ) from exc
             return b"".join(chunks)
 
+    def read_row(self, local_row: int) -> bytes:
+        _exact_int(local_row, label="local row")
+        if not 0 <= local_row < self.shard.row_count:
+            raise NGramManifestError("local row is outside its logical shard")
+        if not self._components:
+            row_bytes = self.shard.data_bytes // self.shard.row_count
+            return self.pread(
+                self.shard.data_offset + local_row * row_bytes,
+                row_bytes,
+            )
+        with self._lock:
+            if self.closed:
+                raise NGramManifestError(
+                    f"verified shard {self.shard.name} is closed"
+                )
+            return b"".join(
+                verified.source.pread(
+                    verified.component.data_offset
+                    + local_row * verified.component.row_bytes,
+                    verified.component.row_bytes,
+                )
+                for verified in self._components
+            )
+
     def close(self) -> None:
         with self._lock:
             if self.closed:
+                return
+            if self._components:
+                self._segmented_closed = True
                 return
             descriptor = self._fd
             self._fd = -1
@@ -950,6 +1294,7 @@ class VerifiedNGramArtifact:
         "_cache_reuse_error",
         "_lock",
         "_root_fd",
+        "_source_files",
         "manifest",
         "report",
         "shards",
@@ -960,6 +1305,7 @@ class VerifiedNGramArtifact:
         manifest: NGramManifest,
         root_descriptor: int,
         shards: tuple[VerifiedNGramShard, ...],
+        source_files: tuple[_VerifiedNGramFile, ...] = (),
     ) -> None:
         self.manifest = manifest
         self._root_fd = root_descriptor
@@ -967,6 +1313,7 @@ class VerifiedNGramArtifact:
         self._cache_owner: object | None = None
         self._cache_reuse_error: str | None = None
         self.shards = shards
+        self._source_files = source_files
         self.report = {
             "shards": len(shards),
             "rows": manifest.padded_rows,
@@ -1001,6 +1348,8 @@ class VerifiedNGramArtifact:
         shard, offset = self.manifest.locate_row(row)
         for verified in self.shards:
             if verified.shard is shard or verified.shard.name == shard.name:
+                if shard.components:
+                    return verified.read_row(row - shard.start_row)
                 return verified.pread(offset, self.manifest.row_bytes)
         raise NGramManifestError(f"verified artifact has no shard for row {row}")
 
@@ -1014,6 +1363,12 @@ class VerifiedNGramArtifact:
             for shard in self.shards:
                 try:
                     shard.close()
+                except NGramManifestError as exc:
+                    if first_error is None:
+                        first_error = exc
+            for source in self._source_files:
+                try:
+                    source.close()
                 except NGramManifestError as exc:
                     if first_error is None:
                         first_error = exc
@@ -1109,6 +1464,169 @@ def _hash_descriptor_payload(descriptor: int, shard: NGramShard) -> str:
     return digest.hexdigest()
 
 
+def _hash_complete_descriptor(descriptor: int, size: int, *, name: str) -> str:
+    digest = hashlib.sha256()
+    remaining = size
+    offset = 0
+    try:
+        while remaining:
+            chunk = os.pread(descriptor, min(8 * 1024 * 1024, remaining), offset)
+            if not chunk:
+                raise NGramManifestError(f"short payload in source file {name}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+            offset += len(chunk)
+    except NGramManifestError:
+        raise
+    except OSError as exc:
+        raise NGramManifestError(f"could not hash source file {name}: {exc}") from exc
+    return digest.hexdigest()
+
+
+def _verify_segmented_ngram_manifest(
+    root: Path | str,
+    manifest: NGramManifest,
+) -> VerifiedNGramArtifact:
+    if any(not shard.components for shard in manifest.shards):
+        raise NGramManifestError(
+            "source-native n-gram manifests cannot mix contiguous and segmented shards"
+        )
+    expected_files: dict[str, tuple[int, str]] = {}
+    for shard in manifest.shards:
+        for component in shard.components:
+            prior = expected_files.setdefault(
+                component.name,
+                (component.file_size, component.file_sha256),
+            )
+            if prior != (component.file_size, component.file_sha256):
+                raise NGramManifestError(
+                    f"conflicting source identity for {component.name}"
+                )
+
+    root_descriptor: int | None = None
+    opened_files: list[_VerifiedNGramFile] = []
+    try:
+        root_descriptor = _open_root_nofollow(root)
+        by_name: dict[str, _VerifiedNGramFile] = {}
+        for name, (file_size, file_sha256) in sorted(expected_files.items()):
+            safe_name = _safe_component(name, label="component shard name")
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    safe_name,
+                    _readonly_flags(),
+                    dir_fd=root_descriptor,
+                )
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise NGramManifestError(
+                        f"source component file is not regular: {name}"
+                    )
+                if metadata.st_nlink != 1:
+                    raise NGramManifestError(
+                        f"source component file {name} must have exactly one hard link"
+                    )
+                if metadata.st_mode & (
+                    stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+                ):
+                    raise NGramManifestError(
+                        f"source component file {name} must be read-only"
+                    )
+                if metadata.st_size != file_size:
+                    raise NGramManifestError(
+                        f"source component file size mismatch for {name}"
+                    )
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except OSError as exc:
+                        raise NGramManifestError(
+                            f"could not acquire immutable shared lock for {name}: {exc}"
+                        ) from exc
+                if _hash_complete_descriptor(descriptor, file_size, name=name) != file_sha256:
+                    raise NGramManifestError(
+                        f"source component file digest mismatch for {name}"
+                    )
+                verified_metadata = os.fstat(descriptor)
+                if (
+                    verified_metadata.st_dev != metadata.st_dev
+                    or verified_metadata.st_ino != metadata.st_ino
+                    or verified_metadata.st_size != metadata.st_size
+                    or verified_metadata.st_mode != metadata.st_mode
+                    or verified_metadata.st_nlink != metadata.st_nlink
+                    or verified_metadata.st_mtime_ns != metadata.st_mtime_ns
+                    or verified_metadata.st_ctime_ns != metadata.st_ctime_ns
+                ):
+                    raise NGramManifestError(
+                        f"source component file identity changed during verification: {name}"
+                    )
+                owner = _VerifiedNGramFile(
+                    name,
+                    descriptor,
+                    NGramFileIdentity(
+                        device=verified_metadata.st_dev,
+                        inode=verified_metadata.st_ino,
+                        size=verified_metadata.st_size,
+                        mtime_ns=verified_metadata.st_mtime_ns,
+                        ctime_ns=verified_metadata.st_ctime_ns,
+                    ),
+                )
+                descriptor = None
+                opened_files.append(owner)
+                by_name[name] = owner
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+
+        retained: list[VerifiedNGramShard] = []
+        for shard in manifest.shards:
+            verified_components = tuple(
+                _VerifiedNGramComponent(component, by_name[component.name])
+                for component in shard.components
+            )
+            retained.append(
+                VerifiedNGramShard(
+                    shard,
+                    -1,
+                    verified_components[0].source.identity,
+                    components=verified_components,
+                )
+            )
+        artifact = VerifiedNGramArtifact(
+            manifest,
+            root_descriptor,
+            tuple(retained),
+            tuple(opened_files),
+        )
+        root_descriptor = None
+        opened_files = []
+        return artifact
+    except NGramManifestError:
+        raise
+    except OSError as exc:
+        raise NGramManifestError(
+            f"could not verify source-native n-gram artifact: {exc}"
+        ) from exc
+    finally:
+        cleanup_error: NGramManifestError | None = None
+        for source in opened_files:
+            try:
+                source.close()
+            except NGramManifestError as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if root_descriptor is not None:
+            try:
+                os.close(root_descriptor)
+            except OSError as exc:
+                if cleanup_error is None:
+                    cleanup_error = NGramManifestError(
+                        f"could not close artifact root: {exc}"
+                    )
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
 def _require_verification_capabilities() -> None:
     """Fail closed before artifact access if immutable-FD primitives are absent."""
 
@@ -1178,6 +1696,8 @@ def verify_ngram_manifest(
     manifest.validate_structure()
     if manifest.digest is None or manifest.digest != manifest.with_digest().digest:
         raise NGramManifestError("manifest digest mismatch")
+    if any(shard.components for shard in manifest.shards):
+        return _verify_segmented_ngram_manifest(root, manifest)
     root_descriptor: int | None = None
     retained: list[VerifiedNGramShard] = []
     try:
@@ -1717,6 +2237,13 @@ class _PackedCacheIndex:
 
 
 @dataclass(frozen=True)
+class _InstalledNGramComponent:
+    data_offset: int
+    row_bytes: int
+    source: _VerifiedNGramFile
+
+
+@dataclass(frozen=True)
 class _InstalledNGramShard:
     """Construction-proven physical route to one retained shard descriptor."""
 
@@ -1726,6 +2253,7 @@ class _InstalledNGramShard:
     data_offset: int
     data_bytes: int
     retained: VerifiedNGramShard
+    components: tuple[_InstalledNGramComponent, ...] = ()
 
 
 def _install_ngram_shard_routes(
@@ -1751,6 +2279,7 @@ def _install_ngram_shard_routes(
         raise NGramCacheIOError("retained artifact root is not an open directory")
     descriptors: set[int] = {root_descriptor}
     identities: set[tuple[int, int]] = set()
+    proven_sources: set[_VerifiedNGramFile] = set()
     for index, (expected, retained) in enumerate(
         zip(manifest_shards, retained_shards, strict=True)
     ):
@@ -1764,6 +2293,72 @@ def _install_ngram_shard_routes(
             raise TypeError("verified shard identity has the wrong exact type")
         if retained.closed:
             raise NGramCacheClosed(f"verified shard {expected.name} is closed")
+        if expected.components:
+            if len(retained._components) != len(expected.components):
+                raise ValueError(
+                    f"verified shard {expected.name} component count changed"
+                )
+            installed_components: list[_InstalledNGramComponent] = []
+            for component, verified_component in zip(
+                expected.components,
+                retained._components,
+                strict=True,
+            ):
+                if verified_component.component != component:
+                    raise ValueError(
+                        f"verified shard {expected.name} component metadata changed"
+                    )
+                source = verified_component.source
+                if source not in proven_sources:
+                    try:
+                        descriptor = source.fileno()
+                        metadata = os.fstat(descriptor)
+                    except (NGramManifestError, OSError) as exc:
+                        raise NGramCacheIOError(
+                            f"could not prove retained source {source.name}: {exc}"
+                        ) from exc
+                    current_identity = NGramFileIdentity(
+                        device=metadata.st_dev,
+                        inode=metadata.st_ino,
+                        size=metadata.st_size,
+                        mtime_ns=metadata.st_mtime_ns,
+                        ctime_ns=metadata.st_ctime_ns,
+                    )
+                    if source.identity != current_identity:
+                        raise NGramCacheIOError(
+                            f"retained source {source.name} identity changed"
+                        )
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise NGramCacheIOError(
+                            f"retained source {source.name} is not singly linked"
+                        )
+                    file_identity = (current_identity.device, current_identity.inode)
+                    if descriptor in descriptors or file_identity in identities:
+                        raise NGramCacheIOError(
+                            "retained source descriptors are not unique"
+                        )
+                    descriptors.add(descriptor)
+                    identities.add(file_identity)
+                    proven_sources.add(source)
+                installed_components.append(
+                    _InstalledNGramComponent(
+                        data_offset=component.data_offset,
+                        row_bytes=component.row_bytes,
+                        source=source,
+                    )
+                )
+            routes.append(
+                _InstalledNGramShard(
+                    index=index,
+                    start_row=expected.start_row,
+                    stop_row=expected.start_row + expected.row_count,
+                    data_offset=0,
+                    data_bytes=expected.data_bytes,
+                    retained=retained,
+                    components=tuple(installed_components),
+                )
+            )
+            continue
         try:
             descriptor = retained.fileno()
             metadata = os.fstat(descriptor)
@@ -1820,6 +2415,20 @@ class _PageCacheInstallState:
     rollback_detail: str = ""
 
 
+def _installed_source_descriptors(
+    routes: tuple[_InstalledNGramShard, ...],
+) -> tuple[int, ...]:
+    descriptors: list[int] = []
+    for route in routes:
+        if route.components:
+            descriptors.extend(
+                component.source.fileno() for component in route.components
+            )
+        else:
+            descriptors.append(route.retained.fileno())
+    return tuple(dict.fromkeys(descriptors))
+
+
 def _install_page_cache_policy(
     routes: tuple[_InstalledNGramShard, ...],
     bypass_page_cache: bool,
@@ -1836,8 +2445,7 @@ def _install_page_cache_policy(
     command = fcntl.F_NOCACHE
     installed: list[int] = []
     try:
-        for route in routes:
-            descriptor = route.retained.fileno()
+        for descriptor in _installed_source_descriptors(routes):
             installed.append(descriptor)
             fcntl.fcntl(descriptor, command, 1)
     except BaseException as exc:
@@ -1869,9 +2477,9 @@ def _restore_page_cache_policy(
     command = fcntl.F_NOCACHE
     first_error: BaseException | None = None
     first_traceback: Any | None = None
-    for route in routes:
+    for descriptor in _installed_source_descriptors(routes):
         try:
-            fcntl.fcntl(route.retained.fileno(), command, 0)
+            fcntl.fcntl(descriptor, command, 0)
         except BaseException as exc:  # noqa: BLE001 - restore every descriptor
             if first_error is None:
                 first_error = exc
@@ -1888,13 +2496,18 @@ def _restore_page_cache_policy(
 class _DescriptorReader:
     """Production descriptor reader with no runtime policy selection."""
 
-    __slots__ = ("_preadv",)
+    __slots__ = ("_iov_max", "_preadv")
 
     def __init__(self) -> None:
         preadv = getattr(os, "preadv", None)
         if not callable(preadv):
             raise TypeError("production n-gram streaming requires os.preadv")
         self._preadv = preadv
+        try:
+            iov_max = os.sysconf("SC_IOV_MAX")
+        except (OSError, ValueError):
+            iov_max = 1024
+        self._iov_max = max(1, int(iov_max))
 
     def read_into(
         self,
@@ -1910,6 +2523,56 @@ class _DescriptorReader:
                 break
             cursor += count
         return cursor
+
+    def read_segmented_into(
+        self,
+        route: _InstalledNGramShard,
+        local_row: int,
+        row_count: int,
+        row_bytes: int,
+        target: memoryview,
+    ) -> int:
+        output_offset = 0
+        total = 0
+        for component in route.components:
+            completed = 0
+            while completed < row_count:
+                count = min(self._iov_max, row_count - completed)
+                views = [
+                    target[
+                        (completed + row) * row_bytes + output_offset :
+                        (completed + row) * row_bytes
+                        + output_offset
+                        + component.row_bytes
+                    ]
+                    for row in range(count)
+                ]
+                source_offset = component.data_offset + (
+                    local_row + completed
+                ) * component.row_bytes
+                expected = count * component.row_bytes
+                read = 0
+                while read < expected:
+                    skip = read
+                    active: list[memoryview] = []
+                    for view in views:
+                        if skip >= view.nbytes:
+                            skip -= view.nbytes
+                            continue
+                        active.append(view[skip:])
+                        skip = 0
+                    current = self._preadv(
+                        component.source.fileno(),
+                        active,
+                        source_offset + read,
+                    )
+                    if current <= 0:
+                        return total + read
+                    read += current
+                completed += count
+                total += read
+            output_offset += component.row_bytes
+        return total
 
 
 class _TransientPool:
@@ -2162,11 +2825,15 @@ class NGramRowCache:
             raise NGramCacheClosed("verified n-gram artifact is closed")
         manifest = artifact.manifest
         row_bytes = manifest.row_bytes
+        segmented = bool(manifest.shards[0].components)
         if config.max_inflight_io_bytes < row_bytes:
             raise ValueError("max_inflight_io_bytes must hold at least one row")
-        if config.max_open_files < len(artifact.shards) + 1:
+        retained_file_count = (
+            len(artifact._source_files) if segmented else len(artifact.shards)
+        )
+        if config.max_open_files < retained_file_count + 1:
             raise ValueError(
-                "max_open_files must include the root and every retained shard"
+                "max_open_files must include the root and every retained source file"
             )
         plan = plan_ngram_cache(manifest, config)
         token = object()
@@ -2195,6 +2862,12 @@ class NGramRowCache:
             selected_reader = reader if reader is not None else _DescriptorReader()
             if not callable(getattr(selected_reader, "read_into", None)):
                 raise TypeError("reader must provide a callable read_into method")
+            if segmented and not callable(
+                getattr(selected_reader, "read_segmented_into", None)
+            ):
+                raise TypeError(
+                    "source-native reader must provide read_segmented_into"
+                )
             if allocator is None:
                 from mtplx.mmap_mlx import allocate_metal_u8
 
@@ -2266,6 +2939,9 @@ class NGramRowCache:
         self._physical_routes = installed_routes
         self._physical_starts = tuple(route.start_row for route in installed_routes)
         self._reader = selected_reader
+        self._read_group = (
+            self._read_segmented_group if segmented else self._read_contiguous_group
+        )
         self._victim_key = self._lru_key if config.eviction == "lru" else self._frequency_key
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -2383,6 +3059,33 @@ class NGramRowCache:
         ):
             self._invalidate_ticket(ticket)
 
+    def _read_contiguous_group(
+        self,
+        route: _InstalledNGramShard,
+        offset: int,
+        length: int,
+        target: memoryview,
+    ) -> int:
+        del length
+        return self._reader.read_into(route.retained, offset, target)
+
+    def _read_segmented_group(
+        self,
+        route: _InstalledNGramShard,
+        offset: int,
+        length: int,
+        target: memoryview,
+    ) -> int:
+        local_row = offset // self._row_bytes
+        row_count = length // self._row_bytes
+        return self._reader.read_segmented_into(
+            route,
+            local_row,
+            row_count,
+            self._row_bytes,
+            target,
+        )
+
     def _read_publish(
         self,
         shard_index: int,
@@ -2392,7 +3095,7 @@ class NGramRowCache:
         transient_rows: int,
         rows: tuple[tuple[int, SlotTicket], ...],
     ) -> None:
-        shard = self._physical_routes[shard_index].retained
+        route = self._physical_routes[shard_index]
         failure: str | None = None
         fatal: BaseException | None = None
         target: memoryview | None = None
@@ -2400,7 +3103,7 @@ class NGramRowCache:
             target = self._transient_pool.bytes_view(
                 transient_start, transient_rows
             )
-            count = self._reader.read_into(shard, offset, target)
+            count = self._read_group(route, offset, length, target)
             if type(count) is not int or count != length:
                 raise NGramCacheIOError(
                     f"short n-gram read: expected {length} bytes, got "
@@ -2936,6 +3639,7 @@ __all__ = [
     "NGramCacheFull",
     "NGramCacheIOError",
     "NGramCachePlan",
+    "NGramComponent",
     "NGramFileIdentity",
     "NGramGeometry",
     "NGramLease",
@@ -2953,5 +3657,6 @@ __all__ = [
     "plan_production_ngram_cache",
     "qwen38_ngram_manifest",
     "save_ngram_manifest",
+    "segmented_ngram_shard",
     "verify_ngram_manifest",
 ]

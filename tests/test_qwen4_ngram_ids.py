@@ -17,6 +17,7 @@ import pytest
 from mtplx import qwen4_ngram
 from mtplx.qwen4_ngram import (
     QWEN38_FLASH_NEXT_REVISION,
+    NGramComponent,
     NGramGeometry,
     NGramManifest,
     NGramManifestError,
@@ -24,6 +25,7 @@ from mtplx.qwen4_ngram import (
     load_ngram_manifest,
     qwen38_ngram_manifest,
     save_ngram_manifest,
+    segmented_ngram_shard,
     verify_ngram_manifest,
 )
 
@@ -329,6 +331,166 @@ def test_qwen38_manifest_constructor_pins_provenance_and_layout() -> None:
     assert manifest.row_bytes == 100
     assert manifest.padded_rows == 320_001_536
     assert manifest.digest is not None
+
+
+def test_segmented_affine_manifest_roundtrips_source_safetensors_layout() -> None:
+    file_digest = "1" * 64
+    components = (
+        NGramComponent(
+            component="weight",
+            name="model.safetensors",
+            tensor="ngram.shard_0.weight",
+            data_offset=0,
+            row_bytes=16,
+            data_bytes=32,
+            file_size=40,
+            file_sha256=file_digest,
+            dtype="U32",
+            shape=(2, 4),
+        ),
+        NGramComponent(
+            component="scales",
+            name="model.safetensors",
+            tensor="ngram.shard_0.scales",
+            data_offset=32,
+            row_bytes=2,
+            data_bytes=4,
+            file_size=40,
+            file_sha256=file_digest,
+            dtype="BF16",
+            shape=(2, 1),
+        ),
+        NGramComponent(
+            component="biases",
+            name="model.safetensors",
+            tensor="ngram.shard_0.biases",
+            data_offset=36,
+            row_bytes=2,
+            data_bytes=4,
+            file_size=40,
+            file_sha256=file_digest,
+            dtype="BF16",
+            shape=(2, 1),
+        ),
+    )
+    shard = segmented_ngram_shard(
+        name="ngram-shard-000",
+        tensor="ngram.shard_0",
+        start_row=0,
+        row_count=2,
+        components=components,
+    )
+    manifest = NGramManifest(
+        source_repo="Vontra/example",
+        source_revision="a" * 40,
+        storage="affine-q4-g32",
+        row_width=32,
+        row_bytes=20,
+        padded_rows=2,
+        shards=(shard,),
+    ).with_digest()
+
+    restored = NGramManifest.from_dict(manifest.to_dict())
+
+    assert restored == manifest
+    assert restored.shards[0].components == components
+    assert restored.shards[0].data_bytes == 40
+
+
+def test_segmented_affine_manifest_rejects_component_layout_drift() -> None:
+    component = NGramComponent(
+        component="weight",
+        name="model.safetensors",
+        tensor="ngram.shard_0.weight",
+        data_offset=0,
+        row_bytes=16,
+        data_bytes=32,
+        file_size=40,
+        file_sha256="1" * 64,
+        dtype="U32",
+        shape=(2, 4),
+    )
+
+    with pytest.raises(NGramManifestError, match="weight, scales, biases"):
+        segmented_ngram_shard(
+            name="ngram-shard-000",
+            tensor="ngram.shard_0",
+            start_row=0,
+            row_count=2,
+            components=(component,),
+        )
+
+
+def test_segmented_affine_artifact_reads_exact_rows_from_source_components(
+    tmp_path: Path,
+) -> None:
+    weights = b"A" * 16 + b"B" * 16
+    scales = b"c0" + b"c1"
+    biases = b"d0" + b"d1"
+    payload = weights + scales + biases
+    source = tmp_path / "model.safetensors"
+    source.write_bytes(payload)
+    source.chmod(0o444)
+    digest = hashlib.sha256(payload).hexdigest()
+    components = (
+        NGramComponent(
+            "weight",
+            source.name,
+            "ngram.shard_0.weight",
+            0,
+            16,
+            32,
+            len(payload),
+            digest,
+            "U32",
+            (2, 4),
+        ),
+        NGramComponent(
+            "scales",
+            source.name,
+            "ngram.shard_0.scales",
+            32,
+            2,
+            4,
+            len(payload),
+            digest,
+            "BF16",
+            (2, 1),
+        ),
+        NGramComponent(
+            "biases",
+            source.name,
+            "ngram.shard_0.biases",
+            36,
+            2,
+            4,
+            len(payload),
+            digest,
+            "BF16",
+            (2, 1),
+        ),
+    )
+    shard = segmented_ngram_shard(
+        name="ngram-shard-000",
+        tensor="ngram.shard_0",
+        start_row=0,
+        row_count=2,
+        components=components,
+    )
+    manifest = NGramManifest(
+        source_repo="Vontra/example",
+        source_revision="a" * 40,
+        storage="affine-q4-g32",
+        row_width=32,
+        row_bytes=20,
+        padded_rows=2,
+        shards=(shard,),
+    ).with_digest()
+
+    with verify_ngram_manifest(tmp_path, manifest) as artifact:
+        assert artifact.report == {"shards": 1, "rows": 2, "bytes": 40}
+        assert artifact.read_row(0) == b"A" * 16 + b"c0d0"
+        assert artifact.read_row(1) == b"B" * 16 + b"c1d1"
 
 
 @pytest.mark.parametrize(

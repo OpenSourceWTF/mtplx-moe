@@ -19,6 +19,7 @@ from mtplx.qwen4_ngram import (
     NGramCacheError,
     NGramCacheFull,
     NGramCacheIOError,
+    NGramComponent,
     NGramFileIdentity,
     NGramLease,
     NGramManifest,
@@ -31,6 +32,8 @@ from mtplx.qwen4_ngram import (
     VerifiedNGramShard,
     plan_ngram_cache,
     plan_production_ngram_cache,
+    segmented_ngram_shard,
+    verify_ngram_manifest,
 )
 
 ROW_BYTES = 8
@@ -189,6 +192,71 @@ def test_cache_deduplicates_pins_and_never_grows(tmp_path: Path) -> None:
         assert fixture.cache.arena_bytes == 4 * ROW_BYTES
     finally:
         fixture.close()
+
+
+def test_source_native_affine_cache_gathers_exact_segmented_rows(
+    tmp_path: Path,
+) -> None:
+    weights = b"A" * 16 + b"B" * 16 + b"C" * 16
+    scales = b"s0s1s2"
+    biases = b"b0b1b2"
+    payload = weights + scales + biases
+    source = tmp_path / "model.safetensors"
+    source.write_bytes(payload)
+    source.chmod(0o444)
+    digest = hashlib.sha256(payload).hexdigest()
+    components = (
+        NGramComponent(
+            "weight", source.name, "ngram.weight", 0, 16, 48,
+            len(payload), digest, "U32", (3, 4),
+        ),
+        NGramComponent(
+            "scales", source.name, "ngram.scales", 48, 2, 6,
+            len(payload), digest, "BF16", (3, 1),
+        ),
+        NGramComponent(
+            "biases", source.name, "ngram.biases", 54, 2, 6,
+            len(payload), digest, "BF16", (3, 1),
+        ),
+    )
+    manifest = NGramManifest(
+        source_repo="Vontra/example",
+        source_revision="a" * 40,
+        storage="affine-q4-g32",
+        row_width=32,
+        row_bytes=20,
+        padded_rows=3,
+        shards=(
+            segmented_ngram_shard(
+                name="ngram-shard-000",
+                tensor="ngram",
+                start_row=0,
+                row_count=3,
+                components=components,
+            ),
+        ),
+    ).with_digest()
+    artifact = verify_ngram_manifest(tmp_path, manifest)
+    cache = NGramRowCache(
+        artifact,
+        NGramCacheConfig(
+            cache_limit_bytes=40,
+            transient_limit_bytes=60,
+            max_inflight_io_bytes=60,
+            max_open_files=2,
+            bypass_page_cache=False,
+            eviction="lru",
+        ),
+        allocator=bytearray,
+    )
+    try:
+        lease = cache.acquire_rows((2, 0))
+        assert lease.row_bytes(0) == b"C" * 16 + b"s2b2"
+        assert lease.row_bytes(1) == b"A" * 16 + b"s0b0"
+        lease.release()
+    finally:
+        cache.close()
+        artifact.close()
 
 
 def test_adjacent_rows_coalesce_only_within_one_shard(tmp_path: Path) -> None:

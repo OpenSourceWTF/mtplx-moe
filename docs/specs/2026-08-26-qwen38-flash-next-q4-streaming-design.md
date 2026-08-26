@@ -127,10 +127,10 @@ parity evidence for this checkpoint.
 
 ### Routed-expert storage
 
-The repacker reads one pinned oQ4-MTP shard at a time. The published checkpoint
-already stores gate, up, and down leaves in MLX affine form under
-`switch_mlp`. It slices whole expert records without dequantizing or
-requantizing them and writes record-major expert sidecars:
+The published checkpoint already stores gate, up, and down leaves in MLX
+affine form under `switch_mlp`. The expert manifest addresses the nine exact
+source tensor slices for each expert directly; no expert payload is repacked,
+dequantized, or requantized:
 
 ```text
 record(layer, expert):
@@ -145,7 +145,7 @@ these 49 sparse blocks to the binder without adding the MTP block to the
 target model's 48-layer forward loop.
 
 `expert-manifest.json` records exact shapes, offsets, lengths, source tensor
-names, per-record hashes, source revision, and whole-bank hashes. Resident
+names, per-record hashes, source revision, and source-shard hashes. Resident
 tensors retain their published mixed-precision representation. Existing expert-streaming
 memory planning, slot generations, I/O admission, pinning, deferred release,
 and component execution are reused only after a Qwen4-specific construction
@@ -159,8 +159,11 @@ generation.
 ### Fixed-budget n-gram cache
 
 N-gram storage and cache ownership are separate from routed-expert storage.
-The complete 29.80 GiB published affine-Q4/group-32 table remains immutable on SSD and is never mapped
-or copied into unified memory as a whole. Only exact rows required by active
+The complete 29.80 GiB published affine-Q4/group-32 table remains immutable on
+SSD and is never mapped or copied into unified memory as a whole. Each logical
+row stays in its three published safetensors components: 80 packed-weight
+bytes, 10 BF16 scale bytes, and 10 BF16 bias bytes. Cache fill gathers those
+exact slices into the fixed slot without writing a transformed artifact. Only exact rows required by active
 tokens occupy the fixed cache. Its ownership resembles a second KV cache, but
 unlike KV state its values are static, addressable from token history, and
 safely reloadable after eviction; it does not grow monotonically with context.
@@ -361,11 +364,11 @@ enabled on the real model until fixed-depth cache and logit gates pass.
 
 ### Critical: artifact peak disk or memory exceeds the machine
 
-Repacking is shard-streamed and writes directly into final banks. Before
-download, preflight reserves source, output, temporary, and safety bytes. If
-space is still insufficient, only the verified re-downloadable 91 GiB Hy3
-artifact may be removed under the user's authorization; unique receipts and
-generated banks are never deleted.
+The unchanged pinned oQ4-MTP checkpoint is the shipping payload; MTPLX adds
+small manifests and receipts only. Before download, preflight reserves source
+and safety bytes. If space is still insufficient, only user-authorized,
+verified re-downloadable artifacts may be removed; unique receipts are never
+deleted.
 
 ### Minor: first PR is text-only
 
@@ -377,9 +380,9 @@ up; the model card and CLI must state the limitation plainly.
 ## Rollout
 
 1. Land tiny-model arithmetic and cache tests.
-2. Land byte-preserving repacker and real-header manifest tests.
-3. Produce sampled repacking receipts.
-4. Repack the pinned oQ4-MTP artifact.
+2. Land source-native expert/ngram manifest and real-header tests.
+3. Produce sampled direct-read identity receipts.
+4. Download the unchanged pinned oQ4-MTP artifact.
 5. Verify AR, then fixed-depth MTP, then measured oQ4 n-gram streaming.
 6. Run matched quality/performance gates under exclusive GPU ownership.
 7. Final review, push, and open the code PR.
