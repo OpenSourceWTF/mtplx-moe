@@ -14951,17 +14951,16 @@ def cmd_config_public(args: Any) -> int:
         raise SystemExit("thermal_control must be auto or none")
     if key == "paged_kv_quantization":
         value = normalize_paged_kv_quantization(value)
-    if key == "scheduler_mode" and value not in {
-        "serial",
-        "cooperative",
-        "ar_batch",
-        "mtp_batch",
-        "mtp_cohort_experimental",
-    }:
-        raise SystemExit(
-            "scheduler_mode must be serial, cooperative, ar_batch, mtp_batch, "
-            "or mtp_cohort_experimental"
-        )
+    if key == "scheduler_mode":
+        # Single source of truth: the SchedulerMode enum (also feeds the CLI
+        # choices), so `mtplx config set` can never trail a new server mode.
+        from mtplx.batching.state import SchedulerMode
+
+        valid_modes = tuple(mode.value for mode in SchedulerMode)
+        if value not in valid_modes:
+            raise SystemExit(
+                "scheduler_mode must be one of: " + ", ".join(valid_modes)
+            )
     if key == "batching_preset" and value not in {
         "solo",
         "latency",

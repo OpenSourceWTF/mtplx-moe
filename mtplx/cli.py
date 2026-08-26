@@ -10,6 +10,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from .batching.state import SchedulerMode
 from .constants import DEFAULT_RUNTIME_MODEL_DIR
 from .fan_mode import FAN_MODE_CHOICES
 from .mtp_batch_numerics import MTP_BATCH_NUMERICS_CHOICES
@@ -660,13 +661,9 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-SCHEDULER_MODE_CHOICES = (
-    "serial",
-    "cooperative",
-    "ar_batch",
-    "mtp_batch",
-    "mtp_cohort_experimental",
-)
+# Single source of truth is the SchedulerMode enum (mtplx.batching.state is
+# MLX/FastAPI-free, so the CLI can import it without dragging in the server).
+SCHEDULER_MODE_CHOICES = tuple(mode.value for mode in SchedulerMode)
 BATCHING_PRESET_CHOICES = ("solo", "latency", "agent", "throughput")
 ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value", "cost")
 
@@ -682,7 +679,10 @@ def _add_batching_args(parser: argparse.ArgumentParser) -> None:
             "the batched-AR lane end to end on prefill-heavy concurrent "
             "loads because MTP decode is ~4x faster per stream); ar_batch "
             "opts concurrent requests into the batched AR decode lane, "
-            "which wins on decode-heavy many-client loads."
+            "which wins on decode-heavy many-client loads. hyper serves ONE "
+            "request at a time (extra requests queue FIFO like serial) and "
+            "reserves batch width for self-speculative rows of that request; "
+            "at width 1 it rides the exact serial path."
         ),
     )
     parser.add_argument(

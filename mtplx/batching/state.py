@@ -23,6 +23,12 @@ class SchedulerMode(StrEnum):
     AR_BATCH = "ar_batch"
     MTP_BATCH = "mtp_batch"
     MTP_COHORT_EXPERIMENTAL = "mtp_cohort_experimental"
+    # Hyper: batch machinery spent on ONE request (external admission = 1,
+    # simultaneous requests queue FIFO exactly like serial). Width, when it
+    # exists (H1/H2), is self-generated speculative rows for that request —
+    # never a second client. Stage H0 is the singleton chassis: width 1 rides
+    # the untouched serial B1 path. See mtplx/server/hyper.py.
+    HYPER = "hyper"
 
 
 class SchedulerPreset(StrEnum):
