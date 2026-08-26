@@ -883,6 +883,9 @@ def _sustained_prefill_layout() -> str:
     return "contiguous_then_repage"
 
 
+_DENSE_AUTO_ANNOUNCED = False
+
+
 def _dense_decode_max_context() -> int:
     """Context ceiling for the contiguous-dense-decode layout (tokens).
 
@@ -916,7 +919,26 @@ def _dense_decode_max_context() -> int:
         window = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
         if window > 0:
             budget_tokens = min(budget_tokens, window)
-        return max(131072, budget_tokens)
+        resolved = max(131072, budget_tokens)
+        # Announce once: a new model that forgot to ship its
+        # MTPLX_DENSE_KV_BYTES_PER_TOKEN gets its budget computed on the
+        # 65536 Qwen3.8 default — this line is how a wrong-geometry day-0
+        # shows itself in the serve log instead of as a silent OOM or a
+        # silently conservative ceiling.
+        global _DENSE_AUTO_ANNOUNCED
+        if not _DENSE_AUTO_ANNOUNCED:
+            _DENSE_AUTO_ANNOUNCED = True
+            try:
+                print(
+                    "[mtplx] dense-decode ceiling auto: "
+                    f"{resolved} tokens ({ram_fraction}% RAM over "
+                    f"{bytes_per_token} B/token"
+                    f"{'' if os.environ.get('MTPLX_DENSE_KV_BYTES_PER_TOKEN') else ' — MODEL DEFAULT, set MTPLX_DENSE_KV_BYTES_PER_TOKEN for non-Qwen3.8 geometry'})",
+                    flush=True,
+                )
+            except Exception:
+                pass
+        return resolved
     if raw:
         try:
             return int(raw)
