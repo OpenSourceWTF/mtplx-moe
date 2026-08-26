@@ -49,6 +49,7 @@ from .cache_state import (
     tail_owned_attention_kv_stats,
     trim_verified_window_to_prefix,
 )
+from .forkev_telemetry import ForkEVRecorder
 from .fast_sampling import (
     MAX_DEVICE_TOP_K_ORDER,
     BatchedSparseDistributions,
@@ -2043,6 +2044,9 @@ class GenerationStats:
     repetition_stop_raw_tokens: int = 0
     loop_guard: dict[str, object] = field(default_factory=dict)
     thinking_guard: dict[str, object] = field(default_factory=dict)
+    # Fork-EV shadow telemetry aggregate (MTPLX_FORKEV_TELEMETRY); empty dict
+    # when the instrument is off. Schema: mtplx/forkev_telemetry.py snapshot().
+    forkev: dict[str, object] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -7543,6 +7547,12 @@ def generate_mtpk(
     _draft_conf_needed = (
         _draft_conf_trace or _draft_conf_width_threshold is not None
     )
+    # Fork-EV shadow telemetry (MTPLX_FORKEV_TELEMETRY, default off): H2 gate
+    # pricing for margin-triggered B2 forks WITHOUT building the tree. None
+    # when disabled — the hot path then carries a single `is not None` check
+    # per round. Observe-only: reads host-side sparse draft distributions the
+    # lane already materialized; never samples, never mutates trajectory.
+    _forkev = ForkEVRecorder.from_env()
     draft_confidence_width_stops = 0
     draft_confidence_sum_by_depth = [0.0 for _ in range(speculative_depth)]
     draft_confidence_count_by_depth = [0 for _ in range(speculative_depth)]
@@ -10472,6 +10482,29 @@ def generate_mtpk(
             )
 
         event["accepted_depths"] = accepted_count
+        if _forkev is not None:
+            # Fork-EV shadow round observation (see mtplx/forkev_telemetry.py
+            # for the full accounting contract). Runs once per verify round
+            # after the accept outcome is final (post grammar clamp); reads
+            # only host-side arrays. Failures count, never raise or reroute.
+            try:
+                _fk_rejected = event.get("rejected_at_depth")
+                _fk_index = int(_fk_rejected) - 1 if _fk_rejected else None
+                _fk_drafts = event.get("drafts") or []
+                _forkev.observe_round(
+                    draft_probs=draft_probs,
+                    attempted=len(draft_tokens),
+                    accepted=accepted_count,
+                    rejection_index=_fk_index,
+                    correction=int(correction) if _fk_index is not None else None,
+                    clamped=bool(
+                        _fk_index is not None
+                        and _fk_index < len(_fk_drafts)
+                        and _fk_drafts[_fk_index].get("constraint_clamped")
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — telemetry never breaks decode
+                _forkev.errors += 1
         if adaptive_policy is not None:
             _policy_now = time.perf_counter()
             _policy_kwargs: dict[str, float] = {}
@@ -11165,8 +11198,20 @@ def generate_mtpk(
             mtp_history_position_base=int(prompt_state.mtp_history_position_base),
         )
     reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
+    _forkev_snapshot: dict[str, object] = {}
+    if _forkev is not None:
+        # Close the fork-EV shadow ledger: a hit still awaiting its next-round
+        # resolution resolves to saved=0 (stream ended; conservative), then
+        # emit the greppable one-liner Δ-telemetry-style for serve-log reads.
+        try:
+            _forkev.finalize()
+            _forkev_snapshot = _forkev.snapshot()
+            print(_forkev.stderr_summary(), file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001 — telemetry never breaks decode
+            _forkev_snapshot = {"enabled": True, "errors": _forkev.errors + 1}
     stats = GenerationStats(
         mode="mtpk",
+        forkev=_forkev_snapshot,
         constraint_active=constraint is not None,
         constraint_completed=(
             constraint.completed if constraint is not None else None

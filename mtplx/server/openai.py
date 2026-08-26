@@ -13853,6 +13853,13 @@ def _metrics_envelope(
         "mean_accept_probability_by_depth": (
             stats.get("mean_accept_probability_by_depth") or []
         ),
+        # Fork-EV shadow telemetry (MTPLX_FORKEV_TELEMETRY): present only when
+        # the instrument ran, so request-log rows stay byte-identical when off.
+        **(
+            {"forkev": stats["forkev"]}
+            if isinstance(stats.get("forkev"), dict) and stats.get("forkev")
+            else {}
+        ),
         "correction_tokens": int(stats.get("correction_tokens") or 0),
         "bonus_tokens": int(stats.get("bonus_tokens") or 0),
         "verify_time_s": float(stats.get("verify_time_s") or 0.0),
