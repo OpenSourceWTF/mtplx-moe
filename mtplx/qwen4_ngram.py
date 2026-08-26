@@ -2026,10 +2026,13 @@ class NGramRowCache:
                     _restore_page_cache_policy(
                         installed_routes, page_cache_installed
                     )
-            except NGramCacheIOError as cleanup_error:
+            except BaseException as cleanup_error:
                 cleanup_safe = False
                 with artifact._lock:
-                    artifact._cache_reuse_error = str(cleanup_error)[:512]
+                    artifact._cache_reuse_error = (
+                        f"{type(cleanup_error).__name__}: "
+                        f"{str(cleanup_error)[:448]}"
+                    )
                 raise
             finally:
                 with artifact._lock:

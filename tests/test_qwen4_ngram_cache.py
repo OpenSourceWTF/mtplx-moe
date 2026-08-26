@@ -1167,6 +1167,57 @@ def test_page_cache_policy_rolls_back_when_later_allocation_fails(
         fixture.artifact.close()
 
 
+def test_fatal_constructor_restore_poisons_reuse_and_releases_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = fixture_cache(tmp_path)
+    fixture.cache.close()
+    assert qwen4_ngram.fcntl is not None
+    monkeypatch.setattr(qwen4_ngram.fcntl, "F_NOCACHE", 48, raising=False)
+    descriptors = [shard.fileno() for shard in fixture.artifact.shards]
+    calls: list[tuple[int, int]] = []
+
+    def fatal_restore(descriptor: int, _command: int, value: int) -> None:
+        calls.append((descriptor, value))
+        if descriptor == descriptors[0] and value == 0:
+            raise KeyboardInterrupt("fatal constructor restore")
+
+    monkeypatch.setattr(qwen4_ngram.fcntl, "fcntl", fatal_restore)
+    config = NGramCacheConfig(
+        cache_limit_bytes=ROW_BYTES,
+        transient_limit_bytes=ROW_BYTES,
+        max_inflight_io_bytes=ROW_BYTES,
+        max_open_files=3,
+        bypass_page_cache=True,
+        eviction="lru",
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt, match="fatal constructor restore"):
+            NGramRowCache(
+                fixture.artifact,
+                config,
+                reader=RecordingReader(),
+                allocator=lambda _size: (_ for _ in ()).throw(
+                    MemoryError("synthetic allocation")
+                ),
+            )
+        assert calls == [(descriptor, 1) for descriptor in descriptors] + [
+            (descriptor, 0) for descriptor in descriptors
+        ]
+        assert fixture.artifact._cache_owner is None
+        assert fixture.artifact._cache_reuse_error is not None
+        with pytest.raises(NGramCacheIOError, match="poisoned for cache reuse"):
+            NGramRowCache(
+                fixture.artifact,
+                replace(config, bypass_page_cache=False),
+                reader=RecordingReader(),
+                allocator=bytearray,
+            )
+    finally:
+        fixture.artifact.close()
+    assert all(shard.closed for shard in fixture.artifact.shards)
+
+
 def test_restore_failure_is_persistent_but_artifact_can_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
