@@ -2984,6 +2984,23 @@ class TensorOffsetVllmMetalPagedKVCache:
             return None
         if int(queries.shape[0]) != 1:
             return None
+        if (
+            _env_truthy("MTPLX_PAGED_TAILMASK_ELIDE")
+            and isinstance(mask, mx.array)
+            and mask.dtype == mx.bool_
+            and int(mask.shape[-2]) == int(queries.shape[2])
+            and int(mask.shape[-1]) == int(self.capacity)
+        ):
+            # The capacity-wide tail-causal bool mask this class's make_mask
+            # emits (row j sees keys <= offset+j) is exactly the dynamic-
+            # offset kernel's built-in visibility — the same equivalence the
+            # packed route documents for the identical mask object. The
+            # kernel refuses array masks outright (its mask gate is the
+            # 147.4k decline, receipts 2026-08-26 12:58), so elide it.
+            # Equivalence is pinned numerically by
+            # tests/test_paged_tailmask_elide.py; opt-in until a serve
+            # trajectory-sha gate runs on a bench window.
+            mask = None
         static_max_offset = self._static_attention_max_offset()
         started = time.perf_counter()
         from .kernels.sdpa_2pass_paged import sdpa_2pass_paged_tail_dynamic_offset
