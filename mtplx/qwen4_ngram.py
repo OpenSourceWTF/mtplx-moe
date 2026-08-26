@@ -20,15 +20,23 @@ from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import numpy as np
 
 QWEN38_FLASH_NEXT_REPO = "Qwen/Qwen3.8-Flash-Next"
 QWEN38_FLASH_NEXT_REVISION = "f5d08274bafd880402bd16f5e3e6c514136ec06c"
 NGRAM_MANIFEST_FORMAT = "mtplx-qwen4-ngram-manifest-v1"
-MAX_MANIFEST_BYTES = 16 * 1024 * 1024
-MAX_MANIFEST_SHARDS = 4_096
+# The production artifact has exactly 128 n-gram shards.  At under 8 KiB of
+# metadata per shard, 1 MiB leaves generous headroom without accepting an
+# unbounded document at this trust boundary.
+MAX_MANIFEST_BYTES = 1 * 1024 * 1024
+MAX_MANIFEST_SHARDS = 128
+MAX_JSON_DEPTH = 32
+MAX_JSON_NODES = 4_096
+MAX_JSON_COLLECTION_ITEMS = 256
+MAX_JSON_STRING_CHARS = 4_096
+MAX_JSON_INTEGER_DIGITS = 20
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -52,10 +60,20 @@ def _exact_int(value: Any, *, label: str, minimum: int = 0) -> int:
     return value
 
 
+def _valid_unicode(value: str, *, label: str) -> str:
+    if len(value) > MAX_JSON_STRING_CHARS:
+        raise NGramManifestError(
+            f"{label} exceeds the {MAX_JSON_STRING_CHARS}-character limit"
+        )
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise NGramManifestError(f"{label} contains an invalid Unicode scalar")
+    return value
+
+
 def _exact_string(value: Any, *, label: str) -> str:
     if type(value) is not str or not value:
         raise NGramManifestError(f"{label} must be a non-empty exact string")
-    return value
+    return _valid_unicode(value, label=label)
 
 
 def _sha256(value: Any, *, label: str) -> str:
@@ -106,15 +124,21 @@ def _nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
-def _token_matrix(tokens: Any, *, label: str) -> np.ndarray:
+def _token_matrix(tokens: Any, *, label: str, vocab_size: int) -> np.ndarray:
     if isinstance(tokens, np.ndarray):
         if tokens.ndim != 2:
             raise ValueError(f"{label} must have shape [batch, sequence]")
-        if tokens.dtype.kind not in "iu" or tokens.dtype.kind == "b":
-            raise TypeError(f"{label} must contain exact integers")
         if tokens.shape[0] == 0:
             raise ValueError(f"{label} must contain at least one batch row")
-        return tokens.astype(np.int64, copy=False)
+        if tokens.dtype.kind in "iu":
+            if tokens.size and (
+                bool(np.any(tokens < 0)) or bool(np.any(tokens >= vocab_size))
+            ):
+                raise ValueError(f"{label} token is outside the vocabulary range")
+            return tokens.astype(np.int64, copy=False)
+        if tokens.dtype.kind != "O":
+            raise TypeError(f"{label} must contain exact integers")
+        tokens = tokens.tolist()
     if not isinstance(tokens, (list, tuple)) or not tokens:
         raise TypeError(f"{label} must be a non-empty rectangular sequence")
     width: int | None = None
@@ -130,9 +154,14 @@ def _token_matrix(tokens: Any, *, label: str) -> np.ndarray:
         for token in row:
             if type(token) is not int:
                 raise TypeError(f"{label} must contain exact integers")
+            if not 0 <= token < vocab_size:
+                raise ValueError(f"{label} token is outside the vocabulary range")
             parsed.append(token)
         rows.append(parsed)
-    return np.asarray(rows, dtype=np.int64)
+    try:
+        return np.asarray(rows, dtype=np.int64)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{label} token is outside the vocabulary range") from exc
 
 
 @dataclass(frozen=True)
@@ -228,22 +257,16 @@ class NGramGeometry:
             context = tuple(
                 (self.eos_token_id, self.eos_token_id) for _ in range(batch_size)
             )
+            array = np.asarray(context, dtype=np.int64)
         else:
-            if not isinstance(prior_context, (list, tuple)):
-                raise TypeError("prior_context must have shape [batch, 2]")
-            context_rows: list[tuple[int, int]] = []
-            for row in prior_context:
-                if not isinstance(row, (list, tuple)) or len(row) != 2:
-                    raise ValueError("prior_context must have shape [batch, 2]")
-                if any(type(token) is not int for token in row):
-                    raise TypeError("prior_context must contain exact integers")
-                context_rows.append((row[0], row[1]))
-            context = tuple(context_rows)
-        if len(context) != batch_size:
+            array = _token_matrix(
+                prior_context, label="prior_context", vocab_size=self.vocab_size
+            )
+            if array.shape[1] != 2:
+                raise ValueError("prior_context must have shape [batch, 2]")
+            context = tuple(tuple(int(token) for token in row) for row in array)
+        if array.shape[0] != batch_size:
             raise ValueError("prior_context batch does not match new tokens")
-        array = np.asarray(context, dtype=np.int64)
-        if np.any(array < 0) or np.any(array >= self.vocab_size):
-            raise ValueError("prior_context token is outside the unigram vocabulary")
         return array, context
 
     def row_ids(self, token_ids: Any) -> np.ndarray:
@@ -259,9 +282,9 @@ class NGramGeometry:
     ) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
         """Plan only new rows and return the next raw two-token context."""
 
-        tokens = _token_matrix(new_token_ids, label="new_token_ids")
-        if np.any(tokens < 0) or np.any(tokens >= self.vocab_size):
-            raise ValueError("token is outside the unigram vocabulary")
+        tokens = _token_matrix(
+            new_token_ids, label="new_token_ids", vocab_size=self.vocab_size
+        )
         batch_size, token_count = tokens.shape
         context, old_context = self._context_matrix(
             prior_context, batch_size=batch_size
@@ -327,10 +350,122 @@ def _safe_component(name: Any, *, label: str) -> str:
     return value
 
 
+def _scan_json_bounds(text: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    string_chars = 0
+    structural_nodes = 1
+    collection_items: list[int] = []
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            else:
+                string_chars += 1
+                if string_chars > MAX_JSON_STRING_CHARS:
+                    raise NGramManifestError(
+                        "manifest JSON string exceeds the character limit"
+                    )
+            continue
+        if character == '"':
+            in_string = True
+            string_chars = 0
+        elif character in "[{":
+            depth += 1
+            structural_nodes += 1
+            collection_items.append(1)
+            if depth > MAX_JSON_DEPTH:
+                raise NGramManifestError(
+                    f"manifest JSON exceeds the depth limit {MAX_JSON_DEPTH}"
+                )
+        elif character in "]}":
+            depth -= 1
+            if collection_items:
+                collection_items.pop()
+        elif character == ",":
+            structural_nodes += 1
+            if collection_items:
+                collection_items[-1] += 1
+                if collection_items[-1] > MAX_JSON_COLLECTION_ITEMS:
+                    raise NGramManifestError(
+                        "manifest JSON collection exceeds the item limit"
+                    )
+        if structural_nodes > MAX_JSON_NODES:
+            raise NGramManifestError(
+                f"manifest JSON exceeds the {MAX_JSON_NODES}-node limit"
+            )
+
+
+def _bounded_json_int(value: str) -> int:
+    digits = value.removeprefix("-")
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise NGramManifestError(
+            f"manifest integer exceeds the {MAX_JSON_INTEGER_DIGITS}-digit limit"
+        )
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise NGramManifestError("manifest contains an invalid integer") from exc
+
+
+def _reject_json_constant(value: str) -> None:
+    raise NGramManifestError(f"manifest contains invalid constant {value!r}")
+
+
+def _validate_json_tree(value: Any) -> None:
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES:
+            raise NGramManifestError(
+                f"manifest JSON exceeds the {MAX_JSON_NODES}-node limit"
+            )
+        if depth > MAX_JSON_DEPTH:
+            raise NGramManifestError(
+                f"manifest JSON exceeds the depth limit {MAX_JSON_DEPTH}"
+            )
+        if type(current) is dict:
+            if len(current) > MAX_JSON_COLLECTION_ITEMS:
+                raise NGramManifestError("manifest JSON object exceeds the item limit")
+            for key, item in current.items():
+                if type(key) is not str:
+                    raise NGramManifestError("manifest JSON object key must be a string")
+                _valid_unicode(key, label="manifest JSON key")
+                stack.append((item, depth + 1))
+        elif type(current) in {list, tuple}:
+            if len(current) > MAX_JSON_COLLECTION_ITEMS:
+                raise NGramManifestError("manifest JSON array exceeds the item limit")
+            stack.extend((item, depth + 1) for item in current)
+        elif type(current) is str:
+            _valid_unicode(current, label="manifest JSON string")
+        elif current is None or type(current) in {bool, int, float}:
+            continue
+        else:
+            raise NGramManifestError(
+                f"manifest JSON contains unsupported type {type(current).__name__}"
+            )
+
+
 def _canonical_json(value: Any) -> bytes:
-    return json.dumps(
-        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
+    _validate_json_tree(value)
+    try:
+        payload = json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+        raise NGramManifestError(f"could not canonicalize manifest JSON: {exc}") from exc
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise NGramManifestError(
+            f"manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -619,10 +754,18 @@ def load_ngram_manifest(
 ) -> NGramManifest:
     payload = _read_manifest(Path(path))
     try:
-        value = json.loads(payload, object_pairs_hook=_strict_pairs)
+        text = payload.decode("utf-8")
+        _scan_json_bounds(text)
+        value = json.loads(
+            text,
+            object_pairs_hook=_strict_pairs,
+            parse_int=_bounded_json_int,
+            parse_constant=_reject_json_constant,
+        )
+        _validate_json_tree(value)
     except NGramManifestError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (RecursionError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise NGramManifestError(f"invalid manifest JSON: {exc}") from exc
     return NGramManifest.from_dict(value, verify_digest=verify_digest)
 
@@ -633,14 +776,26 @@ def save_ngram_manifest(manifest: NGramManifest, path: Path | str) -> NGramManif
     finalized = manifest.with_digest()
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(finalized.to_dict(), indent=2, sort_keys=True) + "\n"
+    try:
+        payload = (
+            json.dumps(
+                finalized.to_dict(), ensure_ascii=False, indent=2, sort_keys=True
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+        raise NGramManifestError(f"could not encode manifest JSON: {exc}") from exc
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise NGramManifestError(
+            f"manifest exceeds the {MAX_MANIFEST_BYTES}-byte limit"
+        )
     temporary: Path | None = None
     try:
         descriptor, name = tempfile.mkstemp(
             prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
         )
         temporary = Path(name)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -671,65 +826,330 @@ def qwen38_ngram_manifest(
     return manifest.with_digest()
 
 
-def verify_ngram_manifest(root: Path | str, manifest: NGramManifest) -> dict[str, int]:
-    """Verify manifest digest and every exact shard payload without symlinks."""
+@dataclass(frozen=True)
+class NGramFileIdentity:
+    """Stable identity captured from a verified open shard descriptor."""
+
+    device: int
+    inode: int
+    size: int
+
+
+class VerifiedNGramShard:
+    """One verified immutable shard whose descriptor remains authoritative."""
+
+    __slots__ = ("_fd", "identity", "shard")
+
+    def __init__(
+        self, shard: NGramShard, descriptor: int, identity: NGramFileIdentity
+    ) -> None:
+        self.shard = shard
+        self.identity = identity
+        self._fd = descriptor
+
+    @property
+    def closed(self) -> bool:
+        return self._fd < 0
+
+    def fileno(self) -> int:
+        if self.closed:
+            raise NGramManifestError(f"verified shard {self.shard.name} is closed")
+        return self._fd
+
+    def pread(self, offset: int, length: int) -> bytes:
+        """Read an exact descriptor-relative byte range from the retained file."""
+
+        _exact_int(offset, label="pread offset")
+        _exact_int(length, label="pread length")
+        if offset + length > self.identity.size:
+            raise NGramManifestError("pread range exceeds the verified shard size")
+        descriptor = self.fileno()
+        chunks: list[bytes] = []
+        remaining = length
+        cursor = offset
+        try:
+            while remaining:
+                chunk = os.pread(descriptor, remaining, cursor)
+                if not chunk:
+                    raise NGramManifestError(
+                        f"short descriptor read from shard {self.shard.name}"
+                    )
+                chunks.append(chunk)
+                remaining -= len(chunk)
+                cursor += len(chunk)
+        except NGramManifestError:
+            raise
+        except OSError as exc:
+            raise NGramManifestError(
+                f"could not read verified shard {self.shard.name}: {exc}"
+            ) from exc
+        return b"".join(chunks)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        descriptor = self._fd
+        self._fd = -1
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            raise NGramManifestError(
+                f"could not close verified shard {self.shard.name}: {exc}"
+            ) from exc
+
+
+class VerifiedNGramArtifact:
+    """Retained directory and shard descriptors for one verified artifact."""
+
+    __slots__ = ("_root_fd", "manifest", "report", "shards")
+
+    def __init__(
+        self,
+        manifest: NGramManifest,
+        root_descriptor: int,
+        shards: tuple[VerifiedNGramShard, ...],
+    ) -> None:
+        self.manifest = manifest
+        self._root_fd = root_descriptor
+        self.shards = shards
+        self.report = {
+            "shards": len(shards),
+            "rows": manifest.padded_rows,
+            "bytes": sum(shard.shard.data_bytes for shard in shards),
+        }
+
+    @property
+    def closed(self) -> bool:
+        return self._root_fd < 0
+
+    def root_fileno(self) -> int:
+        if self.closed:
+            raise NGramManifestError("verified n-gram artifact is closed")
+        return self._root_fd
+
+    def pread(self, shard_index: int, offset: int, length: int) -> bytes:
+        _exact_int(shard_index, label="shard index")
+        if shard_index >= len(self.shards):
+            raise NGramManifestError("shard index is out of range")
+        return self.shards[shard_index].pread(offset, length)
+
+    def read_row(self, row: int) -> bytes:
+        shard, offset = self.manifest.locate_row(row)
+        for verified in self.shards:
+            if verified.shard is shard or verified.shard.name == shard.name:
+                return verified.pread(offset, self.manifest.row_bytes)
+        raise NGramManifestError(f"verified artifact has no shard for row {row}")
+
+    def close(self) -> None:
+        first_error: NGramManifestError | None = None
+        for shard in self.shards:
+            try:
+                shard.close()
+            except NGramManifestError as exc:
+                if first_error is None:
+                    first_error = exc
+        if not self.closed:
+            descriptor = self._root_fd
+            self._root_fd = -1
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = NGramManifestError(
+                        f"could not close verified artifact directory: {exc}"
+                    )
+        if first_error is not None:
+            raise first_error
+
+    def __enter__(self) -> Self:
+        if self.closed:
+            raise NGramManifestError("verified n-gram artifact is closed")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+def _directory_flags() -> int:
+    return _readonly_flags() | getattr(os, "O_DIRECTORY", 0)
+
+
+def _open_root_nofollow(root: Path | str) -> int:
+    try:
+        raw_root = os.fspath(root)
+    except TypeError as exc:
+        raise NGramManifestError(f"invalid artifact root: {exc}") from exc
+    if type(raw_root) is not str or "\x00" in raw_root:
+        raise NGramManifestError("artifact root must be a valid filesystem string")
+    try:
+        absolute = os.path.abspath(raw_root)
+    except OSError as exc:
+        raise NGramManifestError(f"could not normalize artifact root: {exc}") from exc
+    components = [component for component in absolute.split(os.sep) if component]
+    opened: list[int] = []
+    try:
+        current = os.open(os.sep, _directory_flags())
+        opened.append(current)
+        for component in components:
+            current = os.open(
+                component,
+                _directory_flags(),
+                dir_fd=current,
+            )
+            opened.append(current)
+        metadata = os.fstat(current)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NGramManifestError("artifact root is not a directory")
+        for index in range(len(opened) - 1):
+            os.close(opened[index])
+            opened[index] = -1
+        result = opened[-1]
+        opened[-1] = -1
+        return result
+    except NGramManifestError:
+        raise
+    except OSError as exc:
+        raise NGramManifestError(f"could not open artifact root {root}: {exc}") from exc
+    finally:
+        for descriptor in opened:
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _hash_descriptor_payload(descriptor: int, shard: NGramShard) -> str:
+    digest = hashlib.sha256()
+    remaining = shard.data_bytes
+    offset = shard.data_offset
+    try:
+        while remaining:
+            chunk = os.pread(descriptor, min(8 * 1024 * 1024, remaining), offset)
+            if not chunk:
+                raise NGramManifestError(f"short payload in shard {shard.name}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+            offset += len(chunk)
+    except NGramManifestError:
+        raise
+    except OSError as exc:
+        raise NGramManifestError(
+            f"could not hash shard {shard.name}: {exc}"
+        ) from exc
+    return digest.hexdigest()
+
+
+def verify_ngram_manifest(
+    root: Path | str, manifest: NGramManifest
+) -> VerifiedNGramArtifact:
+    """Verify and retain immutable, descriptor-anchored shard ownership."""
 
     if type(manifest) is not NGramManifest:
         raise TypeError("manifest must be an exact NGramManifest")
     manifest.validate_structure()
     if manifest.digest is None or manifest.digest != manifest.with_digest().digest:
         raise NGramManifestError("manifest digest mismatch")
-    artifact_root = Path(root).resolve(strict=True)
-    checked_bytes = 0
-    for shard in manifest.shards:
-        path = artifact_root / _safe_component(shard.name, label="shard name")
-        fd: int | None = None
-        try:
-            fd = os.open(path, _readonly_flags())
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise NGramManifestError(f"shard is not a regular file: {shard.name}")
-            if metadata.st_size != shard.file_size:
-                raise NGramManifestError(
-                    f"shard size mismatch for {shard.name}: "
-                    f"expected {shard.file_size}, got {metadata.st_size}"
+    root_descriptor: int | None = None
+    retained: list[VerifiedNGramShard] = []
+    try:
+        root_descriptor = _open_root_nofollow(root)
+        for shard in manifest.shards:
+            name = _safe_component(shard.name, label="shard name")
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    name, _readonly_flags(), dir_fd=root_descriptor
                 )
-            digest = hashlib.sha256()
-            remaining = shard.data_bytes
-            offset = shard.data_offset
-            while remaining:
-                chunk = os.pread(fd, min(8 * 1024 * 1024, remaining), offset)
-                if not chunk:
-                    raise NGramManifestError(f"short payload in shard {shard.name}")
-                digest.update(chunk)
-                remaining -= len(chunk)
-                offset += len(chunk)
-            if digest.hexdigest() != shard.sha256:
-                raise NGramManifestError(f"payload digest mismatch for {shard.name}")
-        except NGramManifestError:
-            raise
-        except OSError as exc:
-            raise NGramManifestError(
-                f"could not verify shard {shard.name}: {exc}"
-            ) from exc
-        finally:
-            if fd is not None:
-                os.close(fd)
-        checked_bytes += shard.data_bytes
-    return {
-        "shards": len(manifest.shards),
-        "rows": manifest.padded_rows,
-        "bytes": checked_bytes,
-    }
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise NGramManifestError(
+                        f"shard is not a regular file: {shard.name}"
+                    )
+                if metadata.st_nlink != 1:
+                    raise NGramManifestError(
+                        f"shard {shard.name} must have exactly one hard link"
+                    )
+                if metadata.st_size != shard.file_size:
+                    raise NGramManifestError(
+                        f"shard size mismatch for {shard.name}: "
+                        f"expected {shard.file_size}, got {metadata.st_size}"
+                    )
+                payload_digest = _hash_descriptor_payload(descriptor, shard)
+                verified_metadata = os.fstat(descriptor)
+                if (
+                    verified_metadata.st_dev != metadata.st_dev
+                    or verified_metadata.st_ino != metadata.st_ino
+                    or verified_metadata.st_size != metadata.st_size
+                    or verified_metadata.st_nlink != 1
+                ):
+                    raise NGramManifestError(
+                        f"shard identity changed during verification: {shard.name}"
+                    )
+                if payload_digest != shard.sha256:
+                    raise NGramManifestError(
+                        f"payload digest mismatch for {shard.name}"
+                    )
+                retained.append(
+                    VerifiedNGramShard(
+                        shard,
+                        descriptor,
+                        NGramFileIdentity(
+                            device=verified_metadata.st_dev,
+                            inode=verified_metadata.st_ino,
+                            size=verified_metadata.st_size,
+                        ),
+                    )
+                )
+                descriptor = None
+            finally:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError as exc:
+                        raise NGramManifestError(
+                            f"could not close shard {shard.name}: {exc}"
+                        ) from exc
+        artifact = VerifiedNGramArtifact(
+            manifest, root_descriptor, tuple(retained)
+        )
+        root_descriptor = None
+        retained = []
+        return artifact
+    except NGramManifestError:
+        raise
+    except OSError as exc:
+        raise NGramManifestError(f"could not verify n-gram artifact: {exc}") from exc
+    finally:
+        cleanup_error: NGramManifestError | None = None
+        for verified in retained:
+            try:
+                verified.close()
+            except NGramManifestError as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if root_descriptor is not None:
+            try:
+                os.close(root_descriptor)
+            except OSError as exc:
+                if cleanup_error is None:
+                    cleanup_error = NGramManifestError(
+                        f"could not close artifact root: {exc}"
+                    )
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 __all__ = [
     "QWEN38_FLASH_NEXT_REPO",
     "QWEN38_FLASH_NEXT_REVISION",
+    "NGramFileIdentity",
     "NGramGeometry",
     "NGramManifest",
     "NGramManifestError",
     "NGramShard",
+    "VerifiedNGramArtifact",
+    "VerifiedNGramShard",
     "load_ngram_manifest",
     "qwen38_ngram_manifest",
     "save_ngram_manifest",

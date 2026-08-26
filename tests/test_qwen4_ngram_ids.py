@@ -6,8 +6,10 @@ import os
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from mtplx import qwen4_ngram
 from mtplx.qwen4_ngram import (
     QWEN38_FLASH_NEXT_REVISION,
     NGramGeometry,
@@ -178,8 +180,6 @@ def test_incremental_chunks_equal_whole_sequence_for_batch_and_eos() -> None:
         )
         tokenwise.append(planned)
 
-    import numpy as np
-
     assert np.array_equal(np.concatenate((first, second, third), axis=1), whole)
     assert np.array_equal(np.concatenate(tokenwise, axis=1), whole)
     assert context == ((50, 60), (6, 7))
@@ -201,6 +201,36 @@ def test_planning_rejects_invalid_inputs(tokens: object, context: object) -> Non
 
     with pytest.raises((TypeError, ValueError)):
         geometry.plan_incremental(tokens, prior_context=context)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        [[10**100]],
+        np.asarray([[10**100]], dtype=object),
+        np.asarray([[(1 << 64) - 1]], dtype=np.uint64),
+    ],
+)
+def test_planning_translates_oversized_tokens_to_range_error(tokens: object) -> None:
+    with pytest.raises(ValueError, match="range|vocabulary"):
+        NGramGeometry.qwen38().row_ids(tokens)
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        ((10**100, 1),),
+        np.asarray([[10**100, 1]], dtype=object),
+        np.asarray([[(1 << 64) - 1, 1]], dtype=np.uint64),
+    ],
+)
+def test_planning_translates_oversized_context_to_range_error(
+    context: object,
+) -> None:
+    with pytest.raises(ValueError, match="range|vocabulary"):
+        NGramGeometry.qwen38().plan_incremental(
+            [[1]], prior_context=context  # type: ignore[arg-type]
+        )
 
 
 def _shard(
@@ -246,8 +276,20 @@ def test_manifest_roundtrip_verify_and_locate_exact_offsets(tmp_path: Path) -> N
 
     saved = save_ngram_manifest(manifest, path)
     loaded = load_ngram_manifest(path)
-    report = verify_ngram_manifest(tmp_path, loaded)
+    with verify_ngram_manifest(tmp_path, loaded) as artifact:
+        report = artifact.report
+        retained_root_fd = artifact.root_fileno()
+        retained_fd = artifact.shards[0].fileno()
+        assert artifact.shards[0].pread(4, 2) == b"aa"
+        assert os.fstat(retained_fd).st_size == 8
 
+    assert artifact.closed
+    assert all(shard.closed for shard in artifact.shards)
+    with pytest.raises(OSError):
+        os.fstat(retained_fd)
+    with pytest.raises(OSError):
+        os.fstat(retained_root_fd)
+    artifact.close()
     assert loaded == saved == manifest
     assert report == {"shards": 2, "rows": 3, "bytes": 6}
     shard, offset = loaded.locate_row(0)
@@ -357,7 +399,8 @@ def test_manifest_accepts_plain_unicode_single_component_name(tmp_path: Path) ->
         shards=(shard,),
     ).with_digest()
 
-    assert verify_ngram_manifest(tmp_path, manifest)["rows"] == 3
+    with verify_ngram_manifest(tmp_path, manifest) as artifact:
+        assert artifact.report["rows"] == 3
 
 
 @pytest.mark.parametrize("name", ["part.bin/", "part\x00.bin", "ngram-e\u0301.bin"])
@@ -383,6 +426,150 @@ def test_verify_rejects_symlink(tmp_path: Path) -> None:
 
     with pytest.raises(NGramManifestError):
         verify_ngram_manifest(tmp_path, manifest)
+
+
+def test_verify_rejects_symlink_artifact_root(tmp_path: Path) -> None:
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    manifest = _tiny_manifest(real_root)
+    linked_root = tmp_path / "linked"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+
+    with pytest.raises(NGramManifestError):
+        verify_ngram_manifest(linked_root, manifest)
+
+
+def test_verify_is_anchored_when_root_path_is_replaced_by_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "artifact"
+    root.mkdir()
+    manifest = _tiny_manifest(root)
+    detached = tmp_path / "detached"
+    original_open = os.open
+    replaced = False
+
+    def racing_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        nonlocal replaced
+        if path == "part-1.bin" and dir_fd is not None and not replaced:
+            root.rename(detached)
+            root.symlink_to(detached, target_is_directory=True)
+            replaced = True
+        if dir_fd is None:
+            return original_open(path, flags, mode)  # type: ignore[arg-type]
+        return original_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(qwen4_ngram.os, "open", racing_open)
+    try:
+        with verify_ngram_manifest(root, manifest) as artifact:
+            assert replaced
+            assert artifact.shards[0].pread(4, 4) == b"aabb"
+    finally:
+        if root.is_symlink():
+            root.unlink()
+        if detached.exists():
+            detached.rename(root)
+
+
+def test_verify_is_anchored_when_ancestor_is_replaced_by_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ancestor = tmp_path / "owner"
+    root = ancestor / "artifact"
+    root.mkdir(parents=True)
+    manifest = _tiny_manifest(root)
+    detached = tmp_path / "detached-owner"
+    original_open = os.open
+    replaced = False
+
+    def racing_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        nonlocal replaced
+        if path == "part-1.bin" and dir_fd is not None and not replaced:
+            ancestor.rename(detached)
+            ancestor.symlink_to(detached, target_is_directory=True)
+            replaced = True
+        if dir_fd is None:
+            return original_open(path, flags, mode)  # type: ignore[arg-type]
+        return original_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(qwen4_ngram.os, "open", racing_open)
+    try:
+        with verify_ngram_manifest(root, manifest) as artifact:
+            assert replaced
+            assert artifact.read_row(0) == b"aa"
+    finally:
+        if ancestor.is_symlink():
+            ancestor.unlink()
+        if detached.exists():
+            detached.rename(ancestor)
+
+
+def test_verify_rejects_hardlinked_shard(tmp_path: Path) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    os.link(tmp_path / "part-1.bin", tmp_path / "part-1-hardlink.bin")
+
+    with pytest.raises(NGramManifestError, match="link"):
+        verify_ngram_manifest(tmp_path, manifest)
+
+
+def test_verified_reads_survive_post_verification_path_replacement(
+    tmp_path: Path,
+) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    artifact = verify_ngram_manifest(tmp_path, manifest)
+    original = tmp_path / "part-1.bin"
+    displaced = tmp_path / "displaced.bin"
+    original.rename(displaced)
+    original.write_bytes(b"HEADXXXX")
+    try:
+        assert artifact.shards[0].pread(4, 4) == b"aabb"
+        identity = artifact.shards[0].identity
+        assert (identity.device, identity.inode, identity.size) == (
+            os.stat(displaced).st_dev,
+            os.stat(displaced).st_ino,
+            8,
+        )
+    finally:
+        artifact.close()
+
+
+def test_verify_closes_every_fd_after_mid_verification_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    (tmp_path / "part-2.bin").write_bytes(b"HEADxx")
+    original_open = os.open
+    opened: list[int] = []
+
+    def tracking_open(
+        path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if dir_fd is None:
+            fd = original_open(path, flags, mode)  # type: ignore[arg-type]
+        else:
+            fd = original_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(qwen4_ngram.os, "open", tracking_open)
+    with pytest.raises(NGramManifestError):
+        verify_ngram_manifest(tmp_path, manifest)
+
+    assert opened
+    for descriptor in set(opened):
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_verify_missing_root_is_domain_error(tmp_path: Path) -> None:
+    manifest = _tiny_manifest(tmp_path)
+
+    with pytest.raises(NGramManifestError):
+        verify_ngram_manifest(tmp_path / "missing", manifest)
 
 
 @pytest.mark.parametrize("corruption", ["short", "payload"])
@@ -421,3 +608,60 @@ def test_load_rejects_stale_digest_malformed_types_and_duplicate_keys(
     path.write_text('{"format":"one","format":"two"}')
     with pytest.raises(NGramManifestError, match="duplicate"):
         load_ngram_manifest(path)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b'{"padded_rows":' + b"9" * 5_000 + b"}", "integer"),
+        (b"[" * 200 + b"0" + b"]" * 200, "depth"),
+        (b'{"source_repo":"\\ud800"}', "Unicode"),
+        (json.dumps([[] for _ in range(5_000)]).encode(), "collection"),
+        (json.dumps({"source_repo": "x" * 5_000}).encode(), "string"),
+    ],
+)
+def test_load_rejects_adversarial_json_with_domain_error(
+    tmp_path: Path, payload: bytes, message: str
+) -> None:
+    path = tmp_path / "adversarial.json"
+    path.write_bytes(payload)
+
+    with pytest.raises(NGramManifestError, match=message):
+        load_ngram_manifest(path, verify_digest=False)
+
+
+def test_load_rejects_too_many_shards_before_materialization(tmp_path: Path) -> None:
+    value = _tiny_manifest(tmp_path).to_dict()
+    value.pop("digest")
+    value["shards"] = [value["shards"][0] for _ in range(129)]
+    path = tmp_path / "too-many-shards.json"
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(NGramManifestError, match="shard|collection"):
+        load_ngram_manifest(path, verify_digest=False)
+
+
+def test_load_missing_manifest_is_domain_error(tmp_path: Path) -> None:
+    with pytest.raises(NGramManifestError):
+        load_ngram_manifest(tmp_path / "missing.json")
+
+
+def test_manifest_canonicalization_rejects_lone_surrogate(tmp_path: Path) -> None:
+    manifest = _tiny_manifest(tmp_path)
+
+    with pytest.raises(NGramManifestError):
+        replace(manifest, source_repo="bad\ud800").with_digest()
+
+
+def test_save_rejects_oversize_before_creating_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _tiny_manifest(tmp_path)
+    monkeypatch.setattr(qwen4_ngram, "MAX_MANIFEST_BYTES", 1)
+
+    def unexpected_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        raise AssertionError("temporary file must not be created")
+
+    monkeypatch.setattr(qwen4_ngram.tempfile, "mkstemp", unexpected_mkstemp)
+    with pytest.raises(NGramManifestError, match="byte limit"):
+        save_ngram_manifest(manifest, tmp_path / "manifest.json")
