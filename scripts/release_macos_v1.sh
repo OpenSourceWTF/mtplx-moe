@@ -287,29 +287,11 @@ DMG_URL="$GITHUB_ASSET_BASE/$(basename "$DMG")"
 
 # Sparkle's "what's new" dialog and the hosted notes page render the real
 # release notes authored in docs/releases/v$VERSION.md (gated above).
-"$PYTOOLS_VENV/bin/python" - "$RELEASE_NOTES_MD" "$NOTES_OUT/v$VERSION.html" "$VERSION" <<'PY'
-import pathlib
-import sys
-
-import markdown
-
-source, destination, version = sys.argv[1], sys.argv[2], sys.argv[3]
-body = markdown.markdown(
-    pathlib.Path(source).read_text(encoding="utf-8"),
-    extensions=["extra"],
-)
-html = (
-    "<!doctype html>\n"
-    '<meta charset="utf-8">\n'
-    f"<title>MTPLX {version}</title>\n"
-    '<style>body{font-family:-apple-system,system-ui,sans-serif;'
-    "max-width:42em;margin:2em auto;padding:0 1em;line-height:1.55}"
-    "h1,h2{line-height:1.2}code{background:#f2f2f4;padding:0 .25em;"
-    "border-radius:4px}</style>\n"
-    f"{body}\n"
-)
-pathlib.Path(destination).write_text(html, encoding="utf-8")
-PY
+# scripts/render_release_notes.py owns the page template — light AND dark
+# mode readable (#367) — and the rehearsal kit renders through the same
+# file, so do not inline a template copy here again.
+"$PYTOOLS_VENV/bin/python" "$ROOT/scripts/render_release_notes.py" \
+  "$RELEASE_NOTES_MD" "$NOTES_OUT/v$VERSION.html" "$VERSION"
 
 python3 - "$RELEASES_OUT/latest.json" "$VERSION" "$APP_BUILD" "$DMG_URL" "$DMG_SHA256" "$DMG_SIZE" "$RELEASE_NOTES_URL" <<'PY'
 import datetime

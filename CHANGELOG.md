@@ -42,6 +42,16 @@ All notable user-facing changes to MTPLX. The format is based on
 - The dashboard "RAM session cache" settings no longer invent `8G/4G`
   when nothing is configured — they report the budgets the engine
   actually resolved.
+- The update dialog's release notes are readable in dark mode (#367).
+  The generated notes page now declares `color-scheme: light dark` and
+  pairs each appearance with readable text colors instead of shipping a
+  light-only stylesheet that Sparkle's dark update window rendered as
+  near-black-on-dark. The release script and the Sparkle rehearsal kit
+  render through one shared template
+  (`scripts/render_release_notes.py`), so the rehearsal now shows the
+  exact page users get and the two can no longer drift apart.
+  Notes pages already published under mtplx.com/releases/notes/ need a
+  one-time re-render and re-upload to pick this up.
 
 ## [2.9.3] - 2026-08-26
 
