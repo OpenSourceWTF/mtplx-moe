@@ -42,6 +42,22 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **Unexecuted tool calls are no longer silently swallowed** (#349). A
+  fresh-install user asking the built-in chat about their files saw the
+  model "invoke" tools (`ls`, `find`, `search_files`, `read_file`) and
+  get nothing back — no output, no error — because the server deleted
+  dead tool-call markup from no-tools responses (#160) and from
+  undeclared-tool fallbacks without telling anyone. Suppressed calls
+  now leave a short, visible notice naming the tool and stating that
+  nothing ran, this chat has no file/terminal access, and a coding
+  agent (Claude Code, OpenCode, Hermes) connected to MTPLX provides
+  it. The model reads the same notice in its history and stops
+  claiming it ran tools; the reply is never blank. Code-fenced tool
+  syntax examples are untouched, and `mtplx_stats` gains
+  `unexecuted_tool_call_notice` for triage. The macOS app also
+  persists a truthful `tool_not_executed` result for any tool call
+  that finishes past the chat's tool-round budget, so replayed
+  transcripts never show the model an unanswered tool call.
 - Metal allocation failures are answered as structured
   `insufficient_memory` (HTTP 507) errors with actionable advice, after
   the engine sheds its caches — instead of anonymous `internal_error`

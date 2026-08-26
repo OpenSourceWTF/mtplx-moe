@@ -7054,6 +7054,160 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: thirdRequestURL.path))
     }
 
+    // Issue #349: a "tool_calls" finish that arrives past the round budget
+    // (here: the server ignores tool_choice "none" and emits another call)
+    // used to persist the calls with NO results — the replayed transcript
+    // then showed the model unanswered tool calls forever, which the model
+    // reports as "I invoke the tool, but I do not receive any result or
+    // output back". Every undispatched call must get a truthful, non-empty
+    // tool result in the persisted conversation.
+    @MainActor
+    func testUndispatchedToolCallsBeyondRoundBudgetGetNonEmptyResults() async throws {
+        let port = try freeTCPPort()
+        let root = temporaryDirectory()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = try makeExecutable(
+            named: "fake-dangling-tool-loop-stream",
+            body: """
+            #!/bin/sh
+            exec python3 -u - <<'PY'
+            import json
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            PORT = \(port)
+
+            def sse(payload):
+                return ("data: " + json.dumps(payload) + "\\n\\n").encode("utf-8")
+
+            class Handler(BaseHTTPRequestHandler):
+                count = 0
+
+                def log_message(self, *_args):
+                    return
+
+                def do_GET(self):
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+
+                def do_POST(self):
+                    if self.path != "/v1/chat/completions":
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                    self.rfile.read(length) if length else b"{}"
+                    Handler.count += 1
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+
+                    call_id = "call_fetch" if Handler.count == 1 else "call_term"
+                    name = "fetch_url" if Handler.count == 1 else "terminal"
+                    args = (
+                        "{\\"url\\":\\"https://example.com/release\\"}"
+                        if Handler.count == 1
+                        else "{\\"command\\":\\"ls ~/Dev\\"}"
+                    )
+                    self.wfile.write(sse({
+                        "id": "chatcmpl-dangling",
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+                    }))
+                    self.wfile.write(sse({
+                        "id": "chatcmpl-dangling",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": args},
+                                }],
+                            },
+                        }],
+                    }))
+                    self.wfile.write(sse({
+                        "id": "chatcmpl-dangling",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    }))
+                    self.wfile.write(b"data: [DONE]\\n\\n")
+                    self.wfile.flush()
+
+            ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+            PY
+            """
+        )
+        let process = Process()
+        process.executableURL = script
+        try process.run()
+        defer { process.terminate() }
+
+        let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        let startupDeadline = Date().addingTimeInterval(5)
+        while Date() < startupDeadline {
+            if (try? await URLSession.shared.data(from: baseURL)) != nil {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        let container = try ChatStore.makeInMemoryContainer()
+        let chatClient = MTPLXChatClient(apiClient: MTPLXAPIClient(baseURL: baseURL))
+        let toolFactory = MTPLXChatToolFactory(
+            urlFetcher: URLFetcher(
+                transport: FixtureWebTransport(
+                    body: "<html><title>Release</title><body>MTPLX_DANGLING_349</body></html>"
+                ),
+                cache: URLFetchCache()
+            )
+        )
+        let viewModel = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            toolFactory: toolFactory,
+            modelName: { "mtplx-test-model" }
+        )
+        _ = viewModel.createNewConversation()
+        viewModel.webSearchEnabled = true
+
+        viewModel.send("look at ~/Dev")
+
+        let finishedDeadline = Date().addingTimeInterval(5)
+        while Date() < finishedDeadline {
+            if !viewModel.isStreaming { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertFalse(viewModel.isStreaming)
+
+        // The round-2 "terminal" call was never dispatched (budget spent).
+        // It must still have a persisted, NON-EMPTY tool result.
+        let repaired = try XCTUnwrap(
+            viewModel.visibleMessages.first {
+                $0.role == .tool && $0.toolCallId == "call_term"
+            },
+            "no tool-result message persisted for the undispatched call"
+        )
+        XCTAssertFalse(
+            repaired.visibleContent
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+        XCTAssertTrue(repaired.visibleContent.contains("tool_not_executed"))
+
+        // And the NEXT request's payload replays that non-empty result for
+        // the call id — the exact surface the model reads.
+        let payload = ChatViewModel.buildRequestMessages(
+            from: viewModel.visibleMessages,
+            overrideLastUserContent: nil
+        )
+        let toolEntry = try XCTUnwrap(
+            payload.first { $0.role == "tool" && $0.toolCallId == "call_term" }
+        )
+        XCTAssertFalse((toolEntry.content ?? "").isEmpty)
+    }
+
     @MainActor
     func testUnreadableAttachmentDoesNotSendEmptyPrompt() throws {
         let container = try ChatStore.makeInMemoryContainer()

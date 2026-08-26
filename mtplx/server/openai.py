@@ -4932,6 +4932,93 @@ def _sanitize_orphan_span_interior(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", s)
 
 
+# --- Unexecuted-tool-call truthfulness (#349) -------------------------------
+#
+# #160 taught the server to hide dead tool-call markup from no-tools chats,
+# and the malformed-parse fallback hides markup for undeclared names. Both
+# fixes deleted the markup SILENTLY: the model saw its call vanish with no
+# output and no error ("tool calls going out into the void" — issue #349's
+# transcript), the user saw a blank reply, and nothing in the conversation
+# said the call never ran. A swallowed call is a masked bug: whenever tool
+# markup is suppressed without execution, the turn now carries a short,
+# truthful, visible notice so the model can self-correct on its next turn
+# and the user learns why nothing happened.
+
+_TOOL_MARKUP_NAME_FUNCTION_RE = re.compile(
+    r"<function=([A-Za-z_][\w.-]*)", re.IGNORECASE
+)
+_TOOL_MARKUP_NAME_INVOKE_RE = re.compile(
+    r'<invoke\s+name="([A-Za-z_][\w.-]*)"', re.IGNORECASE
+)
+_TOOL_MARKUP_NAME_JSON_RE = re.compile(r'"name"\s*:\s*"([A-Za-z_][\w.-]*)"')
+_UNKNOWN_TOOL_REASON_RE = re.compile(r"unknown tool '([^']*)'", re.IGNORECASE)
+
+
+def _tool_markup_call_names(text: str, *, limit: int = 5) -> list[str]:
+    """Best-effort tool names from unexecuted tool-call markup (#349).
+
+    Scans only inside orphan tool-markup spans so a JSON object the model
+    wrote as prose cannot be misread as a call. Order-preserving, deduped.
+    """
+    names: list[str] = []
+    if not text or "<" not in text:
+        return names
+    for span_match in _ORPHAN_TOOL_MARKUP_RE.finditer(text):
+        span = span_match.group(0)
+        for pattern in (
+            _TOOL_MARKUP_NAME_FUNCTION_RE,
+            _TOOL_MARKUP_NAME_INVOKE_RE,
+            _TOOL_MARKUP_NAME_JSON_RE,
+        ):
+            for match in pattern.finditer(span):
+                name = match.group(1)
+                if name and name not in names:
+                    names.append(name)
+                if len(names) >= limit:
+                    return names
+    return names
+
+
+def _unknown_tool_name_from_reason(reason: str) -> str:
+    match = _UNKNOWN_TOOL_REASON_RE.search(reason or "")
+    return match.group(1).strip() if match else ""
+
+
+def _no_tools_unexecuted_call_notice(names: list[str]) -> str:
+    """Visible truth for a no-tools turn whose tool markup was suppressed."""
+    called = ", ".join(f'"{name}"' for name in names) if names else "a tool"
+    return (
+        f"[MTPLX: this reply tried to call {called}, but no tools are active "
+        "on this request, so nothing was executed — there was no output and "
+        "no error. This chat cannot read files or run terminal commands. For "
+        "file and terminal access, connect a coding agent (Claude Code, "
+        "OpenCode, or the Hermes agent in the MTPLX app) to MTPLX.]"
+    )
+
+
+def _unknown_tool_unexecuted_call_notice(
+    name: str,
+    declared: list[str],
+) -> str:
+    """Visible truth for a suppressed call to a tool this request never had."""
+    available = ", ".join(declared) if declared else "none"
+    label = f' "{name}"' if name else ""
+    return (
+        f"[MTPLX: the tool call{label} was not executed — it is not one of "
+        f"this request's available tools (available: {available}). Nothing "
+        "ran and there is no output. Use only the available tools, or answer "
+        "directly.]"
+    )
+
+
+def _append_unexecuted_tool_notice(text: str, notice: str) -> str:
+    """Append the notice as a trailing paragraph; idempotent per turn."""
+    base = (text or "").rstrip()
+    if notice in base:
+        return base
+    return f"{base}\n\n{notice}" if base else notice
+
+
 _TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>",
     re.IGNORECASE | re.DOTALL,
@@ -17039,6 +17126,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     # quiet envelopes stay byte-stable.
     "tool_calls_truncated_by_length",
     "raw_tool_markup_suppressed",
+    # Stamped only when a suppressed (unexecuted) tool call got its visible
+    # truth notice (#349), so quiet envelopes stay byte-stable.
+    "unexecuted_tool_call_notice",
     "legacy_bridge_used",
     "hidden_generation_repair_used",
     "early_tool_cancel_used",
@@ -30422,6 +30512,68 @@ def create_app(state: ServerState) -> FastAPI:
                                     delta = {"content": fallback_visible_text}
                                     remember_stream_delta(delta)
                                     yield mark_sse_sent(delta_payload_chunk(delta))
+                                if (
+                                    extraction.status == "malformed_as_content"
+                                    and not assistant_tool_calls
+                                    and _tool_parse_counter_key(
+                                        extraction.malformed_reason
+                                        or "malformed_tool_call"
+                                    )
+                                    == "unknown_tool_name"
+                                ):
+                                    # #349 (stream twin of the non-stream
+                                    # fallback): a call to an undeclared tool
+                                    # was suppressed without executing — and a
+                                    # turn that was ONLY that call streamed no
+                                    # content at all. State the truth so the
+                                    # model self-corrects instead of believing
+                                    # the tool ran and returned nothing.
+                                    unknown_tool_notice = (
+                                        _unknown_tool_unexecuted_call_notice(
+                                            _unknown_tool_name_from_reason(
+                                                extraction.malformed_reason or ""
+                                            ),
+                                            _tool_names(tool_specs),
+                                        )
+                                    )
+                                    if unknown_tool_notice not in "".join(
+                                        history_content_chunks
+                                    ):
+                                        delta = {"content": unknown_tool_notice}
+                                        remember_stream_delta(delta)
+                                        yield mark_sse_sent(
+                                            delta_payload_chunk(delta)
+                                        )
+                                        stats["unexecuted_tool_call_notice"] = True
+                            elif (
+                                not tools_active
+                                and not read_only_force_answer_contract_active
+                                and not assistant_tool_calls
+                                and splitter.suppressed_tool_markup_chars > 0
+                            ):
+                                # #349 (stream twin of the non-stream #160
+                                # strip): the splitter suppressed no-tools
+                                # tool-call markup mid-stream, so the model's
+                                # call vanished with no output and no error.
+                                # Emit the truthful notice as the turn's last
+                                # content delta; remember_stream_delta puts it
+                                # in the committed history too, keeping the
+                                # session bank byte-identical with what the
+                                # client replays next turn.
+                                no_tools_notice = _no_tools_unexecuted_call_notice(
+                                    _tool_markup_call_names(raw_generated_text)
+                                )
+                                if no_tools_notice not in "".join(
+                                    history_content_chunks
+                                ):
+                                    delta = {"content": no_tools_notice}
+                                    remember_stream_delta(delta)
+                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    stats["unexecuted_tool_call_notice"] = True
+                                    # Parity with the non-stream #160 strip,
+                                    # which stamps this on every no-tools
+                                    # suppression.
+                                    stats["raw_tool_markup_suppressed"] = True
                             if assistant_tool_calls:
                                 recovered_tool_preamble = getattr(
                                     splitter,
@@ -31259,6 +31411,19 @@ def create_app(state: ServerState) -> FastAPI:
                 display_text = _strip_mtplx_internal_continuation_markers(display_text)
                 fallback_reason = extraction.malformed_reason or "malformed_tool_call"
                 fallback_kind = _tool_parse_counter_key(fallback_reason)
+                if fallback_kind == "unknown_tool_name":
+                    # #349: a call to an undeclared tool was stripped from the
+                    # visible text without executing — a turn that was ONLY
+                    # that call came back as literal empty content. Replace
+                    # silence with the truth so the model self-corrects.
+                    display_text = _append_unexecuted_tool_notice(
+                        display_text,
+                        _unknown_tool_unexecuted_call_notice(
+                            _unknown_tool_name_from_reason(fallback_reason),
+                            _tool_names(tool_specs),
+                        ),
+                    )
+                    generated["stats"]["unexecuted_tool_call_notice"] = True
                 generated["stats"]["tool_parse_fallback"] = True
                 generated["stats"]["tool_parse_fallback_reason"] = fallback_reason
                 generated["stats"]["tool_parse_fallback_kind"] = fallback_kind
@@ -31295,6 +31460,7 @@ def create_app(state: ServerState) -> FastAPI:
                     # client cannot execute or parse (#160: small models
                     # answer "look it up" prompts with raw
                     # <tool_call><function=web_search> XML in the app chat).
+                    pre_strip_text = display_text
                     display_text, orphan_blocks = _strip_orphan_tool_markup(
                         display_text
                     )
@@ -31303,6 +31469,16 @@ def create_app(state: ServerState) -> FastAPI:
                         generated["stats"]["orphan_tool_markup_blocks"] = int(
                             orphan_blocks
                         )
+                        # #349: deleting the markup silently left the model
+                        # believing it ran a tool and got nothing back, and
+                        # left the user a blank reply. Say what happened.
+                        display_text = _append_unexecuted_tool_notice(
+                            display_text,
+                            _no_tools_unexecuted_call_notice(
+                                _tool_markup_call_names(pre_strip_text)
+                            ),
+                        )
+                        generated["stats"]["unexecuted_tool_call_notice"] = True
             if stop_sequences:
                 # Post-trim safety net for matches the incremental monitor
                 # cannot see (e.g. a stop string completed only by the

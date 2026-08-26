@@ -738,6 +738,37 @@ public final class ChatViewModel: ObservableObject {
                 sourcesJSON: SourceRecord.encodeJSON(stream.liveTurnSources),
                 thinkingTimeMs: stream.completedThinkingMs > 0 ? stream.completedThinkingMs : nil
             )
+            // #349 hardening: a "tool_calls" finish that lands HERE was not
+            // dispatched (the round budget is spent, or a server ignored
+            // tool_choice "none"). Persisting the calls with no results would
+            // replay a transcript of unanswered tool calls into every later
+            // request — the model then truthfully reports "I invoke the tool,
+            // but I do not receive any result or output back". Every call
+            // gets a non-empty, truthful error result instead of silence.
+            if finishReason == "tool_calls", !accumulatedToolCalls.isEmpty {
+                for call in accumulatedToolCalls.values {
+                    let result = Self.unexecutedToolResultJSON(toolName: call.name)
+                    persistToolTrace(
+                        on: assistantMessage,
+                        id: call.id,
+                        name: call.name,
+                        argumentsJSON: call.arguments,
+                        resultJSON: result,
+                        status: .failed
+                    )
+                    let toolStorageMessage = ChatMessage(
+                        role: .tool,
+                        visibleContent: result,
+                        toolCallId: call.id,
+                        turnGroupID: stream.turnID,
+                        createdAt: Date(),
+                        conversation: conversation
+                    )
+                    context.insert(toolStorageMessage)
+                    conversation.messages.append(toolStorageMessage)
+                }
+                saveContext()
+            }
             updateChatDecodeReading(of: stream, from: finalStats)
             publishVisibleMessages(for: conversation, ensuring: assistantMessage)
             refreshConversations()
@@ -1962,6 +1993,31 @@ public final class ChatViewModel: ObservableObject {
         case "fetch_url": return "Fetching page content…"
         default: return "Running tool…"
         }
+    }
+
+    /// Truthful tool-result payload for a call the app did NOT execute
+    /// (#349). Internal (not private) so the regression test can pin that a
+    /// skipped call always produces a non-empty, explanatory result — an
+    /// empty string here is exactly the "tool calls going out into the void"
+    /// bug.
+    static func unexecutedToolResultJSON(toolName: String) -> String {
+        let name = toolName.isEmpty ? "unknown" : toolName
+        let note =
+            "MTPLX chat did not execute this call: the turn's tool phase was "
+            + "already closed. There is no output to wait for. Answer from "
+            + "what you already have, and if the task needs file or terminal "
+            + "access, tell the user this chat cannot provide it."
+        let payload: [String: Any] = [
+            "error": "tool_not_executed",
+            "tool": name,
+            "note": note,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+            let text = String(data: data, encoding: .utf8), !text.isEmpty
+        else {
+            return "{\"error\":\"tool_not_executed\",\"note\":\"MTPLX chat did not execute this call.\"}"
+        }
+        return text
     }
 
     private static func shortResultDetail(for toolName: String, json: String) -> String {
