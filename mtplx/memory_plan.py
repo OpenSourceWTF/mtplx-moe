@@ -251,7 +251,11 @@ def plan_memory(
         planning_ram = total_ram
         budget = None
     if usable_bytes_override is not None and int(usable_bytes_override) > 0:
-        usable = min(int(usable_bytes_override), planning_ram)
+        # The override is the Metal limit the server actually configured —
+        # computed from the REAL machine. Under a tighter --memory-budget
+        # the formula on the planning RAM must still win, or a simulated
+        # 48G seat would inherit the 128G box's 96G envelope.
+        usable = min(int(usable_bytes_override), usable_engine_bytes(planning_ram))
     else:
         usable = usable_engine_bytes(planning_ram)
 

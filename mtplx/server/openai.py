@@ -1861,13 +1861,26 @@ def _select_backend_context_window(
     *,
     model_max: int,
     requested: int | None,
+    machine_fit: int | None = None,
 ) -> int:
+    """Serving window: explicit request > machine fit > model max.
+
+    ``machine_fit`` is the memory plan's largest window whose full-window
+    KV actually fits this machine's engine envelope (issue #305: the flat
+    model-max default admitted 262k-token prompts on 48 GB Macs, whose KV
+    alone exceeds the Metal budget — swap-death, not an error message).
+    It shapes only the DEFAULT: an explicit --context-window always wins,
+    with the plan warning loudly instead of refusing.
+    """
     requested_value = int(requested or 0)
     default_value = (
         backend.context_window_policy.default
         if backend.backend_id == "laguna_ar"
         else int(model_max)
     )
+    fit = int(machine_fit or 0)
+    if requested_value <= 0 and fit > 0:
+        default_value = min(int(default_value), fit)
     return max(
         4_096,
         min(
@@ -2330,10 +2343,55 @@ class ServerState:
             args.model,
         )
         requested_context_window = int(getattr(args, "context_window", None) or 0)
+        # Machine memory plan (issue #305): weights are a disk scan, RAM a
+        # sysctl, so the machine's largest safe window is knowable BEFORE
+        # any request — and it shapes the default window below. Five
+        # subsystems budgeting independently with a machine-blind 262k
+        # default is how a 48 GB Mac reached 61.8 GB resident and 3 tok/s.
+        from mtplx.engine_session import (
+            model_weights_bytes as _model_weights_bytes,
+        )
+        from mtplx.memory_plan import (
+            describe_plan as _describe_memory_plan,
+            detect_total_ram_bytes as _plan_detect_total_ram,
+            plan_memory as _plan_memory,
+        )
+
+        _plan_weights_bytes = _model_weights_bytes(
+            getattr(self.runtime, "model_path", None)
+        )
+        try:
+            _plan_kv_bytes_per_token = int(
+                os.environ.get("MTPLX_DENSE_KV_BYTES_PER_TOKEN") or 65536
+            )
+        except (TypeError, ValueError):
+            _plan_kv_bytes_per_token = 65536
+        _plan_metal_limit: int | None = None
+        _caps = getattr(self, "metal_memory_caps", None)
+        if isinstance(_caps, dict):
+            _cap_value = _caps.get("memory_limit_bytes")
+            if isinstance(_cap_value, int) and _cap_value > 0:
+                _plan_metal_limit = _cap_value
+        _plan_inputs: dict[str, Any] = {
+            "total_ram_bytes": _plan_detect_total_ram(),
+            "model_weights_bytes": _plan_weights_bytes,
+            "kv_bytes_per_token": _plan_kv_bytes_per_token,
+            "kv_quantization": _effective_paged_kv_quantization(),
+            "model_max_context": int(self.model_context_window_max),
+            "memory_budget_bytes": self.memory_budget_bytes,
+            "usable_bytes_override": _plan_metal_limit,
+        }
+        _fit_plan = _plan_memory(**_plan_inputs)
+        _machine_fit = (
+            int(_fit_plan.context_window_fit)
+            if _fit_plan.available and _fit_plan.model_fits
+            else 0
+        )
         self.context_window = _select_backend_context_window(
             self.backend_descriptor,
             model_max=int(self.model_context_window_max),
             requested=requested_context_window,
+            machine_fit=_machine_fit,
         )
         if (
             scheduler_config.mode == SchedulerMode.MTP_BATCH
@@ -2349,14 +2407,37 @@ class ServerState:
         # The paged KV pool clamps geometric growth to this window (#150);
         # env is the plumbing because cache_state has no server handle.
         os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(int(self.context_window))
-        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
-        from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
+        # Final plan against the RESOLVED window (the fit plan above only
+        # shaped the default): overcommit and machine-bound verdicts ride
+        # the banner, the health payload, and the app's dashboard stream.
+        from mtplx.generation import (
+            _dense_decode_max_context as _dense_decode_ceiling,
+        )
 
+        _plan_inputs["requested_context"] = (
+            int(self.context_window) if requested_context_window > 0 else None
+        )
+        _plan_inputs["dense_decode_ceiling"] = int(_dense_decode_ceiling())
+        self.memory_plan = _plan_memory(**_plan_inputs)
+        if self.memory_plan.available:
+            _startup_line(
+                f"[5/6] Memory plan: {_describe_memory_plan(self.memory_plan)}"
+            )
+            for _plan_note in self.memory_plan.notes:
+                _startup_line(f"[5/6] Memory plan: {_plan_note}")
+        else:
+            # A detector whose failure path is "quietly use the default"
+            # is how the app-daemon PATH bug shipped (mistakes ledger);
+            # the fallback names its reason in one log read.
+            _startup_line(
+                "[5/6] Memory plan unavailable "
+                f"({self.memory_plan.unavailable_reason}); legacy budgets apply"
+            )
+        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
         self.sessions = EngineSessionManager(
             cold_tier=self.session_bank_cold_tier,
-            model_weights_bytes=_model_weights_bytes(
-                getattr(self.runtime, "model_path", None)
-            ),
+            model_weights_bytes=_plan_weights_bytes,
+            memory_plan=self.memory_plan,
         )
         # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
         # it runs at enqueue, never on the writer thread) off request and
@@ -15134,7 +15215,9 @@ def _env_bool_setting(name: str, *, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _effective_ram_session_cache_settings() -> dict[str, Any]:
+def _effective_ram_session_cache_settings(
+    state: "ServerState | None" = None,
+) -> dict[str, Any]:
     entries_raw = os.environ.get("MTPLX_SESSION_BANK_MAX_ENTRIES")
     max_bytes = os.environ.get("MTPLX_SESSION_BANK_MAX_BYTES") or "8G"
     per_session_bytes = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES") or "4G"
@@ -15157,6 +15240,16 @@ def _effective_ram_session_cache_settings() -> dict[str, Any]:
         policy = "minimal"
     else:
         policy = "bounded"
+    # Report the budgets the bank is actually RUNNING, not the env echo:
+    # with nothing configured the engine auto-sizes from the machine plan
+    # (or the half-surplus formula), and this surface used to invent
+    # "8G/4G" — the dashboard disagreeing with the daemon's own budget
+    # line is exactly how config bugs hide.
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    if bank is not None:
+        entries = int(getattr(bank, "max_entries", entries))
+        max_bytes = f"{int(bank.max_bytes) / 2**30:.1f}G"
+        per_session_bytes = f"{int(bank.per_session_max_bytes) / 2**30:.1f}G"
     return {
         "ram_session_cache_policy": policy,
         "ram_session_block_prefix_restore": block_prefix_restore,
@@ -15313,7 +15406,7 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
             "paged_kv_quantization",
             "ssd_session_cache",
         ],
-        **_effective_ram_session_cache_settings(),
+        **_effective_ram_session_cache_settings(state),
     }
 
 
@@ -15570,6 +15663,14 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "memory_pressure_level": int(
             getattr(dashboard, "last_memory_pressure_level", 0) or 0
         ),
+        "memory_plan": (
+            state.memory_plan.to_dict()
+            if getattr(state, "memory_plan", None) is not None
+            else None
+        ),
+        "memory_guard_events": list(
+            getattr(dashboard, "memory_guard_events", ()) or ()
+        )[-8:],
         "settings": _mtplx_current_settings(state),
         "scheduler": _mtplx_scheduler_state(state),
         "machine": _machine_info(),
@@ -25659,6 +25760,11 @@ def create_app(state: ServerState) -> FastAPI:
                 state,
                 "metal_memory_caps",
                 {"applied": False, "reason": "unavailable"},
+            ),
+            "memory_plan": (
+                state.memory_plan.to_dict()
+                if getattr(state, "memory_plan", None) is not None
+                else None
             ),
             "mlx_cache_limit": state.mlx_cache_limit_status,
             "mlx_runtime": state.mlx_runtime_status,

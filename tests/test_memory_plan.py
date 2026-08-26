@@ -229,6 +229,15 @@ def test_usable_override_takes_the_configured_metal_limit() -> None:
     assert plan.usable_bytes == 30 * GIB
 
 
+def test_budget_beats_the_real_machines_metal_limit() -> None:
+    # Simulating a 48G seat on a 128G box: the caps were configured for
+    # the real machine (96G); the budgeted formula (36G) must win.
+    plan = _plan(
+        128, memory_budget_bytes=RAM[48], usable_bytes_override=96 * GIB
+    )
+    assert plan.usable_bytes == 36 * GIB
+
+
 # ---------------------------------------------------------------------------
 # the dynamic ceiling (the guard that turns on)
 

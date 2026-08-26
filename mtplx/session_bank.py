@@ -472,6 +472,14 @@ class SessionBank:
         self.last_restore_source: str | None = None
         self.last_ssd_restore_s: float = 0.0
         self.last_prefix_diagnostic: dict[str, Any] | None = None
+        # Dynamic budget ceiling (memory_plan.bank_dynamic_ceiling): the
+        # bank takes all free memory while live KV is small and yields as a
+        # long-context request's KV actually materializes — the #305 fix's
+        # "guard that turns on". None (tests, CLI without a plan) keeps
+        # max_bytes as the only bound, byte-identical to legacy behavior.
+        self.dynamic_ceiling_fn: Callable[[], int] | None = None
+        self.last_dynamic_ceiling_bytes: int | None = None
+        self.dynamic_ceiling_errors: int = 0
 
     # Capability marker for generation: near_prefix_candidates accepts
     # min_restore_tokens so resident-duplicate eligibility mirrors the
@@ -484,6 +492,26 @@ class SessionBank:
     @property
     def total_nbytes(self) -> int:
         return sum(entry.nbytes for entry in self._entries.values())
+
+    def effective_max_bytes(self) -> int:
+        """The byte budget in force right now.
+
+        min(configured max, dynamic ceiling). A failing ceiling read must
+        never take a put or an eviction down with it — the budget falls
+        back to the static max and the failure is counted, not swallowed
+        invisibly (dynamic_ceiling_errors rides the health snapshot).
+        """
+        limit = int(self.max_bytes)
+        fn = self.dynamic_ceiling_fn
+        if fn is None:
+            return limit
+        try:
+            ceiling = int(fn())
+        except Exception:
+            self.dynamic_ceiling_errors += 1
+            return limit
+        self.last_dynamic_ceiling_bytes = ceiling
+        return max(1, min(limit, ceiling))
 
     def _touch_session(self, session_id: str | None) -> None:
         if not session_id or self.active_pin_ttl_s <= 0:
@@ -1594,6 +1622,9 @@ class SessionBank:
         return {
             "max_entries": self.max_entries,
             "max_bytes": self.max_bytes,
+            "effective_max_bytes": self.effective_max_bytes(),
+            "dynamic_ceiling_bytes": self.last_dynamic_ceiling_bytes,
+            "dynamic_ceiling_errors": self.dynamic_ceiling_errors,
             "per_session_max_bytes": self.per_session_max_bytes,
             "idle_ttl_s": self.idle_ttl_s,
             "entries": len(self._entries),
@@ -2025,7 +2056,7 @@ class SessionBank:
             candidates = list(self._entries.values())
             if len(self._entries) > self.max_entries:
                 reason = CacheMissReason.EVICTED.value
-            elif self.total_nbytes > self.max_bytes:
+            elif self.total_nbytes > self.effective_max_bytes():
                 reason = CacheMissReason.EVICTED.value
             elif session_over_budget:
                 reason = CacheMissReason.EVICTED.value

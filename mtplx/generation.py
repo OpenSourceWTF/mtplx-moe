@@ -886,6 +886,27 @@ def _sustained_prefill_layout() -> str:
 _DENSE_AUTO_ANNOUNCED = False
 
 
+def _memory_budget_env_bytes() -> int:
+    """MTPLX_MEMORY_BUDGET as plain bytes; 0 when unset/unparseable.
+
+    The server normalizes the flag to plain bytes before generation runs;
+    the suffix forms (48G / 48GiB) exist for direct env users.
+    """
+    raw = (os.environ.get("MTPLX_MEMORY_BUDGET") or "").strip()
+    if not raw:
+        return 0
+    text = raw.lower().removesuffix("ib").removesuffix("b")
+    scale = 1
+    if text and text[-1] in "kmgt":
+        scale = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[text[-1]]
+        text = text[:-1]
+    try:
+        value = int(float(text) * scale)
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
+
+
 def _dense_decode_max_context() -> int:
     """Context ceiling for the contiguous-dense-decode layout (tokens).
 
@@ -915,6 +936,13 @@ def _dense_decode_max_context() -> int:
             total_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         except (ValueError, OSError, AttributeError):
             return 131072
+        # --memory-budget scales the whole cache stack down with one knob
+        # (its documented contract); without this line a 48G seat simulated
+        # on a 128G box would keep the 128G dense ceiling and the
+        # simulation would not match a real 48G Mac.
+        budget = _memory_budget_env_bytes()
+        if budget > 0:
+            total_ram = min(total_ram, budget)
         budget_tokens = int(total_ram * ram_fraction / 100) // bytes_per_token
         window = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
         if window > 0:
