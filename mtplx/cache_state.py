@@ -3152,6 +3152,332 @@ class TensorOffsetVllmMetalPagedKVCache:
         }
 
 
+class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
+    """GraphBank-safe QUANTIZED paged KV cache with an array-backed offset.
+
+    The compiled verify bank refused ``--kv-quant`` pages outright
+    ("quantized_paged_kv"), so every verify round under kv-quant ran eager
+    (~380 ms vs ~137 ms banked at long context, receipts 2026-08-25). This
+    adapter makes quantized state promotable: the compiled leaves are the
+    HEAD-MAJOR quantized banks the packed-quant kernel
+    (kernels/sdpa_gqa_packed_quant) walks —
+
+        cache = [key_bank   (1, H_kv, capacity, packed)  int8/uint8,
+                 value_bank (1, H_kv, capacity, packed)  int8/uint8,
+                 offset     ()                           int32 array,
+                 key_scales   (1, H_kv, capacity, 1)     fp32,
+                 value_scales (1, H_kv, capacity, 1)     fp32]
+
+    — one fp32 rowwise-symmetric scale per (token, head) row, exactly the
+    layout kv_quant.quantize_symmetric produces on head-major inputs (the
+    quantizer commutes with the pages<->banks transpose, so promotion
+    carries the SAME integers the eager pages hold). ``offset`` stays at
+    ``cache[2]``: bucket resolution and every positional offset reader keep
+    working unchanged. Shapes and dtypes of all five leaves are fixed at
+    promotion, which is the whole point of the bank — the compiled verify
+    graph sees stable tensors across calls; in-graph writes quantize the
+    incoming bf16 window with pure mx ops (trace-safe) and slice_update the
+    banks at the traced offset.
+
+    Promotion (``from_paged_cache``) transposes pages -> banks once per
+    request; ``demote``/``to_paged_cache`` transposes back once at the end
+    of the generation — quantized bytes both ways, milliseconds at 128k.
+    """
+
+    def __init__(
+        self,
+        *,
+        key_cache: Any,
+        value_cache: Any,
+        offset: int | Any,
+        key_scale_cache: Any,
+        value_scale_cache: Any,
+        block_size: int,
+        num_blocks: int,
+        kv_quant_config: Any,
+        source_dtypes: tuple[Any, Any],
+        head_dims: tuple[int, int],
+    ) -> None:
+        super().__init__(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            offset=offset,
+            block_size=block_size,
+            num_blocks=num_blocks,
+        )
+        self.cache.extend([key_scale_cache, value_scale_cache])
+        self.rollback_state = [None, None, None, None, None]
+        self.kv_quant_config = kv_quant_config
+        self.source_dtypes = tuple(source_dtypes)
+        self.head_dims = (int(head_dims[0]), int(head_dims[1]))
+
+    @property
+    def bits(self) -> int:
+        return int(self.kv_quant_config.bits)
+
+    @property
+    def key_scale_cache(self):
+        return self.cache[3]
+
+    @key_scale_cache.setter
+    def key_scale_cache(self, value) -> None:
+        self.cache[3] = value
+
+    @property
+    def value_scale_cache(self):
+        return self.cache[4]
+
+    @value_scale_cache.setter
+    def value_scale_cache(self, value) -> None:
+        self.cache[4] = value
+
+    @classmethod
+    def promotable(cls, entry: Any) -> bool:
+        """True when the eager cache's quantized state fits this adapter.
+
+        Mirrors the packed-quant kernel's structural gates that are knowable
+        from the cache alone (equal K/V head dims in {64, 128, 256}, bits in
+        {4, 8}, live scale planes). GQA legality depends on the query heads
+        and stays a per-call kernel gate. Fail-closed: anything else keeps
+        the eager refusal.
+        """
+        if not getattr(entry, "kv_quant", False) or getattr(entry, "turboquant", False):
+            return False
+        config = getattr(entry, "kv_quant_config", None)
+        if config is None or int(config.bits) not in (4, 8):
+            return False
+        if (
+            entry.key_cache is None
+            or entry.value_cache is None
+            or entry.key_scale_cache is None
+            or entry.value_scale_cache is None
+        ):
+            return False
+        shape = getattr(entry, "_shape", None)
+        dtypes = getattr(entry, "_dtypes", None)
+        if shape is None or dtypes is None:
+            return False
+        k_dim, v_dim = int(shape[1]), int(shape[2])
+        return k_dim == v_dim and k_dim in (64, 128, 256)
+
+    @classmethod
+    def from_paged_cache(
+        cls, entry: VllmMetalPagedKVCache
+    ) -> "TensorOffsetQuantizedPagedKVCache":
+        import mlx.core as mx
+
+        if not cls.promotable(entry):
+            raise ValueError(
+                "paged cache is not promotable to the quantized adapter"
+            )
+        heads = int(entry.key_cache.shape[2])
+
+        def head_major(pages: Any, *, dtype: Any | None = None) -> Any:
+            flat = pages.reshape(-1, heads, int(pages.shape[3]))
+            bank = mx.contiguous(flat.transpose(1, 0, 2))[None, ...]
+            return bank if dtype is None else bank.astype(dtype)
+
+        return cls(
+            key_cache=head_major(entry.key_cache),
+            value_cache=head_major(entry.value_cache),
+            offset=int(entry.offset),
+            key_scale_cache=head_major(entry.key_scale_cache, dtype=mx.float32),
+            value_scale_cache=head_major(entry.value_scale_cache, dtype=mx.float32),
+            block_size=int(entry.block_size),
+            # Geometry from the LIVE pages, never the mutable claim (#310).
+            num_blocks=int(entry.key_cache.shape[0]),
+            kv_quant_config=entry.kv_quant_config,
+            source_dtypes=tuple(entry._dtypes),
+            head_dims=(int(entry._shape[1]), int(entry._shape[2])),
+        )
+
+    def update_without_fetch(self, keys: Any, values: Any) -> None:
+        import mlx.core as mx
+
+        from .kv_quant import quantize_symmetric
+
+        steps = int(keys.shape[2])
+        started = time.perf_counter()
+        bits = self.bits
+        # Head-major incoming (1, H, steps, D): quantizing here yields the
+        # same integers/scales the eager pages would hold for these rows
+        # (rowwise quantizer, transpose-commutative) — one math for the
+        # whole feature, no layout shuffle on the write path.
+        q_k, s_k = quantize_symmetric(keys, bits=bits)
+        q_v, s_v = quantize_symmetric(values, bits=bits)
+        offset = self.cache[2]
+        self.rollback_state[0] = offset
+        for slot, (buf_idx, update) in enumerate(
+            ((0, q_k), (1, q_v), (3, s_k), (4, s_v)), start=1
+        ):
+            self.rollback_state[slot] = mx.slice(
+                self.cache[buf_idx],
+                offset,
+                axes=(2,),
+                slice_size=update.shape,
+            )
+            self.cache[buf_idx] = mx.slice_update(
+                self.cache[buf_idx], update, offset, axes=(2,)
+            )
+        self.cache[2] = offset + steps
+        self.update_calls += 1
+        self.cache_write_time_s += time.perf_counter() - started
+
+    def paged_attention(
+        self,
+        queries: Any,
+        *,
+        scale: float,
+        sliding_window: int = -1,
+        mask: Any | None = None,
+        impl_override: str | None = None,
+    ):
+        del impl_override
+        if int(sliding_window) > 0:
+            return None
+        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+            return None
+        if int(queries.shape[0]) != 1:
+            return None
+        static_max_offset = self._static_attention_max_offset()
+        started = time.perf_counter()
+        from .kernels.sdpa_gqa_packed_quant import sdpa_gqa_packed_tail_quant
+
+        out = sdpa_gqa_packed_tail_quant(
+            queries=queries,
+            k_q=self.cache[0],
+            k_scale=self.cache[3],
+            v_q=self.cache[1],
+            v_scale=self.cache[4],
+            offset=self.cache[2],
+            scale=float(scale),
+            bits=self.bits,
+            max_q_len=8,
+            max_offset=static_max_offset,
+        )
+        if out is not None:
+            self.paged_attention_calls += 1
+            self.attention_time_s += time.perf_counter() - started
+        return out
+
+    @property
+    def state(self):
+        from .kv_quant import dequantize_symmetric
+
+        keys = dequantize_symmetric(
+            self.cache[0],
+            self.cache[3],
+            bits=self.bits,
+            head_dim=self.head_dims[0],
+        ).astype(self.source_dtypes[0])
+        values = dequantize_symmetric(
+            self.cache[1],
+            self.cache[4],
+            bits=self.bits,
+            head_dim=self.head_dims[1],
+        ).astype(self.source_dtypes[1])
+        return keys, values
+
+    @state.setter
+    def state(self, value) -> None:
+        keys, values = value
+        if keys is None or values is None:
+            for slot in range(len(self.cache)):
+                if slot != 2:
+                    self.cache[slot] = None
+            self.offset = 0
+            return
+        paged = VllmMetalPagedKVCache(
+            block_size=int(self.block_size),
+            num_blocks=int(self.num_blocks),
+            kv_quant_config=self.kv_quant_config,
+        )
+        paged.update_without_fetch(keys, values)
+        promoted = type(self).from_paged_cache(paged)
+        self.cache = promoted.cache
+        self.rollback_state = [None, None, None, None, None]
+        self.num_blocks = int(promoted.num_blocks)
+        self.source_dtypes = promoted.source_dtypes
+        self.head_dims = promoted.head_dims
+
+    def trim(self, n: int) -> int:
+        import mlx.core as mx
+
+        n = int(n)
+        rollback = self.rollback_state
+        if (
+            all(rollback[slot] is not None for slot in range(5))
+            and int(rollback[1].shape[2]) == n
+        ):
+            for slot, buf_idx in ((1, 0), (2, 1), (3, 3), (4, 4)):
+                self.cache[buf_idx] = mx.slice_update(
+                    self.cache[buf_idx],
+                    rollback[slot],
+                    rollback[0],
+                    axes=(2,),
+                )
+            self.cache[2] = rollback[0]
+        else:
+            self.cache[2] = mx.maximum(
+                self.cache[2] - n,
+                mx.array(0, dtype=self.cache[2].dtype),
+            )
+        return n
+
+    def to_paged_cache(self) -> "VllmMetalPagedKVCache":
+        """Restore a stock quantized ``VllmMetalPagedKVCache`` (banks -> pages).
+
+        One transposed copy of the quantized payloads + scales — the inverse
+        of ``from_paged_cache`` and byte-exact with it (integer payloads,
+        fp32 scales). Shape/dtype metadata is rebuilt so the next
+        ``update_without_fetch`` appends in place instead of re-allocating,
+        and the restored cache re-latches its own numerics route.
+        """
+        import mlx.core as mx
+
+        paged = VllmMetalPagedKVCache(
+            block_size=int(self.block_size),
+            num_blocks=int(self.num_blocks),
+            kv_quant_config=self.kv_quant_config,
+        )
+        if self.cache[0] is None or self.cache[1] is None:
+            return paged
+        heads = int(self.cache[0].shape[1])
+
+        def pages(bank: Any) -> Any:
+            rows = mx.contiguous(bank[0].transpose(1, 0, 2))
+            return rows.reshape(
+                int(self.num_blocks),
+                int(self.block_size),
+                heads,
+                int(bank.shape[3]),
+            )
+
+        paged.key_cache = pages(self.cache[0])
+        paged.value_cache = pages(self.cache[1])
+        paged.key_scale_cache = pages(self.cache[3])
+        paged.value_scale_cache = pages(self.cache[4])
+        paged.offset = int(self.size())
+        paged._shape = (heads, int(self.head_dims[0]), int(self.head_dims[1]))
+        paged._dtypes = tuple(self.source_dtypes)
+        return paged
+
+    @property
+    def nbytes(self) -> int:
+        if self.cache[0] is None or self.cache[1] is None:
+            return 0
+        total = int(self.cache[2].nbytes)
+        for slot in (0, 1, 3, 4):
+            total += int(self.cache[slot].nbytes)
+        return total
+
+    def paged_stats(self) -> dict[str, int | float | str]:
+        stats = super().paged_stats()
+        stats["mode"] = "tensor_offset_quantized_paged"
+        stats["kv_quant_bits"] = int(self.bits)
+        return stats
+
+
 class OwnedRecurrentStateCache:
     """Fixed-shape recurrent cache with persistent owned state buffers.
 
