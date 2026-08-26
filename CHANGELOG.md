@@ -4,6 +4,45 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Machine memory governor** (issue #305). MTPLX now plans its memory
+  against the Mac it is actually on instead of assuming a 128 GB studio
+  machine. At startup the serve banner prints the machine plan (engine
+  budget, weights, resolved context window, session-bank budget); the
+  default context window is the largest one whose full-window KV really
+  fits (a 48 GB Mac serving the Speed model defaults to 196,608 tokens
+  instead of a physically impossible 262,144 — 128 GB machines are
+  unchanged), and an explicit `--context-window` above the fit still wins
+  but is flagged loudly. The session bank stays idle-aggressive and
+  yields dynamically as a long-context request's KV materializes, ahead
+  of any swap; macOS pressure and an earlier allocator-relative signal
+  drive the existing shedding guard. `/health`, the dashboard snapshot
+  and the app carry `memory_plan`, guard events, and a pressure banner.
+  `--memory-budget 48G` reproduces a real 48 GB seat exactly (test-pinned).
+- **Streaming SSD spill for large sessions** (issues #305, #323). Sessions
+  above the per-session RAM cap — exactly the 100k+-token coding-agent
+  sessions whose re-prefill costs minutes — now persist to the SSD tier
+  through a tensor-by-tensor streaming writer (bounded memory, same
+  on-disk format), instead of silently losing durability. Live-ref-only
+  sessions reach the SSD tier for the first time; every remaining skip is
+  recorded, never silent.
+
+### Fixed
+
+- Metal allocation failures are answered as structured
+  `insufficient_memory` (HTTP 507) errors with actionable advice, after
+  the engine sheds its caches — instead of anonymous `internal_error`
+  500s that left the next request to hit the same wall (issue #348 class).
+- `--memory-budget 48G` (the bare-suffix spelling MTPLX's own messages
+  advertise) crashed serve startup with a raw ValueError; single-letter
+  and terabyte size suffixes parse now.
+- The dashboard "RAM session cache" settings no longer invent `8G/4G`
+  when nothing is configured — they report the budgets the engine
+  actually resolved.
+
 ## [2.9.3] - 2026-08-26
 
 ### Fixed
