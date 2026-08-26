@@ -630,7 +630,10 @@ def _print_command_error(
     if detail:
         print(f"detail: {detail}")
     if error == "model is not available locally":
-        print(f"try: mtplx {command} --download --model {model}")
+        # `--download` only exists on `mtplx start`; every other command's
+        # download path is `mtplx pull` first (the old hint suggested a flag
+        # the parser rejects).
+        print(f"try: mtplx pull {model}")
         print("try: mtplx models")
 
 
