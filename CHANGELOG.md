@@ -4,6 +4,60 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.9.3] - 2026-08-26
+
+### Fixed
+
+- **The long-context decode cliff.** Past 131,072 prompt tokens dense decode
+  silently repaged into a cache layout that structurally excluded the packed
+  verify kernel, collapsing speculative decode to plain-AR speed (12.0 tok/s
+  at 147k on an M5 Max 128 GB). The dense-decode ceiling is now memory-aware
+  (`MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT=auto`, floored at the old
+  131,072 literal so smaller machines cannot regress), keeping the packed
+  lane engaged (16.3 tok/s at 147k; 18.4 with copy speculation off). The
+  resolver announces itself in the serve log, and an exported ceiling env
+  beats the profile instead of being silently stomped back.
+- **KV-cache quantization was effectively broken and is now usable.**
+  Enabling q8/q4 crashed serving at warmup; q4 additionally re-dequantized
+  the entire prefix every round, and quantized caches were refused by the
+  compiled verify bank. All three fixed: the crash is gone, q4 routes
+  through the exact packed-quant kernel via a persistent quantized bank,
+  and the verify bank promotes quantized paged caches. Measured cost at 16k
+  on an M5 Max vs off: q8 ≈ −4% decode, q4 ≈ −19% (down from crash / −50%).
+  Still opt-in — the remaining gap to zero-loss, and the slow quantized
+  lane past the dense ceiling, are known and being worked. A pre-existing
+  q4 numerics defect at head_dim 128 is fenced fail-closed (the shipped
+  head_dim 256 family is exact).
+- The dynamic-offset paged verify kernel had never compiled since its
+  introduction (a pointer-cast Metal bug hidden behind its own mask gate)
+  and crashed at q_len > 5 once compiled; both fixed. Still opt-in
+  (`MTPLX_PAGED_TAILMASK_ELIDE`) pending its serve verdict, but the crash
+  class is removed.
+- Warmup failures log their full traceback instead of a one-line skip.
+
+### Changed
+
+- **mlx floor raised to 0.32.2.** A clean same-wheel A/B on an M5 Max
+  measured 0.32.0 → 0.32.2 at +29% decode / +41% prefill at 88k context
+  (+31% at 16k); the floor converges existing installs onto that stack.
+- Every request row now records packed-route bail counters and
+  paged-adapter engagement, and `MTPLX_ROUTE_DEBUG=1` prints one line per
+  layer naming the attention branch taken and every gate input — the
+  decode cliff hid for months because fast lanes declined silently.
+
+### Added
+
+- Release-pin regression tests: the shipped profiles' fast-lane values
+  (compiled-verify ceiling, packed verify kernel, dense-decode ceiling),
+  operator-env-beats-profile precedence, and the mlx floor are now pinned
+  by tests so a silent lane loss fails CI instead of surfacing in a
+  benchmark weeks later.
+- Experimental, off by default: `--scheduler-mode hyper` (single-user
+  manufactured-concurrency chassis, trajectory-sha-exact vs serial),
+  `MTPLX_NAX_TILE_ROUTE` (first M5 tensor-unit attention kernel at decode
+  shapes), `MTPLX_ADAPTIVE_DTEMP`, `MTPLX_CCOPY_BANK_ROUTE`,
+  `MTPLX_FORKEV_TELEMETRY`.
+
 ## [2.9.2] - 2026-08-25
 
 ### Changed

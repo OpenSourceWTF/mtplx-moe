@@ -355,10 +355,16 @@ SUSTAINED_PREFILL_ENV = {
     **NATIVE_MTP_60_FAST_PATH_ENV,
     "MTPLX_SUSTAINED_PREFILL": "1",
     "MTPLX_SUSTAINED_PREFILL_LAYOUT": "auto",
-    # Keep the v0.2 sustained default through the 128k class: current release
-    # QA shows this is the better OpenCode/Pi user path for TTFT, prefill TPS,
-    # decode TPS, and memory than the short-lived dense/repage chunk split.
-    "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT": "131072",
+    # "auto" (2.9.3): memory-aware dense-decode ceiling, floored at the old
+    # 131072 literal so no machine regresses. The fixed 131072 was a memory
+    # guess, not a kernel envelope — past 2^17 tokens the auto layout repaged
+    # decode and structurally excluded the packed fast-SDPA lane (the 147.4k
+    # decode cliff: 12.0 -> 18.44 tok/s once dense decode holds; walk ladders
+    # show both kernels linear through 2^17, MEASUREMENTS 2026-08-26). The
+    # resolver budgets 15% of device RAM against the model's KV bytes/token
+    # (MTPLX_DENSE_KV_BYTES_PER_TOKEN) and announces its resolution in the
+    # serve log.
+    "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT": "auto",
     # MTPLX_PREFILL_CHUNK_SIZE is retained as a legacy single-knob fallback:
     # if set to a numeric value it overrides BOTH paths. "auto" resolves to
     # the per-layout defaults below, which intentionally match in product mode.

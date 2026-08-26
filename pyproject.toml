@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "2.9.2"
+version = "2.9.3"
 description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,7 +26,11 @@ dependencies = [
   # -U uses pip's only-if-needed strategy. Raising the floor converges every
   # install to the stack new installs already run (and the 2026-08-04
   # long-generation runs consistently read faster on 0.32.0).
-  "mlx>=0.32,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # Floor raised to 0.32.2 in 2.9.3: clean shipped-wheel A/B on M5 Max
+  # (2026-08-26, MEASUREMENTS 07:20) measured 0.32.0 -> 0.32.2 at +29%
+  # decode / +41% prefill @88.4k and +31% @16k — same wheel, same flags,
+  # only mlx differs. A 0.32.0 venv silently forfeits that; converge it.
+  "mlx>=0.32.2,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name
