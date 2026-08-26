@@ -359,11 +359,32 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 sdpa_gqa_packed_tail_grouped,
             )
 
+            output = None
+            # MTPLX_NAX_TILE_ROUTE (2026-08-26 hyper): TensorOps wide-M tile
+            # kernel for q_len >= 6 — the M-curve regime where the scalar
+            # kernels pay (Battery A + spot receipts: QL9 +34%/+45% at
+            # 71k/128k). Bails fall through to the scalar routes unchanged.
+            if _env_enabled("MTPLX_NAX_TILE_ROUTE") and int(queries.shape[2]) >= 6:
+                from .kernels.sdpa_nax_tile import sdpa_nax_tile
+
+                output = sdpa_nax_tile(
+                    queries=queries,
+                    keys=cache.keys,
+                    values=cache.values,
+                    offset=cache.offset,
+                    scale=self.scale,
+                )
+                if output is not None:
+                    self._mtplx_nax_tile_calls = (
+                        int(getattr(self, "_mtplx_nax_tile_calls", 0)) + 1
+                    )
+            if output is not None:
+                pass
             # Grouped wins past the second-bank register cliff: 2026-08-25
             # three-way sweep at 71k — bank2 ahead at QL5-6; grouped ahead
             # from QL7 (QL8 68.6 vs stock 83.7; QL9 with the mixed 4+5 v3
             # tail 61.1 vs stock 83.6, -27%).
-            if gqa_packed_wide and int(queries.shape[2]) >= 7:
+            elif gqa_packed_wide and int(queries.shape[2]) >= 7:
                 output = sdpa_gqa_packed_tail_grouped(
                     queries=queries,
                     keys=cache.keys,
