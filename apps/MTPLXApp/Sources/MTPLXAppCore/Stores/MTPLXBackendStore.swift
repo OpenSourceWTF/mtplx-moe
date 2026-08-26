@@ -171,6 +171,11 @@ public final class MTPLXBackendStore: ObservableObject {
     @Published public private(set) var sessionBank: SessionBank?
     @Published public private(set) var mem: MemSnapshot?
     @Published public private(set) var thermal: ThermalSnapshot?
+    /// Memory governor telemetry (issue #305): macOS/allocator pressure
+    /// level and the daemon's machine memory plan. 0 / nil until a
+    /// governor-aware daemon reports.
+    @Published public private(set) var memoryPressureLevel: Int = 0
+    @Published public private(set) var memoryPlan: MemoryPlanStatus?
     @Published public private(set) var settings: MutableSettings?
     @Published public private(set) var scheduler: DynamicObject?
     @Published public private(set) var prefillStatus: DynamicObject?
@@ -3670,6 +3675,8 @@ public final class MTPLXBackendStore: ObservableObject {
         sessionBank = snapshot.sessionBank
         mem = snapshot.mem
         thermal = snapshot.thermal
+        memoryPressureLevel = snapshot.memoryPressureLevel ?? 0
+        memoryPlan = snapshot.memoryPlan
         if daemonState == .running || supervisor.isRunning() {
             adoptDaemonSettings(snapshot.settings, persist: true)
         } else {

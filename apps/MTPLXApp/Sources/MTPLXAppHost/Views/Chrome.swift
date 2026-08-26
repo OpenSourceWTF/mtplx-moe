@@ -464,6 +464,65 @@ struct ThermalRuleBanner: View {
     }
 }
 
+// MARK: - MemoryGuardBanner
+
+/// Memory governor banner (issue #305). Shows while the daemon reports
+/// system/allocator memory pressure: the engine is already shedding its
+/// caches — this tells the user what that means and, when the plan knows
+/// the context window is overcommitted for this Mac, names the fix.
+struct MemoryGuardBanner: View {
+    let pressureLevel: Int
+    let plan: MemoryPlanStatus?
+
+    var body: some View {
+        if pressureLevel >= 2 {
+            let critical = pressureLevel >= 4
+            let tint = critical ? Brand.danger : Brand.warning
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "memorychip")
+                    .font(.title3)
+                    .foregroundStyle(tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(
+                        critical
+                            ? "Critical memory pressure"
+                            : "Memory pressure — engine shedding caches"
+                    )
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(tint)
+                    Text(message(critical: critical))
+                        .font(.caption)
+                        .foregroundStyle(Brand.textHighlight.opacity(0.75))
+                }
+                Spacer()
+            }
+            .padding(12)
+            .background {
+                RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                    .fill(tint.opacity(0.12))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                            .strokeBorder(tint.opacity(0.45), lineWidth: Brand.hairlineStrong)
+                    }
+            }
+        }
+    }
+
+    private func message(critical: Bool) -> String {
+        var text = critical
+            ? "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD."
+            : "Warm sessions are being demoted to SSD ahead of any swap. Turns may restore from disk (seconds) instead of RAM."
+        if let plan,
+           plan.contextOvercommitted == true,
+           let resolved = plan.contextWindowResolved,
+           let fit = plan.contextWindowFit
+        {
+            text += " Context window \(resolved) exceeds this Mac's fit of \(fit) tokens — lower it (or use q8 KV quantization) to stop this recurring."
+        }
+        return text
+    }
+}
+
 // MARK: - ConnectionIssueBanner
 
 /// Top-of-window banner when the SSE connection is reconnecting or failed.
