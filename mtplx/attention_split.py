@@ -311,6 +311,35 @@ def _install_split_attention_hook(attn: Any) -> bool:
             and hasattr(cache, "paged_attention")
             and can_slice_mask
         )
+        if _env_enabled("MTPLX_ROUTE_DEBUG"):
+            # One line per layer for the first 2 decode-shaped calls: which
+            # branch the ladder takes and why — the 147.4k lane went dark
+            # because every fast branch declined SILENTLY (2026-08-26).
+            dbg_count = int(getattr(self, "_mtplx_route_debug_calls", 0))
+            if dbg_count < 2 and int(queries.shape[2]) <= 16:
+                self._mtplx_route_debug_calls = dbg_count + 1
+                import sys as _sys
+
+                print(
+                    "mtplx_route_debug "
+                    f"layer={getattr(self, '_mtplx_full_attention_index', -1)} "
+                    f"q_len={int(queries.shape[2])} "
+                    f"cache={type(cache).__name__} "
+                    f"blockwise={blockwise_enabled} "
+                    f"vllm_flag={bool(getattr(self, '_mtplx_vllm_metal_paged_enabled', False))} "
+                    f"vllm_enabled={vllm_metal_paged_enabled} "
+                    f"vllm_should={should_use_vllm_metal_paged} "
+                    f"packed_enabled={gqa_packed_enabled} "
+                    f"packed_should={should_use_gqa_packed} "
+                    f"has_uwf={hasattr(cache, 'update_without_fetch')} "
+                    f"has_pa={hasattr(cache, 'paged_attention')} "
+                    f"keys_none={getattr(cache, 'keys', None) is None} "
+                    f"mask={type(mask).__name__} "
+                    f"can_slice={can_slice_mask} "
+                    f"twopass={should_use_2pass}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
         should_split = (
             cache is not None
             and getattr(self, "_mtplx_split_full_attention_explicit_enabled", False)
