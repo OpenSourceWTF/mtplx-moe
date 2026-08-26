@@ -16202,6 +16202,212 @@ async def _memory_pressure_loop(
             raise
 
 
+def _idle_pump_enabled() -> bool:
+    raw = str(os.environ.get("MTPLX_SSD_IDLE_PUMP", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+# The pump arms only after this much request-level quiet. Well above any
+# foreground->tail-postcommit gap (milliseconds) and above the scheduler's
+# own idle+quiet graces (~0.55 s), so an armed pump can never race a
+# latency-critical tail; well below the ~90 s background-warmup re-fire,
+# so durability lands before the warm ladder re-occupies the idle band.
+_IDLE_PUMP_AFTER_S = 5.0
+_IDLE_PUMP_INTERVAL_S = 2.0
+
+
+def _server_request_idle_s(state: "ServerState") -> float:
+    """Seconds since the last HTTP request activity; 0.0 while any is live.
+
+    Fresh boot (no request ever) counts as infinitely idle: pending
+    durability work (e.g. a re-dispatched encode) may drain freely."""
+    try:
+        if state.has_foreground():
+            return 0.0
+    except BaseException:
+        return 0.0
+    last = max(
+        float(getattr(state, "last_request_started_at", 0.0) or 0.0),
+        float(getattr(state, "last_request_at", 0.0) or 0.0),
+    )
+    if last <= 0.0:
+        return float("inf")
+    return max(0.0, time.time() - last)
+
+
+async def _idle_persistence_pump_loop(
+    state: "ServerState", *, interval_s: float = _IDLE_PUMP_INTERVAL_S
+) -> None:
+    """Guarantee the durability lane forward progress on an idle server.
+
+    Issue #290: the scheduler's persistence band is reachable only while
+    the idle_postcommit deque is COMPLETELY empty, so any self-chaining
+    idle occupant (the 2.8.2 background warm ladder ran rungs back-to-back
+    for minutes after the last request; 2.8.3's 90 s grace narrowed but
+    did not close the window) starves SSD session-cache writes forever —
+    entries sat in the RAM bank with every cold-tier counter at zero and
+    were lost on restart. An idle server is the BEST time to write: once
+    the server has seen several seconds of request-level quiet, arm one
+    pump slot per tick so the persistence head can bridge the chain's
+    not-yet-ready gaps. All existing protections stand: foreground always
+    wins, a foreground submission disarms the pump before admission, a
+    ready idle item still runs first, and the per-tensor encode abort +
+    writer pause keep yielding to real traffic.
+    """
+    scheduler = getattr(state, "model_scheduler", None)
+    if (
+        scheduler is None
+        or not hasattr(scheduler, "pump_persistence")
+        or not hasattr(scheduler, "persistence_pending")
+    ):
+        return
+    while True:
+        try:
+            if (
+                scheduler.persistence_pending() > 0
+                and _server_request_idle_s(state) >= _IDLE_PUMP_AFTER_S
+                and not scheduler.foreground_pending_or_active()
+            ):
+                scheduler.pump_persistence(budget=1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            raise
+
+
+def _shutdown_flush_timeout_s() -> float:
+    """Bounded best-effort window for the shutdown cold-write flush.
+
+    Matches EngineSessionManager.flush_cold_tier's historical 10 s bound.
+    MTPLX_SHUTDOWN_SSD_FLUSH_S overrides; 0 disables the flush entirely.
+    """
+    raw = str(os.environ.get("MTPLX_SHUTDOWN_SSD_FLUSH_S", "")).strip()
+    if not raw:
+        return 10.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    if value != value or value < 0.0:
+        return 10.0
+    return min(value, 60.0)
+
+
+def _shutdown_flush_cold_writes(state: "ServerState") -> dict[str, Any]:
+    """Best-effort, bounded flush of pending SSD session-cache writes.
+
+    Issue #290 (secondary): lifespan shutdown used to go straight to
+    ``scheduler.shutdown(cancel_futures=True)`` — queued persistence
+    encodes were CANCELLED and the writer queue was never drained, so a
+    plain SIGTERM/Ctrl-C silently lost every entry still in flight and the
+    next boot paid a full re-prefill. This runs BEFORE the scheduler
+    shutdown: pump the persistence lane (the owner thread is still alive
+    and no foreground exists during shutdown), then wait out the writer
+    queue's task accounting. Bounded and honest — one console line says
+    how many writes flushed and how many remained.
+    """
+    outcome = {"pending_before": 0, "flushed": 0, "remained": 0, "elapsed_s": 0.0}
+    budget_s = _shutdown_flush_timeout_s()
+    scheduler = getattr(state, "model_scheduler", None)
+    cold_tier = getattr(state, "session_bank_cold_tier", None)
+    sessions = getattr(state, "sessions", None)
+    if budget_s <= 0.0 or cold_tier is None:
+        return outcome
+
+    def _writer_outstanding() -> int:
+        """Staged writes not yet durable — INCLUDING the in-flight one.
+
+        ``writer_queue_depth`` alone misses the write the writer thread
+        has already popped and is moving to disk (measured live: a 619 MB
+        entry showed depth 0 / enqueued 1 / completed 0 while its file was
+        mid-write; an early exit on depth alone let the daemon writer die
+        mid-file). This mirrors the tier's ``flush()`` task accounting.
+        """
+        try:
+            stats = cold_tier.stats()
+            outstanding = (
+                int(stats.get("writes_enqueued") or 0)
+                - int(stats.get("writes_completed") or 0)
+                - int(stats.get("write_failures") or 0)
+                - int(stats.get("writes_cancelled") or 0)
+            )
+            return max(0, outstanding)
+        except BaseException:
+            return 0
+
+    def _persistence_pending() -> int:
+        if scheduler is None or not hasattr(scheduler, "persistence_pending"):
+            return 0
+        try:
+            return int(scheduler.persistence_pending())
+        except BaseException:
+            return 0
+
+    def _persistence_active() -> bool:
+        # A popped encode no longer counts as pending but is still moving
+        # bytes (spill_entry writes blobs directly on the owner thread);
+        # the flush must outwait it or report it as remained.
+        if scheduler is None or not hasattr(scheduler, "stats"):
+            return False
+        try:
+            return scheduler.stats().get("active_kind") == "idle_persistence"
+        except BaseException:
+            return False
+
+    started = time.monotonic()
+    deadline = started + budget_s
+    pending = _persistence_pending() + _writer_outstanding()
+    if pending <= 0 and not _persistence_active():
+        return outcome
+    if _persistence_active():
+        # The running encode is real outstanding work too.
+        pending += 1
+    outcome["pending_before"] = pending
+    print(
+        f"[mtplx] shutdown: flushing {pending} pending SSD session-cache "
+        f"write(s) (bounded {budget_s:.0f}s)...",
+        flush=True,
+    )
+    # Drain the un-run encodes first: each needs an owner-thread slot, and
+    # during shutdown the only possible idle-band occupants are background
+    # chains — exactly what the pump bridges.
+    while (
+        _persistence_pending() > 0 or _persistence_active()
+    ) and time.monotonic() < deadline:
+        try:
+            if scheduler is not None and hasattr(scheduler, "pump_persistence"):
+                scheduler.pump_persistence(budget=4)
+        except BaseException:
+            break
+        time.sleep(0.05)
+    # Then the staged writer queue (file IO on the writer thread).
+    remaining_s = max(0.1, deadline - time.monotonic())
+    flush = getattr(sessions, "flush_cold_tier", None) if sessions is not None else None
+    try:
+        if callable(flush):
+            flush(timeout_s=remaining_s)
+        elif hasattr(cold_tier, "flush"):
+            cold_tier.flush(timeout_s=remaining_s)
+    except BaseException:
+        pass
+    remained = _persistence_pending() + _writer_outstanding()
+    outcome["remained"] = remained
+    outcome["flushed"] = max(0, pending - remained)
+    outcome["elapsed_s"] = round(time.monotonic() - started, 2)
+    print(
+        "[mtplx] shutdown: SSD session cache flushed "
+        f"{outcome['flushed']}/{pending} pending write(s) in "
+        f"{outcome['elapsed_s']}s"
+        + (f"; {remained} remained (bound hit)" if remained else ""),
+        flush=True,
+    )
+    return outcome
+
+
 async def _thermal_poll_loop(state: "ServerState", *, interval_s: float = 1.0) -> None:
     """Optional background sampler that publishes fan snapshots to the bus.
 
@@ -25624,6 +25830,14 @@ def create_app(state: ServerState) -> FastAPI:
             bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
         if _memory_pressure_guard_enabled():
             bg_tasks.append(asyncio.create_task(_memory_pressure_loop(state)))
+        if (
+            _idle_pump_enabled()
+            and getattr(state, "session_bank_cold_tier", None) is not None
+        ):
+            # Issue #290: guarantee SSD session-cache writes forward
+            # progress once the server goes request-idle (the persistence
+            # band otherwise starves behind any chaining idle occupant).
+            bg_tasks.append(asyncio.create_task(_idle_persistence_pump_loop(state)))
         retrieval = getattr(state, "retrieval", None)
         if retrieval is not None and retrieval.idle_timeout_s > 0:
             bg_tasks.append(asyncio.create_task(_retrieval_idle_loop(state)))
@@ -25640,6 +25854,15 @@ def create_app(state: ServerState) -> FastAPI:
                 pass
             for task in bg_tasks:
                 task.cancel()
+            # Issue #290: BEFORE the scheduler shutdown cancels queued
+            # futures, give pending SSD session-cache writes a bounded
+            # best-effort flush — a plain SIGTERM/Ctrl-C used to silently
+            # lose every entry still in flight, and the next boot paid a
+            # full re-prefill. Off-loop so a second Ctrl-C stays live.
+            try:
+                await asyncio.to_thread(_shutdown_flush_cold_writes, state)
+            except Exception:
+                pass
             mtp_batch_service = getattr(state, "mtp_batch_service", None)
             if mtp_batch_service is not None:
                 mtp_batch_service.shutdown()

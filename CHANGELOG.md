@@ -58,6 +58,19 @@ All notable user-facing changes to MTPLX. The format is based on
   persists a truthful `tool_not_executed` result for any tool call
   that finishes past the chat's tool-round budget, so replayed
   transcripts never show the model an unanswered tool call.
+- **SSD session-cache writes no longer starve on an idle server, and
+  shutdown flushes them** (issue #290). The scheduler's durability lane
+  was only reachable while the idle band was completely empty, so any
+  self-chaining background occupant (the background warm ladder) could
+  hold SSD writes off forever — entries sat in RAM with every cold-tier
+  counter at zero and vanished on restart, costing a full re-prefill.
+  The server now pumps the durability lane within seconds of going
+  request-idle (foreground work still always wins, and the pump disarms
+  the moment a request arrives), and a plain SIGTERM/Ctrl-C gives
+  pending writes a bounded best-effort flush (default 10 s,
+  `MTPLX_SHUTDOWN_SSD_FLUSH_S` overrides, `0` disables) with one honest
+  console line — including the write the SSD writer thread already has
+  in flight, which the old shutdown killed mid-file.
 - Metal allocation failures are answered as structured
   `insufficient_memory` (HTTP 507) errors with actionable advice, after
   the engine sheds its caches — instead of anonymous `internal_error`
