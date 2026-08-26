@@ -896,6 +896,27 @@ def test_production_budget_rejects_quantized_ngram_storage() -> None:
         )
 
 
+def test_production_budget_rejects_unapproved_eviction_policy() -> None:
+    gib = 1024**3
+    with pytest.raises(ValueError, match="production eviction"):
+        plan_production_ngram_cache(
+            planning_manifest("bf16"),
+            NGramRuntimeBudget(
+                measured_base_residency_bytes=64 * gib,
+                kv_mtp_reserve_bytes=2 * gib,
+                metal_working_reserve_bytes=2 * gib,
+                safety_margin_bytes=2 * gib,
+                minimum_payload_bytes=1 * gib,
+                allocation_alignment_bytes=16 * 1024,
+            ),
+            transient_limit_bytes=1024**2,
+            max_inflight_io_bytes=1024**2,
+            max_open_files=129,
+            bypass_page_cache=True,
+            eviction="frequency",
+        )
+
+
 def test_planner_rejects_packed_index_overflow() -> None:
     manifest = planning_manifest("bf16")
     config = NGramCacheConfig(

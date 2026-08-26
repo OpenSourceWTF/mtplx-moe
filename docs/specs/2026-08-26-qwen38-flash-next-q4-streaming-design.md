@@ -351,7 +351,7 @@ The task is complete only when all of the following are current and evidenced:
 
 Random rows may cause page amplification or first-layer compute may be too
 short to hide storage latency. Guarded lookup traces outside the production hot
-path select LRU or frequency/CLOCK-like eviction from measured reuse behavior.
+path select LRU or CLOCK eviction from measured reuse behavior.
 The BF16 lane measures cache hit rate, coalesced bytes, I/O wait at the layer-2
 boundary, and end-to-end wall time outside the measured hot path. Eviction can
 only cause an exact SSD reload; it cannot change numerical results. The port is

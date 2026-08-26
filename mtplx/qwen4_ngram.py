@@ -1519,6 +1519,11 @@ def plan_production_ngram_cache(
         raise ValueError("the pinned production n-gram table must remain exact BF16")
     if type(budget) is not NGramRuntimeBudget:
         raise TypeError("budget must be an exact NGramRuntimeBudget")
+    if eviction != "lru":
+        raise ValueError(
+            "production eviction must remain 'lru' until a measured CLOCK lane "
+            "is construction-approved"
+        )
     fixed_runtime_bytes = _checked_add_bytes(
         budget.measured_base_residency_bytes,
         budget.kv_mtp_reserve_bytes,
