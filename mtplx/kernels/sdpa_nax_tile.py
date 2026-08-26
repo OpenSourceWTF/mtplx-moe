@@ -54,12 +54,14 @@ inline short2 nax_get_coord(ushort lid) {
 _SOURCE = r"""
     constexpr int TK = 32;               // keys per tile
     constexpr int MROWS = 16;            // M rows per simdgroup
-    constexpr int LIVE = GQA_F * QL;     // live M rows per KV head (24)
+    constexpr int LIVE = GQA_F * QL;     // live M rows per KV head
+    constexpr int NSGS = (LIVE + MROWS - 1) / MROWS;  // simdgroups (M pad /16)
+    constexpr int NTHREADS = NSGS * 32;
     constexpr int DFRAGS = D / 16;       // 16 K-frags along head dim
     constexpr int NGROUPS = D / 32;      // 8 PV output column groups
 
-    const uint lid64 = thread_position_in_threadgroup.x;      // 0..63
-    const uint sg = lid64 >> 5;                               // simdgroup 0/1
+    const uint lid64 = thread_position_in_threadgroup.x;      // 0..NTHREADS-1
+    const uint sg = lid64 >> 5;                               // simdgroup id
     const ushort lane = ushort(lid64 & 31);
     const int kv_head = int(threadgroup_position_in_grid.x);
     const int block_idx = int(threadgroup_position_in_grid.z);
@@ -76,11 +78,11 @@ _SOURCE = r"""
     const short2 sc = nax_get_coord(lane);
     const int m_base = int(sg) * MROWS;   // rows [m_base, m_base+16) of the 32-pad
 
-    // Threadgroup staging: V transposed tile [D][TK] bf16-class + P + factors.
-    threadgroup InT tg_vT[D * TK];        // 16 KB at D=256
-    threadgroup float tg_S[2 * MROWS * TK];   // 4 KB
-    threadgroup InT tg_P[2 * MROWS * TK];     // 2 KB
-    threadgroup float tg_f[2 * MROWS];
+    // Threadgroup staging: only the transposed V tile. S and P never leave
+    // registers — the fragment coord map makes the exp'd S fragment the PV
+    // left operand directly, and row max/sum reduce over the 4 lanes sharing
+    // a row (lane bits 0 and 3) via two simd shuffles.
+    threadgroup InT tg_vT[D * TK];              // 16 KB at D=256
 
     const device InT* k_head = keys + (size_t)kv_head * kcap * D;
     const device InT* v_head = values + (size_t)kv_head * kcap * D;
@@ -97,136 +99,152 @@ _SOURCE = r"""
     auto ct_b = mm.get_right_input_cooperative_tensor<InT, InT, float>();
     auto ct_c = mm.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
 
-    // Per-thread state: online softmax (row-owner threads) + O fragments.
-    float row_m = -1e38f;   // owned row max (threads 0..15 of each sg)
-    float row_l = 0.0f;     // owned row sumexp
+    // Per-thread state: each thread carries TWO rows (i=0: sc.y, i=1: sc.y+8)
+    // of online-softmax state, replicated across the 4 lanes sharing the row.
+    float row_m[2] = {-1e38f, -1e38f};
+    float row_l[2] = {0.0f, 0.0f};
     float o_frag[NGROUPS][2][kElemsPerFrag];
     for (int g = 0; g < NGROUPS; g++)
       for (int h = 0; h < 2; h++)
         for (int i = 0; i < kElemsPerFrag; i++) o_frag[g][h][i] = 0.0f;
 
     for (int t0 = kv_start; t0 < kv_end; t0 += TK) {
-      // ── stage V^T tile (all 64 threads, coalesced read) ──
-      for (int idx = int(lid64); idx < TK * D; idx += 64) {
-        const int p = idx / D;           // key row in tile
-        const int d = idx % D;
+      // ── stage V^T tile (all 64 threads, vectorized coalesced read;
+      //     transpose scatter lands in threadgroup memory, which is cheap) ──
+      for (int idx4 = int(lid64); idx4 < TK * (D / 4); idx4 += NTHREADS) {
+        const int p = idx4 / (D / 4);    // key row in tile
+        const int d4 = idx4 % (D / 4);
         const int gp = t0 + p;
-        tg_vT[d * TK + p] = (gp < kv_end)
-            ? v_head[(size_t)gp * D + d] : InT(0);
+        vec<InT, 4> v4 = vec<InT, 4>(InT(0));
+        if (gp < kv_end) {
+          const device vec<InT, 4>* src = reinterpret_cast<const device vec<InT, 4>*>(
+              v_head + (size_t)gp * D + d4 * 4);
+          v4 = src[0];
+        }
+        for (short e = 0; e < 4; e++)
+          tg_vT[(d4 * 4 + e) * TK + p] = v4[e];
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       // ── QK: S[16,32] += Q[16,256] x Ktile[32,256]^T ──
-      float s_frag[2][kElemsPerFrag];
-      for (int h = 0; h < 2; h++)
-        for (int i = 0; i < kElemsPerFrag; i++) s_frag[h][i] = 0.0f;
+      // ct_c accumulates in place across all DFRAGS runs (single S tile).
+      const bool tile_full = (t0 + TK) <= kv_end;
+      for (short i = 0; i < 2 * kElemsPerFrag; i++) ct_c[i] = 0.0f;
 
       for (int kk = 0; kk < DFRAGS; kk++) {
-        // left: Q fragment [16,16] at rows m_base+, dims kk*16 (zero-pad dead rows)
+        // left: Q fragment [16,16] at rows m_base+, dims kk*16 (zero-pad dead
+        // rows). 4 contiguous bf16 per (i) = one 8-byte vector load.
         for (short i = 0; i < 2; i++) {
-          for (short j = 0; j < kElemCols; j++) {
-            const int mr = m_base + sc.y + i * kElemRowsJump;
-            ct_a[i * kElemCols + j] = (mr < LIVE)
-                ? q_head[(size_t)mr * D + kk * 16 + sc.x + j] : InT(0);
+          const int mr = m_base + sc.y + i * kElemRowsJump;
+          if (mr < LIVE) {
+            const device vec<InT, 4>* qv = reinterpret_cast<const device vec<InT, 4>*>(
+                q_head + (size_t)mr * D + kk * 16 + sc.x);
+            const vec<InT, 4> qq = qv[0];
+            for (short j = 0; j < kElemCols; j++)
+              ct_a[i * kElemCols + j] = qq[j];
+          } else {
+            for (short j = 0; j < kElemCols; j++)
+              ct_a[i * kElemCols + j] = InT(0);
           }
         }
         // right: K tile halves [16,16] rows t0+, dims kk*16 (transpose_b)
         for (short hh = 0; hh < 2; hh++) {
           for (short i = 0; i < 2; i++) {
-            for (short j = 0; j < kElemCols; j++) {
-              const int kr = t0 + hh * 16 + sc.y + i * kElemRowsJump;
-              ct_b[hh * kElemsPerFrag + i * kElemCols + j] = (kr < kv_end)
-                  ? k_head[(size_t)kr * D + kk * 16 + sc.x + j] : InT(0);
+            const int kr = t0 + hh * 16 + sc.y + i * kElemRowsJump;
+            if (tile_full || kr < kv_end) {
+              const device vec<InT, 4>* kvv = reinterpret_cast<const device vec<InT, 4>*>(
+                  k_head + (size_t)kr * D + kk * 16 + sc.x);
+              const vec<InT, 4> kk4 = kvv[0];
+              for (short j = 0; j < kElemCols; j++)
+                ct_b[hh * kElemsPerFrag + i * kElemCols + j] = kk4[j];
+            } else {
+              for (short j = 0; j < kElemCols; j++)
+                ct_b[hh * kElemsPerFrag + i * kElemCols + j] = InT(0);
             }
           }
         }
-        for (short i = 0; i < 2 * kElemsPerFrag; i++)
-          ct_c[i] = (kk == 0) ? 0.0f
-              : ((i < kElemsPerFrag) ? s_frag[0][i] : s_frag[1][i - kElemsPerFrag]);
         mm.run(ct_a, ct_b, ct_c);
-        for (short i = 0; i < kElemsPerFrag; i++) {
-          s_frag[0][i] = ct_c[i];
-          s_frag[1][i] = ct_c[kElemsPerFrag + i];
-        }
       }
-
-      // S fragments -> threadgroup (scaled)
-      for (short hh = 0; hh < 2; hh++) {
+      // ── in-register masked softmax over the S fragments ──
+      // s_p[hh][i*4+j]: row = m_base + sc.y + i*8, col = t0 + hh*16 + sc.x + j.
+      float s_p[2][kElemsPerFrag];
+      float tile_f[2];
+      {
+        float tmax[2] = {-1e38f, -1e38f};
         for (short i = 0; i < 2; i++) {
-          for (short j = 0; j < kElemCols; j++) {
-            const int r = sc.y + i * kElemRowsJump;           // 0..15
-            const int c = hh * 16 + sc.x + j;                 // 0..31
-            tg_S[(m_base + r) * TK + c] = s_frag[hh][i * kElemCols + j] * scale;
+          const int m_local = m_base + sc.y + i * kElemRowsJump;
+          const int row_limit = tail_lo + (m_local % QL);
+          const bool live = m_local < LIVE;
+          for (short hh = 0; hh < 2; hh++) {
+            for (short j = 0; j < kElemCols; j++) {
+              const int gp = t0 + hh * 16 + sc.x + j;
+              const float raw = ct_c[hh * kElemsPerFrag + i * kElemCols + j];
+              const bool vis = live && gp < kv_end && gp <= row_limit;
+              const float s = vis ? raw * scale : -1e38f;
+              s_p[hh][i * kElemCols + j] = s;
+              tmax[i] = metal::max(tmax[i], s);
+            }
           }
         }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-
-      // ── per-row online softmax (threads 0..15 of each sg own a row) ──
-      if (lane < MROWS) {
-        const int m_local = m_base + int(lane);
-        const int j_row = m_local % QL;                 // QL index of this row
-        const int row_limit = tail_lo + j_row;          // visible: n <= row_limit
-        float tmax = -1e38f;
-        for (int c = 0; c < TK; c++) {
-          const int gp = t0 + c;
-          float s = (gp < kv_end && gp <= row_limit && m_local < LIVE)
-              ? tg_S[m_local * TK + c] : -1e38f;
-          tg_S[m_local * TK + c] = s;
-          tmax = metal::max(tmax, s);
+        // reduce max across the 4 lanes sharing each row (lane bits 0, 3)
+        for (short i = 0; i < 2; i++) {
+          tmax[i] = metal::max(tmax[i], simd_shuffle_xor(tmax[i], ushort(1)));
+          tmax[i] = metal::max(tmax[i], simd_shuffle_xor(tmax[i], ushort(8)));
+          const float new_m = metal::max(row_m[i], tmax[i]);
+          tile_f[i] = metal::exp(row_m[i] - new_m);
+          float tsum = 0.0f;
+          for (short hh = 0; hh < 2; hh++) {
+            for (short j = 0; j < kElemCols; j++) {
+              const float s = s_p[hh][i * kElemCols + j];
+              const float p = (s > -1e37f) ? metal::exp(s - new_m) : 0.0f;
+              s_p[hh][i * kElemCols + j] = p;
+              tsum += p;
+            }
+          }
+          tsum += simd_shuffle_xor(tsum, ushort(1));
+          tsum += simd_shuffle_xor(tsum, ushort(8));
+          row_m[i] = new_m;
+          row_l[i] = row_l[i] * tile_f[i] + tsum;
         }
-        const float new_m = metal::max(row_m, tmax);
-        const float f = metal::exp(row_m - new_m);
-        float tsum = 0.0f;
-        for (int c = 0; c < TK; c++) {
-          const float s = tg_S[m_local * TK + c];
-          const float p = (s > -1e37f) ? metal::exp(s - new_m) : 0.0f;
-          tg_P[m_local * TK + c] = InT(p);
-          tsum += p;
-        }
-        row_m = new_m;
-        row_l = row_l * f + tsum;
-        tg_f[m_local] = f;
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      // ── O rescale by this tile's factor ──
+      // ── O rescale by this tile's factors ──
       for (short i = 0; i < 2; i++) {
-        const float f = tg_f[m_base + sc.y + i * kElemRowsJump];
+        const float f = tile_f[i];
         for (int g = 0; g < NGROUPS; g++)
           for (short hh = 0; hh < 2; hh++)
             for (short j = 0; j < kElemCols; j++)
-              // elements (i, j) of half hh share the row sc.y + i*8
               o_frag[g][hh][i * kElemCols + j] *= f;
       }
 
       // ── PV: O[16, 32g..] += P[16,32] x (V^T)[32dims,32keys]^T ──
+      // ct_c holds one O group across both K-frags (init from o_frag,
+      // write back once); threadgroup loads vectorized 4-wide.
       for (int g = 0; g < NGROUPS; g++) {
+        for (short i = 0; i < kElemsPerFrag; i++) {
+          ct_c[i] = o_frag[g][0][i];
+          ct_c[kElemsPerFrag + i] = o_frag[g][1][i];
+        }
         for (int kk = 0; kk < 2; kk++) {          // 32 keys = 2 K-frags
-          for (short i = 0; i < 2; i++) {
-            for (short j = 0; j < kElemCols; j++) {
-              const int r = m_base + sc.y + i * kElemRowsJump;
-              ct_a[i * kElemCols + j] = tg_P[r * TK + kk * 16 + sc.x + j];
-            }
-          }
+          // P fragment IS the exp'd S fragment for this key half — registers.
+          for (short i = 0; i < 2; i++)
+            for (short j = 0; j < kElemCols; j++)
+              ct_a[i * kElemCols + j] = InT(s_p[kk][i * kElemCols + j]);
           for (short hh = 0; hh < 2; hh++) {
             for (short i = 0; i < 2; i++) {
-              for (short j = 0; j < kElemCols; j++) {
-                const int dcol = g * 32 + hh * 16 + sc.y + i * kElemRowsJump;
-                ct_b[hh * kElemsPerFrag + i * kElemCols + j] =
-                    tg_vT[dcol * TK + kk * 16 + sc.x + j];
-              }
+              const int dcol = g * 32 + hh * 16 + sc.y + i * kElemRowsJump;
+              const threadgroup vec<InT, 4>* vv = reinterpret_cast<const threadgroup vec<InT, 4>*>(
+                  tg_vT + dcol * TK + kk * 16 + sc.x);
+              const vec<InT, 4> v4 = vv[0];
+              for (short j = 0; j < kElemCols; j++)
+                ct_b[hh * kElemsPerFrag + i * kElemCols + j] = v4[j];
             }
           }
-          for (short i = 0; i < kElemsPerFrag; i++) {
-            ct_c[i] = o_frag[g][0][i];
-            ct_c[kElemsPerFrag + i] = o_frag[g][1][i];
-          }
           mm.run(ct_a, ct_b, ct_c);
-          for (short i = 0; i < kElemsPerFrag; i++) {
-            o_frag[g][0][i] = ct_c[i];
-            o_frag[g][1][i] = ct_c[kElemsPerFrag + i];
-          }
+        }
+        for (short i = 0; i < kElemsPerFrag; i++) {
+          o_frag[g][0][i] = ct_c[i];
+          o_frag[g][1][i] = ct_c[kElemsPerFrag + i];
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -244,12 +262,15 @@ _SOURCE = r"""
           for (short j = 0; j < kElemCols; j++)
             prow[g * 32 + hh * 16 + sc.x + j] = InT(o_frag[g][hh][i * kElemCols + j]);
     }
-    if (lane < MROWS) {
-      const int m_local = m_base + int(lane);
-      if (m_local < LIVE) {
-        const int hq_row = kv_head * LIVE + m_local;
-        sums[hq_row * n_blocks + block_idx] = row_l;
-        maxs[hq_row * n_blocks + block_idx] = (row_l > 0.0f) ? row_m : -1e38f;
+    // Stats: one designated lane per row (lane bits 0 and 3 clear) writes.
+    if ((lane & 0x9) == 0) {
+      for (short i = 0; i < 2; i++) {
+        const int m_local = m_base + sc.y + i * kElemRowsJump;
+        if (m_local < LIVE) {
+          const int hq_row = kv_head * LIVE + m_local;
+          sums[hq_row * n_blocks + block_idx] = row_l[i];
+          maxs[hq_row * n_blocks + block_idx] = (row_l[i] > 0.0f) ? row_m[i] : -1e38f;
+        }
       }
     }
 """
@@ -299,9 +320,9 @@ def sdpa_nax_tile(
     if hk <= 0 or hq % hk:
         return _bail("gqa_heads")
     gqa_factor = hq // hk
-    if gqa_factor * q_len > 32:
-        return _bail("m_rows_gt_32")
-    if q_len < 1 or q_len > 8:
+    if gqa_factor * q_len > 64:
+        return _bail("m_rows_gt_64")
+    if q_len < 1 or q_len > 10:
         return _bail("q_len")
     if queries.dtype not in (mx.bfloat16, mx.float16):
         return _bail("query_dtype")
@@ -343,8 +364,8 @@ def sdpa_nax_tile(
                 ("QL", q_len),
                 ("GQA_F", gqa_factor),
             ],
-            grid=(hk * 64, 1, blocks),
-            threadgroup=(64, 1, 1),
+            grid=(hk * 32 * ((gqa_factor * q_len + 15) // 16), 1, blocks),
+            threadgroup=(32 * ((gqa_factor * q_len + 15) // 16), 1, 1),
             output_shapes=[partial_shape, stats_shape, stats_shape],
             output_dtypes=[queries.dtype, mx.float32, mx.float32],
         )

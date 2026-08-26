@@ -36,7 +36,8 @@ def _ref_tail_causal(q, k, v, offset, scale, q_len):
 @pytest.mark.parametrize("ctx,q_len", [
     (512, 4), (2048, 4), (4096, 4), (2048, 2), (2048, 5),
     (1023, 4),   # non-tile-aligned context
-    (2048, 8),   # wide-QL (M=48 > 32 -> kernel must bail, not miscompute)
+    (2048, 8),   # wide-QL M=48 (3 simdgroups)
+    (2048, 9),   # wide-QL M=54 (4 simdgroups, padded)
 ])
 def test_nax_tile_matches_reference(ctx, q_len):
     mx.random.seed(7)
@@ -48,8 +49,8 @@ def test_nax_tile_matches_reference(ctx, q_len):
     scale = 1.0 / math.sqrt(D)
 
     out = sdpa_nax_tile(queries=q, keys=k, values=v, offset=ctx, scale=scale)
-    if HQ // HKV * q_len > 32:
-        assert out is None, "M>32 must bail to fallback"
+    if HQ // HKV * q_len > 64:
+        assert out is None, "M>64 must bail to fallback"
         return
     assert out is not None, "kernel bailed on a supported shape"
     mx.eval(out)
