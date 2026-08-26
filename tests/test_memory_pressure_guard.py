@@ -130,6 +130,111 @@ def test_guard_core_recovery_clears_pending_action():
     assert g.decide(1, now=200.0, busy=False) is False
 
 
+class FakeDynamicBank(FakeBank):
+    """FakeBank + the dynamic-ceiling interface (memory governor, #305)."""
+
+    def __init__(self, total, max_bytes, ceiling):
+        super().__init__(total, max_bytes)
+        self.dynamic_ceiling_fn = lambda: ceiling
+        self._ceiling = ceiling
+
+    def effective_max_bytes(self):
+        return min(self.max_bytes, self._ceiling)
+
+
+def test_dynamic_ceiling_enforced_every_tick_even_at_level_normal(monkeypatch):
+    # A long-context prefill grows KV for minutes with no put() running;
+    # the loop must walk the bank down to the ceiling without waiting for
+    # a macOS pressure edge.
+    bank = FakeDynamicBank(total=8 << 30, max_bytes=8 << 30, ceiling=2 << 30)
+    state = make_state(bank)
+    run_one_tick(state, level=1, monkeypatch=monkeypatch)
+    assert bank.calls == [(2 << 30, "dynamic_ceiling")]
+    events = list(state.dashboard.memory_guard_events)
+    assert events and events[-1]["action"] == "dynamic_ceiling"
+
+
+def test_dynamic_ceiling_within_slack_is_left_alone(monkeypatch):
+    # 128 MiB over the ceiling is inside the 256 MiB slack: no churn.
+    bank = FakeDynamicBank(
+        total=(2 << 30) + (128 << 20), max_bytes=8 << 30, ceiling=2 << 30
+    )
+    state = make_state(bank)
+    run_one_tick(state, level=1, monkeypatch=monkeypatch)
+    assert bank.calls == []
+
+
+def test_allocator_pressure_escalates_before_macos(monkeypatch):
+    # macOS says normal, but the allocator sits at 99% of the Metal limit:
+    # the guard must act as WARNING now, not minutes into the swap.
+    bank = FakeBank(total=8 << 30, max_bytes=8 << 30)
+    state = make_state(bank)
+    state.metal_memory_caps = {"memory_limit_bytes": 100 << 30}
+    monkeypatch.setattr(
+        srv,
+        "_mlx_memory_stats_live",
+        lambda: {
+            "ok": True,
+            "active_memory_bytes": 95 << 30,
+            "cache_memory_bytes": 4 << 30,
+        },
+    )
+    run_one_tick(state, level=1, monkeypatch=monkeypatch)
+    assert bank.calls == [(4 << 30, "memory_pressure_warning")]
+    assert state.dashboard.last_memory_pressure_level == 2
+    events = list(state.dashboard.memory_guard_events)
+    assert events and events[-1]["level_source"] == "allocator"
+
+
+def test_allocator_pressure_below_threshold_stays_normal():
+    state = make_state(FakeBank(total=0, max_bytes=1 << 30))
+    state.metal_memory_caps = {"memory_limit_bytes": 100 << 30}
+    level, fraction = srv._allocator_pressure_level(state)
+    # _mlx_memory_stats_live runs for real here; whatever it reports on a
+    # quiet test process is far below 97% of a 100 GiB limit.
+    assert level == 1
+    assert fraction < 0.97
+
+
+def test_is_allocation_failure_classifier():
+    assert srv._is_allocation_failure(MemoryError("x"))
+    assert srv._is_allocation_failure(
+        RuntimeError(
+            "[metal::malloc] Attempting to allocate 21474836480 bytes which is "
+            "greater than the maximum allowed buffer size of 17179869184 bytes."
+        )
+    )
+    assert srv._is_allocation_failure(
+        RuntimeError(
+            "[METAL] Command buffer execution failed: Insufficient Memory "
+            "(kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        )
+    )
+    assert not srv._is_allocation_failure(RuntimeError("shape mismatch"))
+    assert not srv._is_allocation_failure(ValueError("failed to allocate"))
+
+
+def test_allocation_failure_becomes_shed_plus_507():
+    bank = FakeDynamicBank(total=8 << 30, max_bytes=8 << 30, ceiling=8 << 30)
+    state = make_state(bank)
+    state.memory_plan = SimpleNamespace(
+        context_overcommitted=True,
+        context_window_resolved=262_144,
+        context_window_fit=196_608,
+    )
+    exc = srv._allocation_failure_http_exception(
+        state, RuntimeError("Insufficient Memory")
+    )
+    assert exc.status_code == 507
+    assert "insufficient memory" in str(exc.detail)
+    # The advice names the user's own overcommit, not a generic tip.
+    assert "196608" in str(exc.detail).replace(",", "")
+    # The shed ran: bank asked to drop to half its effective budget.
+    assert bank.calls and bank.calls[0] == (4 << 30, "allocation_failure")
+    events = list(state.dashboard.memory_guard_events)
+    assert events and events[-1]["action"] == "allocation_failure_shed"
+
+
 def test_bank_shrink_to_bytes_evicts_lru_first():
     from mtplx.session_bank import SessionBank
 

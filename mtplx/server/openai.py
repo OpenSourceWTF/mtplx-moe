@@ -37,7 +37,7 @@ import urllib.parse
 import uuid
 import weakref
 import webbrowser
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, is_dataclass, replace
@@ -15709,6 +15709,130 @@ def _memory_pressure_guard_enabled() -> bool:
     }
 
 
+# Allocation failures the daemon must survive as per-request errors. MLX's
+# Metal allocator raises plain RuntimeErrors ("[metal::malloc] ... maximum
+# allowed buffer size", "Insufficient Memory",
+# kIOGPUCommandBufferCallbackErrorOutOfMemory); before 2.9.4 these reached
+# clients as anonymous internal_error 500s with no cache shed, so the very
+# next request hit the same wall (#348).
+_ALLOCATION_FAILURE_MARKERS = (
+    "insufficient memory",
+    "out of memory",
+    "failed to allocate",
+    "kiogpucommandbuffercallbackerroroutofmemory",
+    "metal::malloc",
+    "maximum allowed buffer size",
+)
+
+
+def _is_allocation_failure(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    if not isinstance(exc, (RuntimeError, OSError)):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _ALLOCATION_FAILURE_MARKERS)
+
+
+def _record_guard_event(state: "ServerState", payload: dict[str, Any]) -> None:
+    """Ring buffer of guard actions for the dashboard/app (never raises)."""
+    try:
+        dashboard = state.dashboard
+        events = getattr(dashboard, "memory_guard_events", None)
+        if events is None:
+            events = deque(maxlen=16)
+            dashboard.memory_guard_events = events
+        events.append({"ts": time.time(), **payload})
+    except Exception:
+        pass
+
+
+def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
+    """Give memory back after an allocation failure; never raises.
+
+    Bank to half its current budget + allocator cache clear: the next
+    request should find room instead of hitting the identical wall.
+    """
+    receipt: dict[str, Any] = {"action": "allocation_failure_shed"}
+    try:
+        bank = getattr(getattr(state, "sessions", None), "bank", None)
+        if bank is not None:
+            receipt["bank_entries_evicted"] = bank.shrink_to_bytes(
+                int(bank.effective_max_bytes()) // 2,
+                reason="allocation_failure",
+            )
+            receipt["bank_bytes_after"] = int(bank.total_nbytes)
+    except Exception as exc:
+        receipt["bank_error"] = repr(exc)
+    try:
+        import mlx.core as _mx
+
+        _mx.clear_cache()
+        receipt["cache_cleared"] = True
+    except Exception:
+        receipt["cache_cleared"] = False
+    _record_guard_event(state, receipt)
+    try:
+        print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
+    except Exception:
+        pass
+    return receipt
+
+
+def _allocation_failure_http_exception(
+    state: "ServerState", exc: BaseException
+) -> HTTPException:
+    """Shed caches, then turn the raw allocator error into an honest 507."""
+    _shed_after_allocation_failure(state)
+    plan = getattr(state, "memory_plan", None)
+    advice = "Reduce --context-window, close other apps, or try q8 KV quantization."
+    if plan is not None and getattr(plan, "context_overcommitted", False):
+        advice = (
+            f"--context-window {plan.context_window_resolved} exceeds this "
+            f"machine's fit of {plan.context_window_fit} tokens; serve at or "
+            "below the fit (or use q8 KV quantization)."
+        )
+    return HTTPException(
+        status_code=507,
+        detail=(
+            "insufficient memory: the request exceeded available GPU memory "
+            f"({exc}). The engine shed its caches and stays up; this request "
+            f"failed. {advice}"
+        ),
+    )
+
+
+def _allocator_pressure_level(state: "ServerState") -> tuple[int, float]:
+    """Engine-relative pressure: allocator footprint vs the Metal limit.
+
+    macOS's kern.memorystatus level fires only once the system is already
+    compressing/swapping — on a 48 GB Mac that is minutes into the death
+    spiral (#305: 61.8/48.0 GB before the first signal). The allocator
+    knows earlier: active+cache at >=97% of the configured Metal memory
+    limit means the next growth step swaps, so treat it as WARNING (2);
+    past the limit is CRITICAL-equivalent (4). Returns (level, fraction).
+    """
+    caps = getattr(state, "metal_memory_caps", None)
+    limit = 0
+    if isinstance(caps, dict):
+        value = caps.get("memory_limit_bytes")
+        if isinstance(value, int):
+            limit = value
+    if limit <= 0:
+        return 1, 0.0
+    stats = _mlx_memory_stats_live()
+    active = stats.get("active_memory_bytes") or 0
+    cache = stats.get("cache_memory_bytes") or 0
+    if not active:
+        return 1, 0.0
+    fraction = float(int(active) + int(cache)) / float(limit)
+    if fraction >= 1.02:
+        return 4, fraction
+    if fraction >= 0.97:
+        return 2, fraction
+    return 1, fraction
+
+
 def _engine_busy_signal(state: "ServerState") -> bool:
     """True while any request is actively being served."""
     try:
@@ -15853,7 +15977,41 @@ async def _memory_pressure_loop(
     while True:
         try:
             level = await asyncio.to_thread(_memory_pressure_level)
+            level_source = "macos"
+            allocator_level, allocator_fraction = _allocator_pressure_level(state)
+            if allocator_level > level:
+                # The allocator sees the wall minutes before macOS does
+                # (see _allocator_pressure_level); the guard acts on
+                # whichever signal is worse.
+                level = allocator_level
+                level_source = "allocator"
             state.dashboard.last_memory_pressure_level = level
+            # Dynamic bank ceiling (memory plan): during a long-context
+            # prefill no put() runs for minutes while KV grows, so the
+            # put-time budget check alone reacts too late. Enforce here
+            # every tick. Deliberately NO mx.clear_cache() while busy —
+            # freed bank buffers return to the allocator pool and get
+            # reused by the growing KV, which is exactly the point.
+            bank = getattr(getattr(state, "sessions", None), "bank", None)
+            if bank is not None and getattr(bank, "dynamic_ceiling_fn", None):
+                try:
+                    ceiling = int(bank.effective_max_bytes())
+                    if int(bank.total_nbytes) > ceiling + 256 * 1024**2:
+                        dyn_evicted = bank.shrink_to_bytes(
+                            ceiling, reason="dynamic_ceiling"
+                        )
+                        if dyn_evicted:
+                            _record_guard_event(
+                                state,
+                                {
+                                    "action": "dynamic_ceiling",
+                                    "ceiling_bytes": ceiling,
+                                    "bank_entries_evicted": int(dyn_evicted),
+                                    "bank_bytes_after": int(bank.total_nbytes),
+                                },
+                            )
+                except Exception:
+                    pass
             busy = False
             if 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)
@@ -15896,18 +16054,20 @@ async def _memory_pressure_loop(
                         _mx.clear_cache()
                     except Exception:
                         pass
-                print(
-                    "[mtplx] memory pressure guard "
-                    + json.dumps(
-                        {
-                            "level": level,
-                            "bank_entries_evicted": evicted,
-                            "bank_bytes_after": int(
-                                getattr(bank, "total_nbytes", 0) or 0
-                            ),
-                            "deferred_s": deferred_s,
-                        }
+                action_receipt = {
+                    "action": "pressure_trim",
+                    "level": level,
+                    "level_source": level_source,
+                    "allocator_fraction": round(allocator_fraction, 3),
+                    "bank_entries_evicted": evicted,
+                    "bank_bytes_after": int(
+                        getattr(bank, "total_nbytes", 0) or 0
                     ),
+                    "deferred_s": deferred_s,
+                }
+                _record_guard_event(state, action_receipt)
+                print(
+                    "[mtplx] memory pressure guard " + json.dumps(action_receipt),
                     flush=True,
                 )
         except asyncio.CancelledError:
@@ -29177,12 +29337,22 @@ def create_app(state: ServerState) -> FastAPI:
                     return f"data: {json.dumps(payload)}\n\n"
 
                 def error_chunk(exc: BaseException) -> str:
+                    if _is_allocation_failure(exc):
+                        # Shed caches + honest 507 instead of an anonymous
+                        # RuntimeError 500; the daemon stays up (#348).
+                        exc = _allocation_failure_http_exception(state, exc)
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
+                        error_code = (
+                            "insufficient_memory"
+                            if status_code == 507
+                            else type(exc).__name__
+                        )
                     else:
                         message = str(exc)
                         status_code = 500
+                        error_code = type(exc).__name__
                     payload = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
@@ -29194,7 +29364,7 @@ def create_app(state: ServerState) -> FastAPI:
                         **_openai_error_content(
                             message,
                             status_code=status_code,
-                            code=type(exc).__name__,
+                            code=error_code,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -31357,12 +31527,22 @@ def create_app(state: ServerState) -> FastAPI:
                     )
 
                 def error_chunk(exc: BaseException) -> str:
+                    if _is_allocation_failure(exc):
+                        # Shed caches + honest 507 instead of an anonymous
+                        # RuntimeError 500; the daemon stays up (#348).
+                        exc = _allocation_failure_http_exception(state, exc)
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
+                        error_code = (
+                            "insufficient_memory"
+                            if status_code == 507
+                            else type(exc).__name__
+                        )
                     else:
                         message = str(exc)
                         status_code = 500
+                        error_code = type(exc).__name__
                     payload = {
                         "id": response_id,
                         "object": "text_completion",
@@ -31372,7 +31552,7 @@ def create_app(state: ServerState) -> FastAPI:
                         **_openai_error_content(
                             message,
                             status_code=status_code,
-                            code=type(exc).__name__,
+                            code=error_code,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -31754,6 +31934,24 @@ def create_app(state: ServerState) -> FastAPI:
     @app.exception_handler(Exception)
     async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
         _record_tool_parse_event(state, event="openai_error_response")
+        if _is_allocation_failure(exc):
+            # Non-streaming lanes land here on a Metal allocation failure.
+            # Shed caches and answer with the honest 507 (same contract as
+            # the streaming error frame) instead of a redacted 500 — the
+            # user can act on "insufficient memory"; they cannot act on
+            # "internal server error" (#348).
+            http_exc = _allocation_failure_http_exception(state, exc)
+            logging.getLogger("mtplx.server").warning(
+                "allocation failure served as 507: %s", exc
+            )
+            return JSONResponse(
+                status_code=http_exc.status_code,
+                content=_openai_error_content(
+                    str(http_exc.detail),
+                    status_code=http_exc.status_code,
+                    code="insufficient_memory",
+                ),
+            )
         request_id = uuid.uuid4().hex[:12]
         # Full detail belongs in the server log, not the wire: exception
         # class + repr in client bodies got quoted verbatim by external
