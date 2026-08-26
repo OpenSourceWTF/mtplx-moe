@@ -1421,10 +1421,13 @@ def test_kv_quant_q4_kernel_route_matches_dequant(monkeypatch):
     monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "1")
 
     mx.random.seed(11311)
-    dim = 128
-    queries = 0.3 * mx.random.normal((1, 8, 2, dim), dtype=mx.bfloat16)
-    keys = 0.5 * mx.random.normal((1, 2, 200, dim), dtype=mx.bfloat16)
-    values = 0.5 * mx.random.normal((1, 2, 200, dim), dtype=mx.bfloat16)
+    # Shipped geometry (D=256, GQA 6): the q4 kernel's verified envelope.
+    # D=128 deviates from its own dequant math (2026-08-26 forensics) and
+    # now BAILS — pinned below.
+    dim = 256
+    queries = 0.3 * mx.random.normal((1, 24, 2, dim), dtype=mx.bfloat16)
+    keys = 0.5 * mx.random.normal((1, 4, 200, dim), dtype=mx.bfloat16)
+    values = 0.5 * mx.random.normal((1, 4, 200, dim), dtype=mx.bfloat16)
 
     def _make_cache():
         cache = VllmMetalPagedKVCache(
@@ -1459,6 +1462,30 @@ def test_kv_quant_q4_kernel_route_matches_dequant(monkeypatch):
     )
     mx.eval(diff)
     assert float(diff.item()) <= 5e-3
+
+
+def test_kv_quant_q4_kernel_bails_outside_envelope():
+    """D=128 q4 deviates from its own dequant math (2026-08-26 forensics:
+    0.006-0.026 abs vs <2e-4 at D=256). The kernel must fail closed there."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    from mtplx.kernels.sdpa_gqa_packed_quant import sdpa_gqa_packed_tail_quant
+    from mtplx.kv_quant import quantize_symmetric
+
+    mx.random.seed(5)
+    dim = 128
+    q = 0.3 * mx.random.normal((1, 8, 2, dim)).astype(mx.bfloat16)
+    k = 0.5 * mx.random.normal((1, 2, 392, dim)).astype(mx.bfloat16)
+    v = 0.5 * mx.random.normal((1, 2, 392, dim)).astype(mx.bfloat16)
+    kq, ks = quantize_symmetric(k, bits=4)
+    vq, vs = quantize_symmetric(v, bits=4)
+    mx.eval(q, kq, ks, vq, vs)
+    out = sdpa_gqa_packed_tail_quant(
+        queries=q, k_q=kq, k_scale=ks.astype(mx.float32),
+        v_q=vq, v_scale=vs.astype(mx.float32),
+        offset=200, scale=dim**-0.5, bits=4,
+    )
+    assert out is None
 
 
 def test_install_hybrid_cache_counts_attention_entries_and_skips_rest(monkeypatch):

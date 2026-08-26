@@ -423,6 +423,12 @@ def sdpa_gqa_packed_tail_quant(
             return _bail("scale_dtype")
     if d not in (64, 128, 256):
         return _bail("head_dim_unsupported")
+    if bits == 4 and d != 256:
+        # 2026-08-26 forensics: the q4 nibble path deviates from its own
+        # dequant math at D=128 (0.006-0.026 abs vs <2e-4 at D=256) —
+        # geometry-scoped defect, receipts in MEASUREMENTS.md. Fail closed
+        # outside the verified envelope until the D<256 path is fixed.
+        return _bail("q4_head_dim_envelope")
     if hk <= 0 or hq % hk:
         return _bail("gqa_heads")
     gqa_factor = hq // hk
