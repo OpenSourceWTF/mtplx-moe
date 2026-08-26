@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import asyncio
+import traceback
 import builtins
 import errno
 import gc
@@ -12896,6 +12897,22 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     investigation had to reconstruct history from a 32-entry RAM ring; this
     keeps the full trail. Best-effort: telemetry must never fail a request.
     """
+    try:
+        # Route observability (2026-08-26): the packed-SDPA route declines
+        # silently unless its TRACE env is set — the 147.4k decode cliff hid
+        # behind that silence. Cumulative-since-boot module counters; a delta
+        # between consecutive rows isolates one request.
+        from ..attention_split import gqa_packed_route_bail_counts
+        from ..kernels.sdpa_gqa_packed import gqa_packed_bail_counts
+
+        record.setdefault(
+            "gqa_packed_route_bail_counts", dict(gqa_packed_route_bail_counts)
+        )
+        record.setdefault(
+            "gqa_packed_kernel_bail_counts", dict(gqa_packed_bail_counts)
+        )
+    except Exception:
+        pass
     safe = _json_safe(record)
     state.last_metrics.append(safe)
     state.last_metrics = state.last_metrics[-100:]
@@ -21777,6 +21794,9 @@ def _run_startup_warmup(state: ServerState) -> dict[str, Any]:
         _startup_line(
             f"[6/6] Warmup failed after {status['elapsed_s']:.1f}s: {status['error']}"
         )
+        # A failed warmup leaves every later request on the same broken
+        # path; the one-line message has no raise site, so surface it.
+        _startup_line(traceback.format_exc())
         if getattr(state.args, "strict_warmup", False):
             raise
         return status
