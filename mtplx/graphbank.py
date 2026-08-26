@@ -1076,6 +1076,23 @@ def paged_offsets_context_ok() -> bool:
     return _PAGED_OFFSETS_CONTEXT_OK.get()
 
 
+def _ccopy_bank_max_len() -> int:
+    """Ceiling for extended-window (context-copy block) compiled dispatch.
+
+    Copy blocks are proposed at their native ladder lengths (block 8-32 ->
+    T=9-33); the bank verifies them one-shot so the trajectory is byte-equal
+    to the eager copy lane (v1's cap-to-bank-window changed the proposal and
+    was falsified as a net win, MEASUREMENTS 2026-08-25 12:05). Default 33
+    covers the full default ladder; longer custom MTPLX_CONTEXT_COPY_K
+    proposals fall back eager per call.
+    """
+    raw = os.environ.get("MTPLX_CCOPY_BANK_MAX_LEN", "").strip()
+    try:
+        return max(1, int(raw)) if raw else 33
+    except ValueError:
+        return 33
+
+
 def _compiled_verify_growth_reserve() -> int:
     """Dense-leaf growth headroom granted at first promotion (tokens).
 
@@ -1371,6 +1388,7 @@ class CompiledVerifyBank:
         self.stats: dict[str, Any] = {
             "calls": 0,
             "compiled_calls": 0,
+            "extended_calls": 0,
             "fallback_calls": 0,
             "fallback_reasons": {},
             "buckets": {},
@@ -1397,12 +1415,30 @@ class CompiledVerifyBank:
         cache=None,
         return_hidden: bool = True,
         hidden_variant: str | None = None,
+        extended_window: bool = False,
     ):
+        """Compiled verify dispatch.
+
+        ``extended_window`` (context-copy block rounds, 2026-08-26 v2) admits
+        lengths above ``max_verify_len`` up to ``MTPLX_CCOPY_BANK_MAX_LEN``.
+        The extended lane changes ROUTING only, never the request's memory
+        contract: the speculative reserve stays keyed to ``max_verify_len``,
+        a dense-capacity preflight refuses (falls back eager) instead of
+        growing a granted KV leaf, and paged capacity overflow falls back as
+        before.  ``_paged_ineligibility`` is skipped for extended lengths:
+        that gate is a performance router for windows whose eager alternative
+        is cheap, while a block round's eager alternative costs ~380 ms flat
+        at long context (MEASUREMENTS 2026-08-25 11:26) — inside the traced
+        graph the paged kernel declining is shape-deterministic and routes to
+        the same dense math the eager forward takes at the same T, so
+        exactness is unaffected either way.
+        """
         global _PREWARM_DONE
         if (
             not _PREWARM_DONE
             and not self.parity
             and not self.parity2
+            and not extended_window
             and _prewarm_enabled()
         ):
             # First compiled dispatch of a generation while coverage is
@@ -1458,7 +1494,9 @@ class CompiledVerifyBank:
                 except Exception:
                     pass
         self.stats["calls"] += 1
-        reason = self._fallback_reason(input_ids, cache, return_hidden)
+        reason = self._fallback_reason(
+            input_ids, cache, return_hidden, extended_window=extended_window
+        )
         if reason is not None:
             return self._fallback(
                 input_ids,
@@ -1490,15 +1528,18 @@ class CompiledVerifyBank:
                     hidden_variant=hidden_variant,
                     reason="context_above_threshold",
                 )
-            ineligible = self._paged_ineligibility(cache, length, bucket)
-            if ineligible is not None:
-                return self._fallback(
-                    input_ids,
-                    cache=cache,
-                    return_hidden=return_hidden,
-                    hidden_variant=hidden_variant,
-                    reason=ineligible,
-                )
+            if not (extended_window and length > self.max_verify_len):
+                # Extended block windows skip this performance router (see
+                # the method docstring); every other call keeps it verbatim.
+                ineligible = self._paged_ineligibility(cache, length, bucket)
+                if ineligible is not None:
+                    return self._fallback(
+                        input_ids,
+                        cache=cache,
+                        return_hidden=return_hidden,
+                        hidden_variant=hidden_variant,
+                        reason=ineligible,
+                    )
             self._ensure_shadow(cache)
             self._apply_bucket(cache, bucket)
             # Boundary policy (experiment knob, 2026-07-02 sprint):
@@ -1587,6 +1628,8 @@ class CompiledVerifyBank:
             )
         self._exception_failures = 0
         self.stats["compiled_calls"] += 1
+        if extended_window and length > self.max_verify_len:
+            self.stats["extended_calls"] += 1
         bucket_key = str(int(bucket))
         self.stats["buckets"][bucket_key] = self.stats["buckets"].get(bucket_key, 0) + 1
         captures = self._rebuild_captures(captures_flat)
@@ -1801,6 +1844,110 @@ class CompiledVerifyBank:
             pass
         return _finish()
 
+    def prewarm_extended_lengths(
+        self,
+        cache: Any,
+        lengths: list[int],
+        *,
+        hidden_variant: str | None = None,
+    ) -> dict[str, Any]:
+        """Trace the extended (context-copy block) windows ahead of use.
+
+        Optional, driven by ``MTPLX_CCOPY_BANK_PREWARM`` at the ccopy site.
+        Without it the first block round per (length, bucket) pays the fresh
+        ``mx.compile`` trace organically — once per PROCESS (shared traces),
+        which was the recurring-looking "~240 ms/call" in the 8-round v1 cell
+        (one ~1s first-trace amortized over 8 rounds; the dispatch layer
+        itself re-clones nothing, probe receipts 2026-08-26). A/B cells that
+        time steady-state block rounds should enable this so first-trace cost
+        lands in warmup, not in a measured row.
+
+        Same firewall economics as ``prewarm_ladder``: the compiled function
+        is pure, outputs are dropped and never mirror-committed, so the live
+        cache is untouched. The dry run cannot donate its input buffers (the
+        real cache still holds every leaf), so each traced length transiently
+        materializes one copy of the full-attn KV set — the same one-time
+        copy the first organic call of a generation pays.
+        """
+        report: dict[str, Any] = {"lengths": [], "skipped": [], "elapsed_s": 0.0}
+        started = time.perf_counter()
+
+        def _finish() -> dict[str, Any]:
+            report["elapsed_s"] = round(time.perf_counter() - started, 3)
+            self.stats["extended_prewarm"] = report
+            return report
+
+        if self.permanent_eager or self.parity or self.parity2:
+            report["skipped"].append("bank_mode")
+            return _finish()
+        ceiling = max(self.max_verify_len, _ccopy_bank_max_len())
+        variant_key = str(hidden_variant or "")
+        runtime_id = id(self.runtime)
+        for length in sorted({int(item) for item in lengths}):
+            if length <= self.max_verify_len or length > ceiling:
+                report["skipped"].append(f"m{length}:outside_extended_window")
+                continue
+            probe = mx.zeros((1, length), dtype=mx.int32)
+            reason = self._fallback_reason(
+                probe,
+                cache,
+                True,
+                consume_post_restore=False,
+                extended_window=True,
+            )
+            if reason is not None:
+                report["skipped"].append(f"m{length}:{reason}")
+                continue
+            try:
+                bucket = self._resolve_bucket(cache, length)
+                if bucket is None:
+                    report["skipped"].append(f"m{length}:capacity_overflow")
+                    continue
+                if (
+                    runtime_id,
+                    length,
+                    variant_key,
+                    int(bucket),
+                ) in _PREWARMED_BUCKETS:
+                    report["skipped"].append(f"m{length}:already")
+                    continue
+                self._ensure_shadow(cache)
+                self._apply_bucket(cache, bucket)
+                state_in = self._read_state_leaves(cache)
+                if state_in is None:
+                    report["skipped"].append(f"m{length}:empty_state_leaf")
+                    continue
+                key = (length, variant_key, int(bucket))
+                fn = self._compiled.get(key)
+                if fn is None:
+                    fn = self._shared_or_new_verify_step(key, length, hidden_variant)
+                    self._compiled[key] = fn
+                length_started = time.perf_counter()
+                outputs = fn(probe, *state_in)
+                mx.eval(*outputs)
+                report["lengths"].append(
+                    {
+                        "m": int(length),
+                        "bucket": int(bucket),
+                        "s": round(time.perf_counter() - length_started, 3),
+                    }
+                )
+                _PREWARMED_BUCKETS.add((runtime_id, length, variant_key, int(bucket)))
+            except Exception as exc:
+                report["skipped"].append(f"m{length}:{type(exc).__name__}")
+        try:
+            # Politeness restore (mirrors prewarm_ladder): an eager forward
+            # between this walk and the next dispatch should see a natural
+            # static ceiling, not the last extended length's. Any ceiling
+            # >= offset + T is topology-valid, and dispatch re-applies its
+            # own bucket before every compiled call.
+            restored = self._resolve_bucket(cache, 1)
+            if restored:
+                self._apply_bucket(cache, restored)
+        except Exception:
+            pass
+        return _finish()
+
     def _materialize_growth_handoff_state(self, cache: Any) -> int:
         """Settle compiled state before the eager tail takes ownership.
 
@@ -1913,6 +2060,7 @@ class CompiledVerifyBank:
         return_hidden: bool,
         *,
         consume_post_restore: bool = True,
+        extended_window: bool = False,
     ) -> str | None:
         if self.permanent_eager:
             return "permanent_eager"
@@ -1926,8 +2074,38 @@ class CompiledVerifyBank:
         length = int(shape[1])
         if length < 1:
             return "invalid_length"
-        if length > self.max_verify_len:
+        window_ceiling = (
+            max(self.max_verify_len, _ccopy_bank_max_len())
+            if extended_window
+            else self.max_verify_len
+        )
+        if length > window_ceiling:
             return "length_outside_bank"
+        if extended_window and length > self.max_verify_len:
+            # Dense-capacity preflight: an extended window must never grow a
+            # granted dense KV leaf (`promote_kv_cache_offsets` below would
+            # call `ensure_capacity(size + length)` and flip
+            # `growth_after_grant`). When the window cannot fit the grant,
+            # run the SAME once-per-request growth-demotion transition the
+            # MTP lane runs at grant exhaustion — the MTP top-up would trip
+            # it within `max_verify_len` tokens anyway — so the eager
+            # fallback verifies against stock containers that grow natively.
+            # (Falling back onto the still-granted adapter would overflow
+            # its fixed buffer inside `update_and_fetch`; the route-off
+            # eager lane shares that narrow dense-edge exposure today.)
+            for entry in cache or []:
+                if not isinstance(entry, TensorOffsetKVCache):
+                    continue
+                if entry.keys is None:
+                    continue
+                if entry.size() + length > int(entry.keys.shape[2]):
+                    self._growth_demoted = True
+                    self.stats["growth_demotions"] = (
+                        int(self.stats.get("growth_demotions", 0)) + 1
+                    )
+                    self._materialize_growth_handoff_state(cache)
+                    self.demote(cache)
+                    return "block_window_capacity"
         if self.capture_backend in _UNSUPPORTED_CAPTURE_BACKENDS:
             return "unsupported_capture_backend"
         if _owned_state_env_active("MTPLX_OWNED_ATTN_KV"):
