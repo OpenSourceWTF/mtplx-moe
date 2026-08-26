@@ -58,7 +58,16 @@ as the receipt ladders' pos-1 acceptance rate, far lower variance than the
      acceptance +.06..+.14 where it helps — away from the drop edge — and
      -.12 where it hurts — decisively through it);
   3. a dwell floor: at least ``dwell_rounds`` observed rounds between
-     transitions, which caps flip rate at band edges under EMA noise.
+     transitions, which caps flip rate at band edges under EMA noise;
+  4. a Schmitt re-arm on the raise trigger: after a BOOST -> DEFAULT drop
+     (the hurt signature fired), the raise rule stays DISARMED until the
+     EMA first recovers ABOVE the raise threshold.  Without this, the
+     post-drop EMA climbing from the boost-arm's ~.68 reading back to the
+     duplication register's ~.80 default reading would transit the raise
+     band and re-boost into the same register that just hurt (a sustained
+     ~2x-dwell oscillation).  Re-arming requires the default-state reading
+     the receipts show for that register (>= ~.80); a LATER sag back into
+     the band then marks a genuine register change and raises legitimately.
 
 Interaction contract (documented, enforced by the build gate in
 ``generation.generate_mtpk``):
@@ -238,6 +247,7 @@ class AdaptiveDraftTemperatureController:
         "boost_rounds",
         "transitions",
         "transition_log",
+        "raise_armed",
         "_seed_sum",
         "_rounds_since_transition",
     )
@@ -258,6 +268,7 @@ class AdaptiveDraftTemperatureController:
         self.boost_rounds = 0
         self.transitions = 0
         self.transition_log: list[tuple[int, float]] = []
+        self.raise_armed = True
         self._seed_sum = 0.0
         self._rounds_since_transition = 0
 
@@ -288,6 +299,15 @@ class AdaptiveDraftTemperatureController:
             return None
         self.ema = (1.0 - cfg.ema_alpha) * self.ema + cfg.ema_alpha * x
         self._rounds_since_transition += 1
+        if (
+            not self.raise_armed
+            and self.state == "default"
+            and self.ema > cfg.raise_threshold
+        ):
+            # Schmitt re-arm (hysteresis layer 4): the post-drop EMA has
+            # recovered to the default-state reading of the register that
+            # hurt — a later sag back into the band is a genuine change.
+            self.raise_armed = True
         return self._decide()
 
     def _decide(self) -> float | None:
@@ -296,7 +316,10 @@ class AdaptiveDraftTemperatureController:
         if self._rounds_since_transition < cfg.dwell_rounds:
             return None
         if self.state == "default":
-            if cfg.floor_threshold <= self.ema <= cfg.raise_threshold:
+            if (
+                self.raise_armed
+                and cfg.floor_threshold <= self.ema <= cfg.raise_threshold
+            ):
                 return self._transition("boost", self.boost_temperature)
             return None
         if self.state == "boost":
@@ -305,6 +328,10 @@ class AdaptiveDraftTemperatureController:
         return None
 
     def _transition(self, state: str, temperature: float) -> float:
+        if state == "default":
+            # A drop means the boost hurt HERE; do not re-boost into the
+            # same register — disarm until the EMA recovers above raise.
+            self.raise_armed = False
         self.state = state
         self.current_temperature = float(temperature)
         self.transitions += 1
@@ -330,6 +357,7 @@ class AdaptiveDraftTemperatureController:
             "observed_rounds": int(self.observed_rounds),
             "boost_rounds": int(self.boost_rounds),
             "transitions": int(self.transitions),
+            "raise_armed": bool(self.raise_armed),
             "transition_log": [
                 [int(round_index), float(temperature)]
                 for round_index, temperature in self.transition_log
