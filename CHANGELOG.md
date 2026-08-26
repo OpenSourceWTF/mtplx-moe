@@ -8,6 +8,17 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **Agent turns died with a fabricated
+  `request cancelled via POST /v1/mtplx/cancel`** (issues #332, #343). After
+  a complete streamed tool call the server cancels its own generation to end
+  the turn; when the worker's acknowledgement outlived the stream loop's
+  250 ms poll, the loop misread its own cancel as a foreign
+  `POST /v1/mtplx/cancel` and killed the healthy turn with that error — no
+  one ever called the endpoint. Tool-calling streams now drain until the
+  worker acknowledges and end with the `tool_calls` terminal frame; a real
+  cancel and a real disconnect behave as before. Deterministic regression
+  test included. Only tool-calling turns were affected, which is why plain
+  streaming never reproduced it.
 - **The long-context decode cliff.** Past 131,072 prompt tokens dense decode
   silently repaged into a cache layout that structurally excluded the packed
   verify kernel, collapsing speculative decode to plain-AR speed (12.0 tok/s
