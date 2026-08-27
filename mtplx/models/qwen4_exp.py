@@ -259,37 +259,51 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
 
         if mask is not None:
             qkv = mx.where(mask[..., None], qkv, 0)
-        conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+        if self._fused_conv_norm_applies(B, S, mask, cache):
+            from mtplx.kernels.gdn_conv_norm import fused_gdn_conv_norm
 
-        q, k, v = [
-            t.reshape(B, S, h, d)
-            for t, h, d in zip(
-                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
-                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
-                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+            q_f, k_f, v_f, new_state = fused_gdn_conv_norm(
+                qkv.reshape(-1),
+                conv_state.reshape(self.conv_kernel_size - 1, self.conv_dim),
+                self.conv1d.weight,
             )
-        ]
+            cache[0] = new_state.reshape(B, self.conv_kernel_size - 1, self.conv_dim)
+            q = q_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
+            k = k_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
+            v = v_f.reshape(B, S, self.num_v_heads, self.head_v_dim)
+            state = cache[1] if cache else None
+        else:
+            conv_input = mx.concatenate([conv_state, qkv], axis=1)
+            if cache is not None:
+                n_keep = self.conv_kernel_size - 1
+                if cache.lengths is not None:
+                    ends = mx.clip(cache.lengths, 0, S)
+                    positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                    cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                else:
+                    cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            conv_out = nn.silu(self.conv1d(conv_input))
 
-        state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
+            q, k, v = [
+                t.reshape(B, S, h, d)
+                for t, h, d in zip(
+                    mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                    [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                    [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+                )
+            ]
 
-        def _l2norm(x: mx.array) -> mx.array:
-            xf = x.astype(mx.float32)
-            return (xf * mx.rsqrt((xf * xf).sum(-1, keepdims=True) + 1e-6)).astype(
-                x.dtype
-            )
+            state = cache[1] if cache else None
+            inv_scale = k.shape[-1] ** -0.5
 
-        q = inv_scale * _l2norm(q)
-        k = _l2norm(k)
+            def _l2norm(x: mx.array) -> mx.array:
+                xf = x.astype(mx.float32)
+                return (
+                    xf * mx.rsqrt((xf * xf).sum(-1, keepdims=True) + 1e-6)
+                ).astype(x.dtype)
+
+            q = inv_scale * _l2norm(q)
+            k = _l2norm(k)
 
         if cache is not None and _VERIFY_CAPTURE.get():
             # Family capture-commit: retain the exact rows gated_delta_update
@@ -335,6 +349,28 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
 
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
+
+    def _fused_conv_norm_applies(self, B, S, mask, cache) -> bool:
+        # Fused conv+silu+l2norm (MTPLX_FUSED_GDN_CONVNORM): the decode-row
+        # chain between the input GEMV and gated_delta_update. Family
+        # geometry only (conv_dim 10240 / key_dim 2048 / heads of 128 — the
+        # kernel's TG alignment depends on 2*key_dim being a threadgroup
+        # multiple), dense rows, no conv bias, no ragged lengths. bf16
+        # rounding happens after the norm instead of before (tolerance
+        # class, same as the fallback re-forward's own noise).
+        if B != 1 or S != 1 or mask is not None or cache is None:
+            return False
+        if not _fused_gdn_conv_norm_enabled() or self.training:
+            return False
+        if getattr(cache, "lengths", None) is not None:
+            return False
+        if self.conv_dim != 10240 or self.key_dim != 2048:
+            return False
+        if self.conv_kernel_size != 4 or self.head_k_dim != 128:
+            return False
+        if getattr(self.conv1d, "bias", None) is not None:
+            return False
+        return True
 
     def _fused_out_applies(self, B: int, S: int) -> bool:
         # Fused norm+gate+out_proj (MTPLX_FUSED_GDN_OUT): decode rows only,
@@ -803,6 +839,11 @@ def _fused_gdn_in_proj_enabled() -> bool:
 
 def _fused_gdn_out_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_GDN_OUT") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_gdn_conv_norm_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GDN_CONVNORM") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 

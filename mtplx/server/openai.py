@@ -736,6 +736,9 @@ def _server_runtime_env_overrides(
         #   NOTE: this arms ONLY the sanitize-time library-call merge; the
         #   custom moe_glu_decode kernel stays behind MTPLX_FUSED_MOE_DECODE
         #   (falsified at g64, -5%).
+        # - GDN conv+silu+l2norm fused between the GEMVs (2026-08-27 A/B/A:
+        #   59.31 -> 60.96, every B row above every A row — the first config
+        #   past the 60-AR line).
         for key in (
             "MTPLX_AR_PIPELINE",
             "MTPLX_COMPILED_GDN",
@@ -743,6 +746,7 @@ def _server_runtime_env_overrides(
             "MTPLX_FUSED_HC_V3",
             "MTPLX_FUSED_GDN_INPROJ",
             "MTPLX_FUSED_GATE_UP",
+            "MTPLX_FUSED_GDN_CONVNORM",
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
