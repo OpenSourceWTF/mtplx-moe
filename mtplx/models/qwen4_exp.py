@@ -695,8 +695,104 @@ def _fuse_gdn_in_proj_sanitize(model, out: dict) -> dict:
     return out
 
 
+_LAYER_ATTN_RE = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.q_proj\.weight$")
+_QSA_QKV_PROJS = ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
+
+
+def _fuse_qsa_qkv_sanitize(model, out: dict) -> dict:
+    """Sanitize-time QSA attention input fusion (MTPLX_FUSED_QSA_QKV).
+
+    q/k/v and the indexer's qk projection all consume the layer input row;
+    row-axis concat of the quantized packs is bit-exact per output row (same
+    contract as the GDN in_proj fusion), so the 13 attention layers run one
+    shared-input GEMV instead of four. Biased checkpoints and mixed packings
+    keep the stock chain."""
+    if not _fused_qsa_qkv_enabled():
+        return out
+    fused = 0
+    hits = [
+        (m.group(1), int(m.group(2)))
+        for m in (_LAYER_ATTN_RE.match(k) for k in list(out))
+        if m is not None
+    ]
+    for prefix, idx in hits:
+        if any(f"{prefix}.{p}.bias" in out for p in _QSA_QKV_PROJS):
+            continue
+        parts = []
+        fused_subs = []
+        for sub in _QSA_QKV_PROJS:
+            w = out.get(f"{prefix}.{sub}.weight")
+            s = out.get(f"{prefix}.{sub}.scales")
+            b = out.get(f"{prefix}.{sub}.biases")
+            if w is None or s is None or b is None:
+                if sub == "indexer.index_qk_proj":
+                    continue  # optional member
+                parts = None
+                break
+            parts.append((w, s, b))
+            fused_subs.append(sub)
+        if parts is None:
+            continue
+        k_words = parts[0][0].shape[-1]
+        n_groups = parts[0][1].shape[-1]
+        if any(
+            w.shape[-1] != k_words or s.shape[-1] != n_groups
+            for w, s, _ in parts[:3]
+        ):
+            continue
+        # The shipped forge keeps the indexer projection at 8-bit (selection
+        # precision) while q/k/v are 4-bit — a mixed-bits member cannot join
+        # one GEMV, so it drops out and keeps its own dispatch.
+        if len(parts) == 4 and (
+            parts[3][0].shape[-1] != k_words or parts[3][1].shape[-1] != n_groups
+        ):
+            parts = parts[:3]
+            fused_subs = fused_subs[:3]
+        attn = model.layers[idx].self_attn
+        if getattr(attn, "indexer", None) is None:
+            continue
+        k_in = 2560  # attention input dim = hidden (same contract as gate_up)
+        group_size = k_in // n_groups
+        bits = (k_words * 32) // k_in
+        if bits not in (4, 8):
+            continue
+        rows = [w.shape[0] for w, _, _ in parts]
+        splits = [sum(rows[: i + 1]) for i in range(len(rows) - 1)]
+        f_w = mx.concatenate([w for w, _, _ in parts], axis=0)
+        f_s = mx.concatenate([s for _, s, _ in parts], axis=0)
+        f_b = mx.concatenate([b for _, _, b in parts], axis=0)
+        attn.qkv_fused = _FusedGDNInProj(
+            mx.zeros(f_w.shape, dtype=f_w.dtype),
+            mx.zeros(f_s.shape, dtype=f_s.dtype),
+            mx.zeros(f_b.shape, dtype=f_b.dtype),
+            group_size,
+            bits,
+            "affine",
+            splits,
+        )
+        for name in ("q_proj", "k_proj", "v_proj"):
+            attn.pop(name, None)
+        if "indexer.index_qk_proj" in fused_subs:
+            attn.indexer.pop("index_qk_proj", None)
+        out[f"{prefix}.qkv_fused.weight"] = f_w
+        out[f"{prefix}.qkv_fused.scales"] = f_s
+        out[f"{prefix}.qkv_fused.biases"] = f_b
+        for sub in fused_subs:
+            for part in ("weight", "scales", "biases"):
+                out.pop(f"{prefix}.{sub}.{part}", None)
+        fused += 1
+    if fused:
+        print(f"[qwen4_exp] sanitize fused QSA qkv: {fused} layers", flush=True)
+    return out
+
+
 def _fused_gate_up_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_GATE_UP") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_qsa_qkv_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_QSA_QKV") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -952,11 +1048,19 @@ class QSAIndexer(nn.Module):
             return None
         return cache.pooled[:, :nb_total, :]
 
-    def __call__(self, hidden: mx.array, pos_start: int, cache: QSACache) -> Optional[mx.array]:
+    def __call__(
+        self,
+        hidden: mx.array,
+        pos_start: int,
+        cache: QSACache,
+        qk_rows: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
         B, S, _ = hidden.shape
         if B != 1:
             raise NotImplementedError("qwen4_exp QSA serves single sequences (B=1)")
-        qk = self.index_qk_proj(hidden)
+        # qk_rows: the layer's fused shared-input GEMV already produced this
+        # projection (MTPLX_FUSED_QSA_QKV) — same rows bit-exactly.
+        qk = self.index_qk_proj(hidden) if qk_rows is None else qk_rows
         q, k = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
         q = q.reshape(B, S, self.n_heads, self.head_dim)
         k = k.reshape(B, S, self.head_dim)
@@ -1053,15 +1157,35 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         pos_start = cache.offset
 
-        sel_mask = None
-        if self.indexer is not None:
-            sel_mask = self.indexer(x, pos_start, cache)
+        fused = getattr(self, "qkv_fused", None)
+        if fused is not None:
+            # One shared-input GEMV replaces q/k/v (+ indexer qk when its
+            # pack precision matches — the shipped forge keeps it 8-bit, so
+            # it usually keeps its own dispatch). Row-concat is bit-exact
+            # per row; MTPLX_FUSED_QSA_QKV sanitize fusion.
+            outs = fused(x)
+            if len(outs) == 4:
+                q, k, v, idx_rows = outs
+            else:
+                q, k, v = outs
+                idx_rows = None
+            sel_mask = (
+                self.indexer(x, pos_start, cache, qk_rows=idx_rows)
+                if self.indexer is not None
+                else None
+            )
+        else:
+            sel_mask = None
+            if self.indexer is not None:
+                sel_mask = self.indexer(x, pos_start, cache)
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
 
-        q = self.q_proj(x)
         q, gate = mx.split(q.reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
-        k = self.k_proj(x).reshape(B, S, self.n_kv_heads, -1)
-        v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1)
+        k = k.reshape(B, S, self.n_kv_heads, -1)
+        v = v.reshape(B, S, self.n_kv_heads, -1)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -2374,6 +2498,7 @@ class Model(nn.Module):
 
         out = _fuse_gate_up_sanitize(self, out)
         out = _fuse_gdn_in_proj_sanitize(self, out)
+        out = _fuse_qsa_qkv_sanitize(self, out)
 
         # The 51B table never loads as a parameter; sidecar rows are gathered
         # lazily. Materialized shard concat is only accepted for tiny test
