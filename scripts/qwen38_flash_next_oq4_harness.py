@@ -200,15 +200,20 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
     if not args.prompt_file.is_file() or not args.context_file.is_file():
         raise RuntimeError("Python workload fixture or context file is missing")
 
-    # runtime.load performs the same header-only gate before importing MLX.
-    from mtplx.generation import generate_ar, generate_mtpk
-    from mtplx.runtime import load
-    from mtplx.sampling import SamplerConfig
+    # Install the existing MTPLX product profile once, before generation/runtime
+    # imports and construction. runtime.load then performs the header-only gate
+    # before importing MLX.
+    from mtplx.profiles import apply_profile_env, restore_profile_env
 
+    previous_profile_env = apply_profile_env(args.profile)
     runtime = None
     output = None
     started = time.perf_counter()
     try:
+        from mtplx.generation import generate_ar, generate_mtpk
+        from mtplx.runtime import load
+        from mtplx.sampling import SamplerConfig
+
         runtime = load(model, **_resident_load_kwargs(args))
         _prompt, prompt_ids = build_exact_python_prompt(
             runtime.tokenizer,
@@ -253,6 +258,7 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
             "schema": "mtplx-qwen38-resident-oq4-harness-v1",
             "status": "passed",
             "mode": args.mode,
+            "profile": args.profile,
             "source_revision": _source_revision(model),
             "prompt_tokens": len(prompt_ids),
             "prompt_token_sha256": _token_sha256(prompt_ids),
@@ -275,6 +281,7 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
     finally:
         if runtime is not None:
             runtime.close()
+        restore_profile_env(previous_profile_env)
     if output is None:
         raise RuntimeError("generation returned no output")
     output_path = args.output.expanduser().resolve() if args.output else None
@@ -305,6 +312,7 @@ def _outer_command(args: argparse.Namespace) -> list[str]:
         "--prompt-tokens", str(args.prompt_tokens),
         "--max-tokens", str(args.max_tokens),
         "--reasoning-effort", args.reasoning_effort,
+        "--profile", args.profile,
         "--depth", str(args.depth),
         "--ngram-cache-gib", str(args.ngram_cache_gib),
         "--runtime-target-gib", str(args.runtime_target_gib),
@@ -326,6 +334,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prompt-tokens", type=int, default=16_384)
     parser.add_argument("--max-tokens", type=int, default=1_024)
     parser.add_argument("--reasoning-effort", choices=("low", "xhigh"), default="low")
+    parser.add_argument("--profile", default="sustained")
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--ngram-cache-gib", type=int, default=10)
     parser.add_argument("--runtime-target-gib", type=int, default=82)

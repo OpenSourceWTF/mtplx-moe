@@ -41,6 +41,7 @@ def test_harness_defaults_to_smallest_viable_resident_target() -> None:
     args = harness._parse_args(["--smoke", "--preflight-only"])
 
     assert args.runtime_target_gib == 82
+    assert args.profile == "sustained"
 
 
 def test_smoke_uses_short_instruction_without_changing_exact_fixture(tmp_path) -> None:
