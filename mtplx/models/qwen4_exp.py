@@ -1665,6 +1665,20 @@ class Qwen4ExpTextModel(nn.Module):
                 if getattr(entry, attr, None) is not None:
                     setattr(entry, attr, None)
 
+    def _refuse_commit(self, layer_index: int, reason: str) -> bool:
+        """A refused capture-commit silently falls back to the rollback +
+        trunk re-forward. Silence hid a whole battery of fallbacks on
+        2026-08-27 — print the first few reasons per process."""
+        count = getattr(self, "_commit_refusals", 0)
+        self._commit_refusals = count + 1
+        if count < 3:
+            print(
+                f"[qwen4_exp] capture-commit refused (layer {layer_index}: "
+                f"{reason}) — falling back to re-forward",
+                flush=True,
+            )
+        return False
+
     def commit_verified_window(
         self,
         cache,
@@ -1695,26 +1709,34 @@ class Qwen4ExpTextModel(nn.Module):
         plan = []
         for i, (layer, entry) in enumerate(zip(self.layers, cache)):
             if entry is None:
-                return False
+                return self._refuse_commit(i, "entry_missing")
             if callable(getattr(entry, "is_trimmable", None)) and entry.is_trimmable():
                 plan.append(("trim", i, None))
                 continue
             pre = snapshot_states[i] if snapshot_states is not None else None
             if pre is None:
-                return False
+                return self._refuse_commit(i, "snapshot_missing")
             if getattr(layer, "ple", None) is not None:
                 cap = getattr(entry, "_mtplx_verify_ple", None)
-                if cap is None or cap[0].shape[1] != verified_tokens:
-                    return False
+                if cap is None:
+                    return self._refuse_commit(i, "ple_rows_missing")
+                if cap[0].shape[1] != verified_tokens:
+                    return self._refuse_commit(
+                        i, f"ple_rows_width_{cap[0].shape[1]}_vs_{verified_tokens}"
+                    )
                 if len(pre) < 4:
-                    return False
+                    return self._refuse_commit(i, "ple_snapshot_short")
                 plan.append(("ple", i, cap))
                 continue
             rows = getattr(entry, "_mtplx_verify_rows", None)
-            if rows is None or rows[0].shape[1] != verified_tokens:
-                return False
+            if rows is None:
+                return self._refuse_commit(i, "gdn_rows_missing")
+            if rows[0].shape[1] != verified_tokens:
+                return self._refuse_commit(
+                    i, f"gdn_rows_width_{rows[0].shape[1]}_vs_{verified_tokens}"
+                )
             if len(pre) < 2 or pre[1] is None:
-                return False
+                return self._refuse_commit(i, "gdn_snapshot_short")
             plan.append(("gdn", i, rows))
 
         for kind, i, payload in plan:
