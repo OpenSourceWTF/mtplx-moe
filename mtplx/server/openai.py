@@ -731,12 +731,18 @@ def _server_runtime_env_overrides(
         #   weights untouched for prefill/verify).
         # - GDN in_proj fusion (2026-08-27 receipt: AR 55.0 -> 56.7; four
         #   input GEMVs -> one, row-concat bit-exact, 36 layers).
+        # - MoE gate+up library merge (2026-08-27 receipt: AR 56.1 -> 57.65
+        #   mean n=4; 96 modules, 3->2 gather_qmm routed + 2->1 qmm shared).
+        #   NOTE: this arms ONLY the sanitize-time library-call merge; the
+        #   custom moe_glu_decode kernel stays behind MTPLX_FUSED_MOE_DECODE
+        #   (falsified at g64, -5%).
         for key in (
             "MTPLX_AR_PIPELINE",
             "MTPLX_COMPILED_GDN",
             "MTPLX_FAMILY_CAPTURE_COMMIT",
             "MTPLX_FUSED_HC_V3",
             "MTPLX_FUSED_GDN_INPROJ",
+            "MTPLX_FUSED_GATE_UP",
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
