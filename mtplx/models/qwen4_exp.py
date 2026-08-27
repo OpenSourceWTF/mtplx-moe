@@ -883,8 +883,27 @@ class NGramEmbedding(nn.Module):
                         )
                 if cache is not None:
                     cache[state_idx] = new_hist
+                self._stage_consumed = getattr(self, "_stage_consumed", 0) + 1
+                self._stage_census()
                 return emb
+            # staged rows were computed for a different call shape — count it,
+            # a silent fall-through here is exactly what an A/B cannot survive
+            self._stage_bypassed = getattr(self, "_stage_bypassed", 0) + 1
+        self._graph_calls = getattr(self, "_graph_calls", 0) + 1
+        self._stage_census()
         return self._graph_path(input_ids, cache, state_idx)
+
+    def _stage_census(self):
+        if os.environ.get("MTPLX_NGRAM_STAGE_DEBUG", "0") != "1":
+            return
+        n = getattr(self, "_stage_consumed", 0) + getattr(self, "_graph_calls", 0)
+        if n in (8, 64) or n % 512 == 0:
+            print(
+                f"[qwen4_exp] ngram path census: staged={getattr(self, '_stage_consumed', 0)} "
+                f"graph={getattr(self, '_graph_calls', 0)} "
+                f"stale-shape={getattr(self, '_stage_bypassed', 0)}",
+                flush=True,
+            )
 
     def _graph_path(self, input_ids, cache, state_idx, prev=None):
         ids = input_ids.astype(mx.int64)
