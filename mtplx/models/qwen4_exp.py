@@ -587,31 +587,100 @@ def _fuse_gate_up_sanitize(model, out: dict) -> dict:
 class QSACache:
     """Cache for one QSA layer: the attention KV plus the indexer's raw key
     stream and the incrementally maintained pooled (mean->norm->rope) block
-    keys. Append-only, single-sequence."""
+    keys. Single-sequence.
 
-    def __init__(self):
+    The raw/pooled streams are POSITIONAL buffers keyed to ``kv.offset``, not
+    append-only logs: every write lands at the absolute row range of the
+    tokens being forwarded and the valid lengths derive from ``kv.offset``.
+    That keeps the indexer streams in lockstep with the KV through every
+    mutation the runtime performs — per-round speculative rollback,
+    verified-window trims, and session-bank ``state`` round-trips — which
+    also makes the layer trimmable like a plain ``KVCache`` instead of being
+    deep-cloned every verify round. (Append-only streams desynced from the
+    KV on the first rollback and, past the indexer's engage threshold, built
+    a selection mask longer than the KV: the 2026-08-27 OpenCode
+    ``broadcast_shapes (1,1,4,3719) vs (1,24,4,3715)`` crash.)"""
+
+    step = 256
+
+    def __init__(self, compress_ratio: int = 4):
         self.kv = KVCache()
-        self.raw_keys: Optional[mx.array] = None  # [1, T, index_head_dim]
-        self.pooled: Optional[mx.array] = None  # [1, nb, index_head_dim]
+        self.ratio = max(1, int(compress_ratio))
+        self.raw_keys: Optional[mx.array] = None  # [1, cap, index_head_dim]
+        self.pooled: Optional[mx.array] = None  # [1, cap_blocks, index_head_dim]
+        self.pooled_len = 0  # valid pooled blocks
 
     @property
     def offset(self) -> int:
         return self.kv.offset
 
-    def append_raw(self, keys: mx.array) -> mx.array:
-        if self.raw_keys is None:
-            self.raw_keys = keys
-        else:
-            self.raw_keys = mx.concatenate([self.raw_keys, keys], axis=1)
-        return self.raw_keys
+    def write_raw(self, keys: mx.array) -> None:
+        """Store this forward's indexer keys at their absolute positions.
+
+        Called before ``kv.update_and_fetch`` advances the offset, so
+        ``kv.offset`` IS the absolute position of ``keys[:, 0]``. After a
+        trim the same positions are simply overwritten."""
+        start = self.kv.offset
+        end = start + keys.shape[1]
+        if self.raw_keys is None or end > self.raw_keys.shape[1]:
+            cap = ((end + self.step - 1) // self.step) * self.step
+            grown = mx.zeros((1, cap, keys.shape[2]), keys.dtype)
+            if self.raw_keys is not None:
+                grown[:, : self.raw_keys.shape[1], :] = self.raw_keys
+            self.raw_keys = grown
+        self.raw_keys[:, start:end, :] = keys
+
+    def write_pooled(self, blocks: mx.array, nb_start: int, nb_total: int) -> None:
+        if self.pooled is None or nb_total > self.pooled.shape[1]:
+            cap = ((nb_total + self.step - 1) // self.step) * self.step
+            grown = mx.zeros((1, cap, blocks.shape[2]), blocks.dtype)
+            if self.pooled is not None:
+                grown[:, : self.pooled.shape[1], :] = self.pooled
+            self.pooled = grown
+        self.pooled[:, nb_start:nb_total, :] = blocks
+        self.pooled_len = nb_total
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        trimmed = self.kv.trim(n)
+        # Pooled blocks past the new frontier were built from now-rejected
+        # rows. The raw buffer needs no touch: future writes land at the same
+        # absolute positions and overwrite.
+        self.pooled_len = min(self.pooled_len, self.kv.offset // self.ratio)
+        return trimmed
+
+    @property
+    def nbytes(self) -> int:
+        total = self.kv.nbytes
+        if self.raw_keys is not None:
+            total += self.raw_keys.nbytes
+        if self.pooled is not None:
+            total += self.pooled.nbytes
+        return total
 
     @property
     def state(self):
-        return self.kv.state
+        off = self.kv.offset
+        nb = min(self.pooled_len, off // self.ratio)
+        raw = None if self.raw_keys is None else self.raw_keys[:, :off, :]
+        pooled = None if self.pooled is None or nb == 0 else self.pooled[:, :nb, :]
+        return (*self.kv.state, raw, pooled)
 
     @state.setter
     def state(self, v):
-        self.kv.state = v
+        if len(v) != 4:
+            raise ValueError(
+                "QSACache.state expects (keys, values, raw_keys, pooled); got "
+                f"{len(v)} leaves — a session snapshot from an older build; "
+                "drop it and re-prefill"
+            )
+        keys, values, raw, pooled = v
+        self.kv.state = (keys, values)
+        self.raw_keys = raw
+        self.pooled = pooled
+        self.pooled_len = 0 if pooled is None else pooled.shape[1]
 
 
 class QSAIndexer(nn.Module):
@@ -638,23 +707,21 @@ class QSAIndexer(nn.Module):
             -mx.arange(0, rot, 2, dtype=mx.float32) / rot
         )
 
-    def _extend_pooled(self, cache: QSACache) -> Optional[mx.array]:
-        raw = cache.raw_keys
-        total = raw.shape[1]
+    def _extend_pooled(self, cache: QSACache, total: int) -> Optional[mx.array]:
         nb_total = total // self.ratio
-        nb_old = 0 if cache.pooled is None else cache.pooled.shape[1]
+        nb_old = min(cache.pooled_len, nb_total)
         if nb_total > nb_old:
-            fresh = raw[:, nb_old * self.ratio : nb_total * self.ratio, :]
+            fresh = cache.raw_keys[:, nb_old * self.ratio : nb_total * self.ratio, :]
             fresh = fresh.reshape(1, nb_total - nb_old, self.ratio, self.head_dim)
-            pooled = mx.mean(fresh.astype(mx.float32), axis=2).astype(raw.dtype)
+            pooled = mx.mean(fresh.astype(mx.float32), axis=2).astype(fresh.dtype)
             pooled = self.k_layernorm(pooled)
             starts = mx.arange(nb_old, nb_total, dtype=mx.int32) * self.ratio
             cos, sin = _rope_cos_sin(starts, self._inv_freq)
             pooled = _apply_partial_rope(pooled[:, :, None, :], cos, sin)[:, :, 0, :]
-            cache.pooled = (
-                pooled if cache.pooled is None else mx.concatenate([cache.pooled, pooled], axis=1)
-            )
-        return cache.pooled
+            cache.write_pooled(pooled, nb_old, nb_total)
+        if nb_total == 0:
+            return None
+        return cache.pooled[:, :nb_total, :]
 
     def __call__(self, hidden: mx.array, pos_start: int, cache: QSACache) -> Optional[mx.array]:
         B, S, _ = hidden.shape
@@ -669,9 +736,9 @@ class QSAIndexer(nn.Module):
         cos, sin = _rope_cos_sin(positions, self._inv_freq)
         q = _apply_partial_rope(q, cos, sin)
 
-        cache.append_raw(k)
-        pooled = self._extend_pooled(cache)
-        T = cache.raw_keys.shape[1]
+        cache.write_raw(k)
+        T = pos_start + S  # == the KV length after this forward's update
+        pooled = self._extend_pooled(cache, T)
         nb_total = 0 if pooled is None else pooled.shape[1]
 
         # Per-query complete-block counts. If every visible prefix fits inside
@@ -1579,13 +1646,14 @@ class TextModel(nn.Module):
         return self.mtp.fuse_and_run(hidden_states, emb, mtp_cache)
 
     def make_mtp_cache(self):
-        return [QSACache()]
+        return [QSACache(self.model.args.indexer_compress_ratio or 4)]
 
     def make_cache(self):
+        ratio = self.model.args.indexer_compress_ratio or 4
         caches = []
         for i, layer in enumerate(self.model.layers):
             if not layer.is_linear:
-                caches.append(QSACache())
+                caches.append(QSACache(ratio))
             elif "ple" in layer:
                 caches.append(ArraysCache(size=4))
             else:
