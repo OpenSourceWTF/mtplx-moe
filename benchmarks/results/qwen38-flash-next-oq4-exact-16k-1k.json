@@ -1,25 +1,25 @@
 {
   "accepted_by_depth": [
-    247,
-    128,
-    50
+    241,
+    126,
+    58
   ],
-  "decode_tps": 29.2719548493386,
+  "decode_tps": 27.186181197322167,
   "generated_tokens": 1024,
   "guard": {
-    "child_pid": 30524,
-    "guard_pid": 30192,
+    "child_pid": 48464,
+    "guard_pid": 48452,
     "lock_path": "/private/tmp/mtplx-gpu-exclusive.lock"
   },
   "mode": "mtp",
   "ngram_cache": {
     "cache_alignment_bytes": 0,
-    "cache_metadata_bytes": 486539264,
-    "cache_overhead_bytes": 758284288,
+    "cache_metadata_bytes": 620756992,
+    "cache_overhead_bytes": 892502016,
     "cache_payload_bytes": 1677721600,
     "cache_route_table_bytes": 268435456,
     "cache_slot_count": 16777216,
-    "cache_total_reserved_bytes": 2436005888,
+    "cache_total_reserved_bytes": 2570223616,
     "cache_transient_bytes": 3276800,
     "cache_transient_metadata_bytes": 32768,
     "eviction": "lru",
@@ -29,8 +29,9 @@
     "metal_working_reserve_bytes": 2147483648,
     "mlx_cache_limit_bytes": 2147483648,
     "payload_formula_ceiling_bytes": 2679602096,
+    "prefill_chunk_tokens": 2048,
     "previous_mlx_cache_limit_bytes": 130567005798,
-    "projected_residency_bytes": 87803233360,
+    "projected_residency_bytes": 87937451088,
     "requested_payload_ceiling_bytes": 10737418240,
     "safety_margin_bytes": 2147483648,
     "source_repo": "Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP",
@@ -38,14 +39,14 @@
     "storage": "affine-q4-g32",
     "target_residency_bytes": 88046829568
   },
-  "output_text": "The user wants me to add a `summarize_generation_outputs` helper function and focused pytest tests. Let me analyze the request:\n\n1. Add a `summarize_generation_outputs(outputs: Sequence[GenerationOutput]) -> dict[str, Any]` helper\n2. It should return a JSON-serializable summary with:\n   - request count\n   - total generated tokens\n   - mean and p95 prefill TPS\n   - mean and p95 decode TPS\n   - mean wall time\n   - peak memory in GiB\n3. Handle empty sequences without raising\n4. Ignore unavailable optional metrics\n5. Preserve existing type style\n6. Add focused pytest tests for empty input and representative outputs\n7. Return only a unified diff against the existing code\n\nI need to figure out what `GenerationOutput` looks like. Looking at the code, there's a `GenerationStats` class referenced (in `_attach_runtime_diagnostics`). The module uses `SimpleNamespace`, `Mapping`, `Sequence` from typing. Let me design the helper to work with objects that have attributes like:\n- `generated_tokens` (or `generated_tokens_total`)\n- `prefill_tps` or similar\n- `decode_tps` or `tok_s` or `decode_tok_s`\n- `elapsed_s` or `wall_time_s`\n- `peak_memory_bytes`\n\nLooking at the code more carefully:\n- `_generation_rate_fields` returns `tok_s`, `decode_elapsed_s`, `decode_tok_s`, `end_to_end_tok_s`\n- `_mlx_memory_stats` returns `peak_memory_bytes`\n- The module references `GenerationStats` in type annotations\n\nI'll design the helper to accept a `Sequence` of objects that may have various attributes, handling missing ones gracefully. I'll use `getattr` with defaults for optional fields.\n\nLet me write a clean implementation that:\n1. Takes a `Sequence[Any]` (or defines a Protocol/dataclass for the output)\n2. Extracts metrics safely\n3. Computes mean and p95 using numpy (already imported)\n4. Returns a JSON-serializable dict\n\nFor the p95 calculation, I can use `np.percentile` since numpy is already imported.\n\nLet me write the diff now. I'll add the helper function and tests. I need to figure out where to place it in the file - logically after the existing helper functions like `_generation_rate_fields`.\n\nFor the tests, I'll create simple mock objects or use `SimpleNamespace` since that's already imported.\n\nLet me craft the unified diff carefully.\n</think>\n\n```diff\n--- a/mtplx/generation.py\n+++ b/mtplx/generation.py\n@@ -1,6 +1,7 @@\n \"\"\"Reference AR and native-MTP generation loops.\n \n These loops intentionally favor correctness and observability over speed. The\n optimized runtime can tighten the same contracts after the MTP-1 gates pass.\n \"\"\"\n \n from __future__ import annotations\n@@ -8,6 +9,7 @@\n from collections import Counter\n from collections.abc import Mapping, Sequence\n from contextlib import contextmanager\n+from dataclasses import dataclass\n from contextvars import ContextVar\n import inspect\n import json\n@@ -15,6 +17,7 @@\n import sys\n import time\n from dataclasses import asdict, dataclass, field, fields, is_dataclass\n+from pathlib import Path\n from pathlib import Path\n from types import SimpleNamespace\n from typing import Any, Callable, Literal\n@@ -22,6 +25,7 @@\n import mlx.core as mx\n import numpy as np\n \n+from .a3b_compiled_target_prefix import (\n from .a3b_compiled_target_prefix import (\n     ensure_a3b_whole_moe_request_preflight as _ensure_a3b_whole_moe_request_preflight,\n     install_a3b_k1_target_prefix_route,\n```\n\nActually, let me redo this properly with a clean, focused diff. I need to look at the imports more carefully and place the new function in a logical location.\n\n```diff\n--- a/mtplx/generation.py\n+++ b/mtplx/generation.py\n@@ -1,5 +1,6 @@\n \"\"\"Reference AR and native-MTP generation loops.\n \n These loops intentionally favor correctness and observability over speed. The\n optimized runtime can tighten the same contracts after the MTP-1 gates pass.\n \"\"\"\n \n from __future__ import annotations\n \n from collections import Counter\n+from collections.abc import Mapping, Sequence\n from collections.abc import Mapping, Sequence\n from contextlib import contextmanager\n from contextvars import ContextVar\n import inspect\n import json\n import os\n import sys\n import time\n from dataclasses import asdict, dataclass, field, fields, is_dataclass",
-  "output_token_sha256": "fbfa32cbd9ce099529934ef6a8bf8cb62a809efe0932a19c693ffc511129be92",
-  "peak_memory_bytes": 85222321564,
-  "prefill_tps": 430.8253906049426,
+  "output_text": "The user wants me to add a `summarize_generation_outputs` function to the module that:\n\n1. Takes `outputs: Sequence[GenerationOutput]` as input\n2. Returns a `dict[str, Any]` that is JSON-serializable\n3. Contains: request count, total generated tokens, mean and p95 prefill TPS, mean and p95 decode TPS, mean wall time, and peak memory in GiB\n4. Handles empty sequence without raising\n5. Ignores unavailable optional metrics\n6. Preserves the module's existing type style\n7. Add focused pytest tests for empty input and representative outputs\n8. Return only a unified diff\n\nFirst, I need to understand what `GenerationOutput` likely looks like based on the context. Looking at the code, I see references to `GenerationStats` and various timing/token fields. Let me infer a reasonable structure for `GenerationOutput` based on the patterns in the code:\n\n- It likely has fields like `generated_tokens`, `prompt_tokens`, `prefill_time_s`, `decode_time_s`, `elapsed_s`, `peak_memory_bytes`, etc.\n- Looking at `_generation_rate_fields`, there are fields like `tok_s`, `decode_elapsed_s`, `decode_tok_s`, `end_to_end_tok_s`\n- Looking at `_attach_runtime_diagnostics`, there's `prefill_chunk_size`, timing fields, etc.\n- The `_mlx_memory_stats` returns `peak_memory_bytes`\n\nLet me design a `GenerationOutput` dataclass that captures the relevant fields, then write the `summarize_generation_outputs` function.\n\nActually, looking more carefully, the user says \"add a reusable `summarize_generation_outputs` helper\" - this means `GenerationOutput` might already exist or needs to be defined. Let me create a reasonable dataclass and the summarization function.\n\nLooking at the style:\n- Uses `from __future__ import annotations`\n- Uses `dataclass` from dataclasses\n- Uses `Literal` from typing\n- Uses `Any`, `Callable`, `Mapping`, `Sequence` from typing\n- Uses `numpy` as `np`\n- Heavy use of `getattr` for optional fields\n- Functions are module-level (not class methods)\n- Type annotations are present\n\nLet me design this:\n\n1. A `GenerationOutput` dataclass with the relevant fields (optional ones defaulting to `None`)\n2. A `summarize_generation_outputs` function that:\n   - Takes `Sequence[GenerationOutput]`\n   - Returns `dict[str, Any]`\n   - Computes: request count, total generated tokens, mean/p95 prefill TPS, mean/p95 decode TPS, mean wall time, peak memory in GiB\n   - Handles empty sequence\n   - Ignores unavailable optional metrics (None fields)\n\nFor the p95 calculation, I'll use `numpy.percentile` since numpy is already imported.\n\nLet me also write focused pytest tests.\n\nHere's my plan:\n\n```python\n@dataclass\nclass GenerationOutput:\n    \"\"\"Per-request generation telemetry record.\"\"\"\n    prompt_tokens: int\n    generated_tokens: int\n    wall_time_s: float\n    prefill_tps: float | None = None\n    decode_tps: float | None = None\n    peak_memory_bytes: int | None = None\n\n\ndef summarize_generation_outputs(\n    outputs: Sequence[GenerationOutput],\n) -> dict[str, Any]:\n    ...\n```\n\nFor the p95, I need to handle the case where there might be very few values (p95 with <2 elements doesn't make statistical sense, but we should still return a value or None).\n\nLet me write the diff now. I'll add:\n1. The `GenerationOutput` dataclass\n2. The `summarize_generation_outputs` function\n3. Tests in a separate test file\n\nActually, re-reading: \"Return only a unified diff against the existing code.\" So I need to produce a diff. Let me structure this as:\n- A diff that adds the dataclass and function to the existing module\n- A separate diff (or part of the same) that adds test file\n\nLet me think about what makes sense. The module already has `import numpy as np` and `import json`, `from typing import Any`, etc. I need to add `import statistics` or use numpy for percentile.\n\nFor the test file, I'll create a new test file.\n\nLet me also look at the existing `GenerationStats` reference - it's referenced as a string annotation `\"GenerationStats\"` in `_attach_runtime_diagnostics`. So `GenerationOutput` would be a new addition.\n\nLet me finalize my design:\n\n```python\n@dataclass\nclass GenerationOutput:\n    \"\"\"Per-request generation telemetry record consumed by summarize_generation_outputs.\"\"\"\n",
+  "output_token_sha256": "4d876b2e83ed4f4ab63027955b3d7b5494200d837564c7077791927d69e8695f",
+  "peak_memory_bytes": 85222315432,
+  "prefill_tps": 396.5944152990156,
   "preflight": {
-    "available_memory_bytes": 107192680448,
-    "cache_overhead_bytes": 613138444,
-    "cache_payload_bytes": 1177075700,
+    "available_memory_bytes": 119380082688,
+    "cache_overhead_bytes": 681852944,
+    "cache_payload_bytes": 1108361200,
     "embedded_mtp_bytes": 1633330336,
     "kv_mtp_reserve_bytes": 637046792,
     "metal_working_reserve_bytes": 2147483648,
@@ -64,5 +65,5 @@
   "schema": "mtplx-qwen38-resident-oq4-harness-v1",
   "source_revision": "43a82b3f0ff64fa417fd09ca046580f08d19b0d6",
   "status": "passed",
-  "wall_s": 96.91882870900008
+  "wall_s": 102.29749158300001
 }
