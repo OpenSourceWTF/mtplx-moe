@@ -8428,3 +8428,45 @@ def test_pi_request_policy_extension_respects_user_ownership(tmp_path):
     assert 'const mtplxModelID = "renamed-model"' in extension_path.read_text(
         encoding="utf-8"
     )
+
+
+def test_connect_opencode_actually_writes_the_config(tmp_path, monkeypatch, capsys):
+    """`mtplx connect opencode --model-id X` must register X in the provider
+    models map and set the default model — not just print a config path.
+    Found live 2026-08-27: wiring a day-0 family printed success while the
+    file kept only the old model id, and OpenCode died with
+    ProviderModelNotFoundError dressed as "Unexpected server error"."""
+    import json
+
+    from mtplx.cli import _cmd_connect, build_parser
+
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "mtplx": {"models": {"old-model": {}}},
+                    "unrelated": {"models": {"keep-me": {}}},
+                },
+                "model": "mtplx/old-model",
+            }
+        )
+    )
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(config_path))
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "connect",
+            "opencode",
+            "--port",
+            "18099",
+            "--model-id",
+            "qwen4-new-family-model",
+        ]
+    )
+    assert _cmd_connect(args) == 0
+    written = json.loads(config_path.read_text())
+    models = written["provider"]["mtplx"]["models"]
+    assert "qwen4-new-family-model" in models
+    assert written["model"] == "mtplx/qwen4-new-family-model"
+    assert "unrelated" in written["provider"], "other providers must survive"

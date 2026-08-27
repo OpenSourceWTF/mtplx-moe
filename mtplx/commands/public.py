@@ -14169,7 +14169,10 @@ def cmd_integrate_public(args: Any) -> int:
             },
         }
     elif action == "opencode":
-        from mtplx.opencode import build_opencode_provider_config
+        from mtplx.opencode import (
+            build_opencode_provider_config,
+            write_opencode_config,
+        )
 
         api_key_suffix = _api_key_command_suffix(args)
         reasoning_policy = reasoning_policy_for_model(model_ref=model_id)
@@ -14207,6 +14210,25 @@ def cmd_integrate_public(args: Any) -> int:
                 "Use MTPLX server settings or --reasoning on|off to change reasoning policy.",
             ],
         }
+        # `connect opencode` used to only PRINT the config while claiming
+        # "Config path: ..." — the file was never touched, so a new model id
+        # (e.g. a day-0 family) stayed missing from the provider's models map
+        # and OpenCode failed with ProviderModelNotFoundError surfaced as
+        # "Unexpected server error" (found live wiring Flash-Next, 2026-08-27).
+        # Write through the same merge-preserving writer the app flow uses.
+        payload["config_write"] = write_opencode_config(
+            base_url=api_base_url,
+            model_id=model_id,
+            model_name=f"MTPLX {model_id}",
+            api_key=getattr(args, "api_key", None),
+            enable_thinking=reasoning_policy.supported,
+            reasoning_effort=reasoning_policy.default_effort,
+            reasoning_effort_levels=(
+                tuple(reasoning_policy.effort_levels)
+                if reasoning_policy.supported
+                else None
+            ),
+        )
     elif action == "swival":
         from mtplx.swival import (
             build_swival_command,
