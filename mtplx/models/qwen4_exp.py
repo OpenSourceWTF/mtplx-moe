@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import struct
 import time
 from dataclasses import dataclass, field
@@ -318,7 +319,42 @@ class GatedResidual(nn.Module):
         if use_combine:
             self.block_inject_weight = nn.Linear(hc_hidden, self.hc_count, bias=False)
 
+    def _fused_read_applies(self, hyper_input: mx.array) -> bool:
+        # The fused kernel hardcodes the family geometry and reads bf16
+        # module weights directly; anything else (quantized hc mixes, other
+        # dims, prefill widths) stays on the eager chain.
+        if not _fused_hc_enabled():
+            return False
+        if self.hc_count != 4 or self.hidden_size != 2560:
+            return False
+        down = self.input_mix_weight_down
+        if hasattr(down, "scales") or down.weight.shape[0] != 320:
+            return False
+        if down.weight.dtype != hyper_input.dtype:
+            return False
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        return 1 <= rows <= 8
+
     def __call__(self, hyper_input: mx.array):
+        if self._fused_read_applies(hyper_input):
+            from mtplx.kernels.hyper_connection import fused_hyper_read
+
+            combine = "block_inject_weight" in self
+            x2 = hyper_input.reshape(-1, self.hc_count * self.hidden_size)
+            mixed, inject = fused_hyper_read(
+                x2,
+                self.hc_norm.weight,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.block_inject_weight.weight if combine else None,
+            )
+            mixed = mixed.reshape(*hyper_input.shape[:-1], self.hidden_size)
+            if not combine:
+                return mixed
+            inject = inject.reshape(*hyper_input.shape[:-1], self.hc_count)
+            return mixed, hyper_input, inject
         normed = self.hc_norm(hyper_input)
         mix = nn.silu(self.input_mix_weight_down(normed) / self.hc_count)
         mix = mx.sigmoid(self.input_mix_weight_up(mix))
@@ -347,59 +383,67 @@ class _FusedGateUpSwitchGLU(nn.Module):
     accumulation order. Large-M (prefill) calls fall through to the original
     SwitchGLU, keeping its expert-sorted access pattern."""
 
-    def __init__(self, sw):
+    def __init__(self, down_proj, gu_weight, gu_scales, gu_biases, group_size, bits, mode):
         super().__init__()
-        g, u = sw.gate_proj, sw.up_proj
-        self.gu_weight = mx.concatenate([g.weight, u.weight], axis=1)
-        self.gu_scales = mx.concatenate([g.scales, u.scales], axis=1)
-        gb = g.get("biases") if hasattr(g, "get") else getattr(g, "biases", None)
-        ub = u.get("biases") if hasattr(u, "get") else getattr(u, "biases", None)
-        self.gu_biases = (
-            mx.concatenate([gb, ub], axis=1) if gb is not None else None
-        )
-        self.group_size = g.group_size
-        self.bits = g.bits
-        self.mode = getattr(g, "mode", "affine")
-        self.down_proj = sw.down_proj
-        self._orig = sw
+        self.gu_weight = gu_weight
+        self.gu_scales = gu_scales
+        self.gu_biases = gu_biases
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self.down_proj = down_proj
+        # Built ONLY at sanitize time with placeholder params that strict
+        # load_weights replaces by the lazily concatenated pack tensors —
+        # the per-projection originals never materialize. A mid-session
+        # module swap cannot reclaim their memory (freed tensors keep their
+        # multi-GB safetensors shard buffers pinned via siblings; measured
+        # +0.31G per fused module straight into a Metal OOM).
 
-    def __call__(self, x, indices) -> mx.array:
-        if indices.size >= 64:
-            return self._orig(x, indices)
-        x = mx.expand_dims(x, (-2, -3))
+    def _gu(self, x, idx, sorted_indices=False):
         gu = mx.gather_qmm(
             x,
             self.gu_weight,
             self.gu_scales,
             self.gu_biases,
-            rhs_indices=indices,
+            rhs_indices=idx,
             transpose=True,
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
+            sorted_indices=sorted_indices,
         )
-        gate, up = mx.split(gu, 2, axis=-1)
-        x = self.down_proj(nn.silu(gate) * up, indices)
+        return mx.split(gu, 2, axis=-1)
+
+    def __call__(self, x, indices) -> mx.array:
+        from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        gate, up = self._gu(x, idx, sorted_indices=do_sort)
+        x = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=do_sort)
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
         return x.squeeze(-2)
 
 
 class _FusedGateUpMLP(nn.Module):
     """Shared-expert MLP with gate_proj+up_proj as one quantized matmul
-    (same fusion rationale as _FusedGateUpSwitchGLU; N=640 -> 1280)."""
+    (same fusion rationale and build-time contract as
+    _FusedGateUpSwitchGLU; N=640 -> 1280)."""
 
-    def __init__(self, mlp):
+    def __init__(self, down_proj, gu_weight, gu_scales, gu_biases, group_size, bits, mode):
         super().__init__()
-        g, u = mlp.gate_proj, mlp.up_proj
-        self.gu_weight = mx.concatenate([g.weight, u.weight], axis=0)
-        self.gu_scales = mx.concatenate([g.scales, u.scales], axis=0)
-        gb = getattr(g, "biases", None)
-        self.gu_biases = (
-            mx.concatenate([gb, u.biases], axis=0) if gb is not None else None
-        )
-        self.group_size = g.group_size
-        self.bits = g.bits
-        self.mode = getattr(g, "mode", "affine")
-        self.down_proj = mlp.down_proj
+        self.gu_weight = gu_weight
+        self.gu_scales = gu_scales
+        self.gu_biases = gu_biases
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self.down_proj = down_proj
 
     def __call__(self, x) -> mx.array:
         gu = mx.quantized_matmul(
@@ -421,22 +465,80 @@ def _fused_gate_up_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _fuse_moe_gate_up(layers) -> int:
-    """Swap quantized MoE gate/up pairs for fused modules. Returns the
-    number of fused projections. Quantized packs only — bf16 (tiny/test)
-    checkpoints keep the stock path."""
+def _fused_hc_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_HC") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+_LAYER_MLP_RE = re.compile(r"^(.*\.layers\.(\d+)\.mlp)\.switch_mlp\.gate_proj\.weight$")
+
+
+def _fuse_gate_up_sanitize(model, out: dict) -> dict:
+    """Sanitize-time MoE gate+up fusion (MTPLX_FUSED_GATE_UP=1).
+
+    Runs on the LAZY, file-backed weight dict before quantize/load: swaps
+    each layer's switch_mlp and shared_expert modules for the fused
+    variants (placeholder params), moves the pack tensors into the dict as
+    lazy concatenations under the fused names, and drops the per-projection
+    keys. Materialization then only ever builds fused buffers — the split
+    originals never come off the shards. down_proj children keep their
+    stock modules and tree paths, so the quantize predicate and strict
+    load_weights treat them exactly as before."""
+    if not _fused_gate_up_enabled():
+        return out
     fused = 0
-    for layer in layers:
-        mlp = getattr(layer, "mlp", None)
-        sw = getattr(mlp, "switch_mlp", None)
-        if sw is not None and hasattr(sw.gate_proj, "scales"):
-            mlp.switch_mlp = _FusedGateUpSwitchGLU(sw)
+    layer_hits = [
+        (m.group(1), int(m.group(2)))
+        for m in (_LAYER_MLP_RE.match(k) for k in list(out))
+        if m is not None
+    ]
+    for prefix, idx in layer_hits:
+        layer = model.layers[idx]
+        for sub, cat_axis in (("switch_mlp", 1), ("shared_expert", 0)):
+            base = f"{prefix}.{sub}"
+            gw = out.get(f"{base}.gate_proj.weight")
+            uw = out.get(f"{base}.up_proj.weight")
+            gs = out.get(f"{base}.gate_proj.scales")
+            us = out.get(f"{base}.up_proj.scales")
+            gb = out.get(f"{base}.gate_proj.biases")
+            ub = out.get(f"{base}.up_proj.biases")
+            if gw is None or uw is None or gs is None or us is None:
+                continue  # bf16/tiny checkpoints: stock path
+            if (gb is None) != (ub is None):
+                continue
+            k_in = 2560  # gate/up input dim = hidden for both blocks
+            group_size = k_in // gs.shape[-1]
+            bits = (gw.shape[-1] * 32) // k_in
+            if gb is None:
+                continue  # non-affine packing: unknown mode, stay stock
+            mod = getattr(layer.mlp, sub)
+            cls = _FusedGateUpSwitchGLU if sub == "switch_mlp" else _FusedGateUpMLP
+            gu_w = mx.concatenate([gw, uw], axis=cat_axis)
+            gu_s = mx.concatenate([gs, us], axis=cat_axis)
+            gu_b = mx.concatenate([gb, ub], axis=cat_axis)
+            setattr(
+                layer.mlp,
+                sub,
+                cls(
+                    mod.down_proj,
+                    mx.zeros(gu_w.shape, dtype=gu_w.dtype),
+                    mx.zeros(gu_s.shape, dtype=gu_s.dtype),
+                    mx.zeros(gu_b.shape, dtype=gu_b.dtype),
+                    group_size,
+                    bits,
+                    "affine",
+                ),
+            )
+            out[f"{base}.gu_weight"] = gu_w
+            out[f"{base}.gu_scales"] = gu_s
+            out[f"{base}.gu_biases"] = gu_b
+            for proj in ("gate_proj", "up_proj"):
+                for part in ("weight", "scales", "biases"):
+                    out.pop(f"{base}.{proj}.{part}", None)
             fused += 1
-        shared = getattr(mlp, "shared_expert", None)
-        if shared is not None and hasattr(shared.gate_proj, "scales"):
-            mlp.shared_expert = _FusedGateUpMLP(shared)
-            fused += 1
-    return fused
+    if fused:
+        print(f"[qwen4_exp] sanitize fused gate+up: {fused} modules", flush=True)
+    return out
 
 
 class QSACache:
@@ -1631,12 +1733,9 @@ class Model(nn.Module):
         return lm._head_logits(lm.mtp(widened, tok_emb, cache))
 
     def post_weight_load(self, model_path) -> None:
-        """Attach the SSD-resident n-gram sidecar after weights load, and
-        apply load-time projection fusions."""
-        if _fused_gate_up_enabled():
-            n = _fuse_moe_gate_up(self.layers)
-            if n:
-                print(f"[qwen4_exp] fused gate+up projections: {n} modules")
+        """Attach the SSD-resident n-gram sidecar after weights load.
+        (Gate+up fusion happens earlier, at sanitize time — see
+        _fuse_gate_up_sanitize.)"""
         path = Path(model_path) / "ngram-table.safetensors"
         if not path.exists():
             return
@@ -1750,6 +1849,8 @@ class Model(nn.Module):
 
         for dest, parts in stacked.items():
             out[dest] = mx.stack([parts[i] for i in range(len(parts))])
+
+        out = _fuse_gate_up_sanitize(self, out)
 
         # The 51B table never loads as a parameter; sidecar rows are gathered
         # lazily. Materialized shard concat is only accepted for tiny test
