@@ -93,6 +93,29 @@ def _diagnostic_timing_receipt(stats: Any) -> dict[str, float]:
     }
 
 
+def _speculation_receipt(stats: Any) -> dict[str, int | bool]:
+    """Copy existing end-of-run counters needed by the vanity comparison."""
+
+    return {
+        "speculative_depth": int(getattr(stats, "speculative_depth", 0) or 0),
+        "requested_speculative_depth": int(
+            getattr(stats, "requested_speculative_depth", 0) or 0
+        ),
+        "context_copy_active": bool(
+            getattr(stats, "context_copy_active", False)
+        ),
+        "context_copy_rounds": int(
+            getattr(stats, "context_copy_rounds", 0) or 0
+        ),
+        "context_copy_drafted_tokens": int(
+            getattr(stats, "context_copy_drafted_tokens", 0) or 0
+        ),
+        "context_copy_accepted_tokens": int(
+            getattr(stats, "context_copy_accepted_tokens", 0) or 0
+        ),
+    }
+
+
 def _resident_load_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Normal resident loader arguments; the n-gram cache is the only lane."""
 
@@ -423,6 +446,7 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
             "capture_commit_time_s": float(
                 getattr(stats, "capture_commit_time_s", 0.0) or 0.0
             ),
+            **_speculation_receipt(stats),
             **_diagnostic_timing_receipt(stats),
             "preflight": runtime.ngram_preflight_report,
             "ngram_cache": runtime.ngram_memory_report,

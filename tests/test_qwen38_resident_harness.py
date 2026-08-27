@@ -183,3 +183,26 @@ def test_receipt_includes_existing_generation_timing_breakdown() -> None:
     assert receipt["repair_time_s"] == 3.75
     assert receipt["pre_first_token_setup_s"] == 4.0
     assert receipt["verify_joint_eval_time_s"] == 0.0
+
+
+def test_receipt_includes_existing_speculation_and_prompt_copy_counts() -> None:
+    harness = _harness()
+    stats = SimpleNamespace(
+        speculative_depth=3,
+        requested_speculative_depth=3,
+        context_copy_active=True,
+        context_copy_rounds=4,
+        context_copy_drafted_tokens=70,
+        context_copy_accepted_tokens=61,
+    )
+
+    receipt = harness._speculation_receipt(stats)
+
+    assert receipt == {
+        "speculative_depth": 3,
+        "requested_speculative_depth": 3,
+        "context_copy_active": True,
+        "context_copy_rounds": 4,
+        "context_copy_drafted_tokens": 70,
+        "context_copy_accepted_tokens": 61,
+    }
