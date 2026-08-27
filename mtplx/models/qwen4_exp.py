@@ -1133,7 +1133,10 @@ class Qwen4ExpMTP(nn.Module):
         en = self.fc_embedding(self.pre_fc_norm_embedding(tok_emb))
         fused = self.fc_hidden(hn) + en[:, :, None, :]
         h = fused.reshape(B, S, W)
-        h = self.layers[0](h, input_ids=None, ssm_mask=None, cache=cache)
+        # cache is the make_mtp_cache() list (runtime convention); the single
+        # layer consumes its own QSACache entry
+        layer_cache = cache[0] if cache is not None else None
+        h = self.layers[0](h, input_ids=None, ssm_mask=None, cache=layer_cache)
         return self.hyper_connection_mixer(h)
 
 
