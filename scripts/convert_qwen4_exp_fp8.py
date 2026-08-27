@@ -41,6 +41,10 @@ import numpy as np
 BASE_BITS, BASE_GROUP = 4, 32
 EIGHT = {"bits": 8, "group_size": 64, "mode": "affine"}
 NGRAM_BITS, NGRAM_GROUP = 4, 32
+# Modules routed to BASE bits explicitly (empty in the speed recipe, where
+# the sensitive set lives in EIGHT_SUFFIXES; the bare recipe moves that set
+# here so it lands at 4-bit instead of falling through to bf16).
+FOUR_SUFFIXES: tuple = ()
 MTP_EXPERT_BITS, MTP_EXPERT_GROUP = 4, 32
 
 EIGHT_SUFFIXES = (
@@ -182,6 +186,9 @@ def quant_for(dest: str) -> dict | None:
     for s in EIGHT_SUFFIXES:
         if dest.endswith(s):
             return dict(EIGHT)
+    for s in FOUR_SUFFIXES:
+        if dest.endswith(s):
+            return {"bits": BASE_BITS, "group_size": BASE_GROUP, "mode": "affine"}
     if dest.endswith(("switch_mlp.gate_proj", "switch_mlp.up_proj", "switch_mlp.down_proj")):
         return {"bits": BASE_BITS, "group_size": BASE_GROUP, "mode": "affine"}
     if dest.endswith(("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
@@ -327,10 +334,28 @@ def rename_trunk(name: str) -> str:
 
 
 def main():
+    global BASE_BITS, BASE_GROUP, EIGHT_SUFFIXES, FOUR_SUFFIXES
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--recipe", choices=("speed", "bare"), default="speed",
+                    help="speed = Optimized Speed (4/g32 + 8-bit sensitive); "
+                         "bare = Bare Speed (flat 4/g64, 8-bit ONLY for the "
+                         "router and QSA indexer — routing integrity is "
+                         "non-negotiable; ~-33%% weight bytes/token)")
     args = ap.parse_args()
+    if args.recipe == "bare":
+        BASE_BITS, BASE_GROUP = 4, 64
+        EIGHT_SUFFIXES = ("mlp.gate", "indexer.index_qk_proj")
+        FOUR_SUFFIXES = (
+            "embed_tokens",
+            "lm_head",
+            "linear_attn.out_proj",
+            "shared_expert_gate",
+            "shared_expert.gate_proj",
+            "shared_expert.up_proj",
+            "shared_expert.down_proj",
+        )
     src, out = args.src, args.out
     out.mkdir(parents=True, exist_ok=True)
 
