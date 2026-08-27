@@ -14,6 +14,7 @@ INTERMEDIATE = 640
 ACTIVATION_SLOTS = 11
 ROWS = 2
 THREADS = 128
+STAGE1_GROUPS = EXPERTS // 32
 STAGE2_GROUPS = ACTIVATION_SLOTS * (INTERMEDIATE // 16)
 STAGE3_GROUPS = HIDDEN // 16
 
@@ -29,6 +30,87 @@ def _preamble() -> str:
         constexpr uint INTERMEDIATE = {INTERMEDIATE};
         constexpr uint ACTIVATION_SLOTS = {ACTIVATION_SLOTS};
         constexpr uint ROWS = {ROWS};
+    """
+
+
+def _stage1_source() -> str:
+    return _preamble() + r"""
+        constexpr uint EXPERTS_PER_GROUP = 32;
+        constexpr uint EXPERTS_PER_SUBTILE = 16;
+        constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint K_BLOCK = VALUES_PER_LANE * 32;
+        constexpr uint SHARED_GROUP = 64;
+
+        uint expert_tile = threadgroup_position_in_grid.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        for (uint subtile = 0; subtile < 2; ++subtile) {
+            uint expert_base = expert_tile * EXPERTS_PER_GROUP
+                + subtile * EXPERTS_PER_SUBTILE + simd_gid * 4;
+            float result[ROWS][4] = {};
+            for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
+                uint k_lane = k_block + lane * VALUES_PER_LANE;
+                float input_values[ROWS][VALUES_PER_LANE];
+                for (uint row = 0; row < ROWS; ++row) {
+                    for (uint item = 0; item < VALUES_PER_LANE; ++item) {
+                        input_values[row][item] = float(
+                            value[row * HIDDEN + k_lane + item]);
+                    }
+                }
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    uint expert = expert_base + result_index;
+                    uint weight_base = expert * HIDDEN + k_lane;
+                    for (uint item = 0; item < VALUES_PER_LANE; ++item) {
+                        float weight_value = float(router_weight[weight_base + item]);
+                        for (uint row = 0; row < ROWS; ++row) {
+                            result[row][result_index] +=
+                                input_values[row][item] * weight_value;
+                        }
+                    }
+                }
+            }
+            for (uint row = 0; row < ROWS; ++row) {
+                for (uint result_index = 0; result_index < 4; ++result_index) {
+                    float reduced = simd_sum(result[row][result_index]);
+                    if (lane == 0) {
+                        uint expert = expert_base + result_index;
+                        router_logits[row * EXPERTS + expert] = reduced;
+                    }
+                }
+            }
+        }
+
+        if (expert_tile == 0 && simd_gid == 0) {
+            const device uchar* weights =
+                reinterpret_cast<const device uchar*>(shared_gate_weight);
+            float result[ROWS] = {};
+            for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
+                uint k_lane = k_block + lane * VALUES_PER_LANE;
+                uint metadata_index = k_lane / SHARED_GROUP;
+                float scale = float(shared_gate_scales[metadata_index]);
+                float bias = float(shared_gate_biases[metadata_index]);
+                float input_sum[ROWS] = {};
+                float quantized_dot[ROWS] = {};
+                for (uint item = 0; item < VALUES_PER_LANE; ++item) {
+                    float weight_value = float(weights[k_lane + item]);
+                    for (uint row = 0; row < ROWS; ++row) {
+                        float input_value = float(value[row * HIDDEN + k_lane + item]);
+                        input_sum[row] += input_value;
+                        quantized_dot[row] += input_value * weight_value;
+                    }
+                }
+                for (uint row = 0; row < ROWS; ++row) {
+                    result[row] += scale * quantized_dot[row] + input_sum[row] * bias;
+                }
+            }
+            for (uint row = 0; row < ROWS; ++row) {
+                float reduced = simd_sum(result[row]);
+                if (lane == 0) {
+                    shared_gate[row] = bfloat(reduced);
+                }
+            }
+        }
     """
 
 
@@ -337,11 +419,16 @@ def _stage3_source() -> str:
 
 
 def sources() -> dict[str, str]:
-    return {"stage2": _stage2_source(), "stage3": _stage3_source()}
+    return {
+        "stage1": _stage1_source(),
+        "stage2": _stage2_source(),
+        "stage3": _stage3_source(),
+    }
 
 
 def launch_geometry() -> dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]]:
     return {
+        "stage1": ((STAGE1_GROUPS * THREADS, 1, 1), (THREADS, 1, 1)),
         "stage2": ((STAGE2_GROUPS * THREADS, 1, 1), (THREADS, 1, 1)),
         "stage3": ((STAGE3_GROUPS * THREADS, 1, 1), (THREADS, 1, 1)),
     }
@@ -359,6 +446,42 @@ def _kernel(key: str, input_names: list[str], output_name: str):
         )
         _KERNELS[key] = kernel
     return kernel
+
+
+def stage1(value: Any, binding: Any):
+    shared_gate = binding.shared_gate
+    kernel = _KERNELS.get("stage1")
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name="mtplx_qwen4_whole_moe_stage1",
+            input_names=[
+                "value",
+                "router_weight",
+                "shared_gate_weight",
+                "shared_gate_scales",
+                "shared_gate_biases",
+            ],
+            output_names=["router_logits", "shared_gate"],
+            source=sources()["stage1"],
+            ensure_row_contiguous=True,
+        )
+        _KERNELS["stage1"] = kernel
+    router = binding.router
+    router_weight = router.weight
+    (router_logits, shared_gate_values) = kernel(
+        inputs=[
+            value,
+            router_weight,
+            shared_gate.weight,
+            shared_gate.scales,
+            shared_gate.biases,
+        ],
+        grid=(STAGE1_GROUPS * THREADS, 1, 1),
+        threadgroup=(THREADS, 1, 1),
+        output_shapes=[(ROWS, EXPERTS), (ROWS,)],
+        output_dtypes=[mx.float32, mx.bfloat16],
+    )
+    return router_logits, shared_gate_values
 
 
 def stage2(value: Any, expert_ids: Any, binding: Any):
@@ -420,4 +543,4 @@ def stage3(
     return output
 
 
-__all__ = ["launch_geometry", "sources", "stage2", "stage3"]
+__all__ = ["launch_geometry", "sources", "stage1", "stage2", "stage3"]

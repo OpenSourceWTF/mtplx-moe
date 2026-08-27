@@ -20,11 +20,13 @@ class _Block:
 
 def test_exact_sources_encode_qwen4_storage_and_right_shapes():
     sources = kernels.sources()
+    assert "constexpr uint EXPERTS = 512" in sources["stage1"]
     assert "constexpr uint HIDDEN = 2560" in sources["stage2"]
     assert "constexpr uint TOP_K = 10" in sources["stage2"]
     assert "constexpr uint Q4_GROUP = 32" in sources["stage2"]
     assert "constexpr uint Q8_GROUP = 128" in sources["stage3"]
     assert kernels.launch_geometry() == {
+        "stage1": ((16 * 128, 1, 1), (128, 1, 1)),
         "stage2": ((440 * 128, 1, 1), (128, 1, 1)),
         "stage3": ((160 * 128, 1, 1), (128, 1, 1)),
     }

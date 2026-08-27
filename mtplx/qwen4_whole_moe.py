@@ -20,6 +20,7 @@ class Qwen4WholeMoeConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class _Binding:
+    router: Any
     routed: Any
     shared: Any
     shared_gate: Any
@@ -164,7 +165,7 @@ def _validate_block(block: Any, index: int) -> None:
 
 
 def _m2_call(block: Any, binding: _Binding, value: Any) -> Any:
-    logits = block.gate(value.astype(mx.float32))
+    logits, shared_gate = kernels.stage1(value, binding)
     expert_ids = mx.argpartition(-logits, block.top_k - 1, axis=-1)[
         ..., : block.top_k
     ]
@@ -173,7 +174,6 @@ def _m2_call(block: Any, binding: _Binding, value: Any) -> Any:
         axis=-1,
         precise=True,
     )
-    shared_gate = block.shared_expert_gate(value)
     activations = kernels.stage2(value, expert_ids, binding)
     output = kernels.stage3(
         activations,
@@ -197,6 +197,7 @@ def _installed_call(self: Any, value: Any) -> Any:
 
 def _bind(block: Any) -> _Binding:
     return _Binding(
+        router=block.gate,
         routed=block.switch_mlp,
         shared=block.shared_expert,
         shared_gate=block.shared_expert_gate,
