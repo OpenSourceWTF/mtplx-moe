@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from mtplx.attention_split import configure_split_full_attention
+from mtplx.attention_split import (
+    _install_split_attention_hook,
+    configure_split_full_attention,
+)
 
 
 class DummyProjection:
@@ -30,6 +33,21 @@ class DummyInner:
 class DummyModel:
     def __init__(self):
         self.model = DummyInner()
+
+
+class Qwen4StyleAttention:
+    """Qwen4 owns RoPE and indexer cache outside the legacy split contract."""
+
+    def __call__(self, x, rope, mask, cache, idx_cache):
+        return x
+
+
+def test_split_hook_rejects_qwen4_external_rope_and_index_cache_contract():
+    attention = Qwen4StyleAttention()
+    native_call = type(attention).__call__
+
+    assert _install_split_attention_hook(attention) is False
+    assert type(attention).__call__ is native_call
 
 
 def test_vllm_paged_hook_does_not_enable_split_full_attention(monkeypatch):

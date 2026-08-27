@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import Any
 
@@ -155,6 +156,18 @@ def _install_split_attention_hook(attn: Any) -> bool:
         return False
 
     original_call = cls.__call__
+    try:
+        inspect.signature(original_call).bind(
+            attn,
+            object(),
+            mask=None,
+            cache=None,
+        )
+    except (TypeError, ValueError):
+        # This hook owns the legacy Qwen3Next attention contract. Architectures
+        # such as Qwen4 pass external RoPE and indexer-cache state; wrapping
+        # those callables would drop required state even when the lane is off.
+        return False
 
     def split_call(
         self,
