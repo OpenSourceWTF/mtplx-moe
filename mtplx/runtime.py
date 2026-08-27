@@ -998,6 +998,17 @@ def load(
         if fuse_projections_enabled():
             fuse_report = configure_fused_projections(model)
             logger.info("[proj-fusion] %s", fuse_report)
+        from .qwen4_whole_moe import (
+            configure_qwen4_whole_moe,
+            qwen4_whole_moe_enabled,
+        )
+
+        if qwen4_whole_moe_enabled():
+            whole_moe_report = configure_qwen4_whole_moe(
+                model,
+                config=config,
+            )
+            logger.info("[qwen4-whole-moe] %s", whole_moe_report)
         from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
         if nax_env_enabled():
