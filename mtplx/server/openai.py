@@ -2055,8 +2055,40 @@ def _validate_hyper_settings(args: argparse.Namespace) -> None:
         )
 
 
+_QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES = frozenset(
+    {"capture", "capture_commit", "graphbank", "graphbank_capture_commit", "target_prefix"}
+)
+
+
+def _coerce_family_verify_strategy(args: argparse.Namespace) -> None:
+    """qwen4_exp packs cannot run the qwen3-next structure verify strategies.
+
+    The server default (--verify-strategy capture_commit) is the 27B fast
+    path; its capture stack introspects the qwen3-next DecoderLayer layout
+    (input_layernorm et al.) and raises AttributeError on Flash-Next
+    hyper-connection layers, so every MTP request 500s (first live hit
+    2026-08-27, raw-module boot). The family's repair-free lane is
+    MTPLX_FAMILY_CAPTURE_COMMIT, which wraps the batched verify instead of
+    replacing it, so 'batched' is the only correct base strategy here.
+    """
+    if not _served_model_type_is_qwen4_exp(args):
+        return
+    strategy = (
+        str(getattr(args, "verify_strategy", "") or "").strip().lower().replace("-", "_")
+    )
+    if strategy in _QWEN3NEXT_STRUCTURE_VERIFY_STRATEGIES:
+        print(
+            f"[serve] verify-strategy {strategy!r} is a qwen3-next structure "
+            "lane; qwen4_exp verifies 'batched' (repair-free rollback rides "
+            "the MTPLX_FAMILY_CAPTURE_COMMIT env lane). Coercing.",
+            flush=True,
+        )
+        args.verify_strategy = "batched"
+
+
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
+        _coerce_family_verify_strategy(args)
         _validate_mtp_batch_settings(args)
         _validate_hyper_settings(args)
         self.args = args
@@ -32672,11 +32704,17 @@ def _gemma4_bundle_defaults(
 def _model_declared_sampler_defaults(model_ref: str | None) -> dict[str, Any] | None:
     """Official sampler defaults declared by the model artifact itself.
 
-    Reads ``generation_config.json`` next to the checkpoint. Scoped to hy_v3
-    (Tencent ships temperature=0.9 / top_p=1.0 / top_k off, which differs from
-    the project-wide 0.6/0.95/20 coding defaults) — existing Qwen/Gemma serving
-    defaults are deliberately left untouched (no-regression rule; widening this
-    to every family needs its own A/B).
+    Scoped to families whose artifact-declared sampler differs from the
+    project-wide 0.6/0.95/20 coding defaults — existing Qwen3.6/Gemma serving
+    defaults are deliberately left untouched (no-regression rule; widening
+    to another family needs its own receipts):
+
+    - hy_v3: ``generation_config.json`` (Tencent ships 0.9 / 1.0 / off).
+    - qwen4_exp: the pack's ``mtplx_runtime.json`` sampler block. The family
+      law is 1.0/0.95/20 (day-0 eval receipts); until 2026-08-27 requests
+      silently sampled at the generic 0.6 while /health advertised the
+      rebound family default — the drafts mirrored 0.6 too
+      (draft_sampler_resolved_temperature receipt, serve battery 13:04).
     """
     if not model_ref:
         return None
@@ -32685,9 +32723,21 @@ def _model_declared_sampler_defaults(model_ref: str | None) -> dict[str, Any] | 
 
         path = resolve_model_path(str(model_ref))
         config = json.loads((path / "config.json").read_text(encoding="utf-8"))
-        if str(config.get("model_type", "")).lower() != "hy_v3":
+        mt = str(config.get("model_type", "")).lower()
+        tmt = str((config.get("text_config") or {}).get("model_type") or "").lower()
+        if mt == "hy_v3":
+            gen = json.loads(
+                (path / "generation_config.json").read_text(encoding="utf-8")
+            )
+        elif "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt):
+            runtime = json.loads(
+                (path / "mtplx_runtime.json").read_text(encoding="utf-8")
+            )
+            gen = runtime.get("sampler")
+            if not isinstance(gen, dict):
+                return None
+        else:
             return None
-        gen = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))
     except Exception:
         return None
     out: dict[str, Any] = {}
