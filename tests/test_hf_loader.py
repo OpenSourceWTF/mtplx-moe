@@ -758,6 +758,63 @@ def test_pull_model_records_provenance_marker_and_pins_commit(
     assert "engine_version" in marker and "pulled_at" in marker
 
 
+def test_pull_model_finalizes_qwen4_ngram_sources_read_only(
+    tmp_path: Path, monkeypatch
+):
+    from mtplx.qwen4_ngram import NGramManifest, NGramShard, save_ngram_manifest
+
+    def writer(**kwargs):
+        destination = Path(kwargs["local_dir"])
+        destination.mkdir(parents=True, exist_ok=True)
+        source = destination / "model-00001-of-00001.safetensors"
+        source.write_bytes(b"x" * 100)
+        source.chmod(0o644)
+        (destination / "config.json").write_text("{}\n", encoding="utf-8")
+        (destination / "model.safetensors.index.json").write_text(
+            '{"weight_map":{"ngram":"model-00001-of-00001.safetensors"}}\n',
+            encoding="utf-8",
+        )
+        save_ngram_manifest(
+            NGramManifest(
+                source_repo="repo",
+                source_revision="revision",
+                storage="affine-q4-g32",
+                row_width=160,
+                row_bytes=100,
+                padded_rows=1,
+                shards=(
+                    NGramShard(
+                        name=source.name,
+                        tensor="ngram",
+                        start_row=0,
+                        row_count=1,
+                        data_offset=0,
+                        data_bytes=100,
+                        file_size=100,
+                        sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                    ),
+                ),
+            ),
+            destination / "ngram-manifest.json",
+        )
+        return str(destination)
+
+    _install_sha_hub(
+        monkeypatch,
+        sha="commit-qwen4",
+        files={"model-00001-of-00001.safetensors": (100, "blob-qwen4")},
+        snapshot_writer=writer,
+    )
+
+    result = pull_model(
+        "OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP",
+        cache_dir=tmp_path,
+    )
+
+    mode = (Path(result["path"]) / "model-00001-of-00001.safetensors").stat().st_mode
+    assert mode & 0o222 == 0
+
+
 def test_pull_model_marker_sha_stale_triggers_sync(tmp_path: Path, monkeypatch):
     pack = _write_complete_pack(tmp_path)
     (pack / ".mtplx-source.json").write_text(

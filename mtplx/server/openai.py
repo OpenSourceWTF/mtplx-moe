@@ -170,6 +170,7 @@ from mtplx.server.flight_recorder import FlightRecorder, resolve_flight_recorder
 # Inert fallback so stubbed states (tests) hit no-op recorder methods instead
 # of AttributeError; real ServerState installs its own in __init__.
 _INERT_FLIGHT = FlightRecorder(None)
+_MAX_LIVE_PREFILL_CHUNK_TOKENS = 32_768
 
 
 def _flight(state: Any) -> FlightRecorder:
@@ -2007,6 +2008,18 @@ class ServerState:
             self.metal_memory_caps,
             getattr(args, "context_window", None),
         )
+        # Resolve the served context before model construction so resident
+        # runtimes can reserve their exact KV/MTP capacity in the pre-MLX
+        # admission gate.  The artifact config is the construction authority;
+        # do not enlarge the window later from tokenizer metadata after the
+        # memory reservation has already been committed.
+        self.model_context_window_max = _resolve_context_window(None, args.model)
+        requested_context_window = int(getattr(args, "context_window", None) or 0)
+        self.context_window = _select_backend_context_window(
+            startup_backend,
+            model_max=int(self.model_context_window_max),
+            requested=requested_context_window,
+        )
         self.profile = get_profile(args.profile)
         runtime_label = _health_runtime_mode_label(
             self.profile.name,
@@ -2092,6 +2105,11 @@ class ServerState:
                     args,
                     startup_backend,
                 ),
+                ngram_context_tokens=int(self.context_window),
+                # Live settings can raise the request-local chunk after model
+                # construction. Reserve the complete supported range once so
+                # no later request can outgrow the exact n-gram staging arena.
+                ngram_prefill_chunk_tokens=_MAX_LIVE_PREFILL_CHUNK_TOKENS,
                 batch_key="startup.load",
             ).result()
         except BaseException as exc:
@@ -2253,16 +2271,6 @@ class ServerState:
         self.draft_temperature_curve = draft_temperature_curve_for_model(
             model_ref=str(getattr(args, "model", "") or "") or None,
             descriptor=self.backend_descriptor,
-        )
-        self.model_context_window_max = _resolve_context_window(
-            self.runtime.tokenizer,
-            args.model,
-        )
-        requested_context_window = int(getattr(args, "context_window", None) or 0)
-        self.context_window = _select_backend_context_window(
-            self.backend_descriptor,
-            model_max=int(self.model_context_window_max),
-            requested=requested_context_window,
         )
         if (
             scheduler_config.mode == SchedulerMode.MTP_BATCH
@@ -14826,8 +14834,13 @@ def _coerce_setting(name: str, value: Any) -> Any:
             raise ValueError(f"{name} must be an integer") from exc
         if name == "depth" and not 1 <= coerced <= 8:
             raise ValueError("depth must be between 1 and 8")
-        if name == "prefill_chunk_tokens" and not 128 <= coerced <= 32768:
-            raise ValueError("prefill_chunk_tokens must be between 128 and 32768")
+        if name == "prefill_chunk_tokens" and not (
+            128 <= coerced <= _MAX_LIVE_PREFILL_CHUNK_TOKENS
+        ):
+            raise ValueError(
+                "prefill_chunk_tokens must be between 128 and "
+                f"{_MAX_LIVE_PREFILL_CHUNK_TOKENS}"
+            )
         if name == "draft_top_k" and coerced < 0:
             raise ValueError("draft_top_k must be non-negative")
         return coerced

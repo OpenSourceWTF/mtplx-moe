@@ -14,9 +14,11 @@ from typing import Any
 from .qwen4_ngram import (
     NGramManifest,
     NGramRuntimeBudget,
+    QWEN38_FLASH_NEXT_NGRAM_MANIFEST_SHA256,
     QWEN38_FLASH_NEXT_REPO,
     QWEN38_FLASH_NEXT_REVISION,
     plan_production_ngram_cache,
+    qwen4_ngram_transient_bytes,
     qwen4_kv_mtp_reserve_bytes,
 )
 
@@ -25,7 +27,6 @@ _MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024**2
 _MINIMUM_NGRAM_PAYLOAD_BYTES = 1 * _GIB
 _METAL_WORKING_RESERVE_BYTES = 2 * _GIB
 _SAFETY_MARGIN_BYTES = 2 * _GIB
-_TRANSIENT_BYTES = 16 * 2048 * 100
 _ALIGNMENT_BYTES = 16 * 1024
 _MAX_SIGNED_64 = (1 << 63) - 1
 _VM_STAT_PAGE_SIZE = re.compile(r"\(page size of ([0-9]+) bytes\)")
@@ -140,6 +141,7 @@ def validate_qwen4_oq4_contract(
         or manifest.source_repo != QWEN38_FLASH_NEXT_REPO
         or manifest.source_revision != QWEN38_FLASH_NEXT_REVISION
         or manifest.storage != "affine-q4-g32"
+        or manifest.digest != QWEN38_FLASH_NEXT_NGRAM_MANIFEST_SHA256
     ):
         raise ValueError(
             "Qwen4 runtime requires the pinned published oQ4 artifact and "
@@ -227,6 +229,7 @@ def plan_qwen4_resident_preflight(
     context_tokens: int,
     payload_ceiling_bytes: int,
     target_residency_bytes: int,
+    prefill_chunk_tokens: int = 2_048,
     available_memory_bytes: int | None = None,
 ) -> Qwen4ResidentPreflight:
     """Reject an unsafe full-resident load before MLX creates model arrays."""
@@ -239,6 +242,7 @@ def plan_qwen4_resident_preflight(
             raise ValueError("available_memory_bytes must be a positive exact integer")
         effective_target = min(effective_target, available_memory_bytes)
     kv_mtp = qwen4_kv_mtp_reserve_bytes(context_tokens)
+    transient_bytes = qwen4_ngram_transient_bytes(prefill_chunk_tokens)
     budget = NGramRuntimeBudget(
         measured_base_residency_bytes=resident_weight_bytes,
         kv_mtp_reserve_bytes=kv_mtp,
@@ -253,8 +257,8 @@ def plan_qwen4_resident_preflight(
         production = plan_production_ngram_cache(
             manifest,
             budget,
-            transient_limit_bytes=_TRANSIENT_BYTES,
-            max_inflight_io_bytes=_TRANSIENT_BYTES,
+            transient_limit_bytes=transient_bytes,
+            max_inflight_io_bytes=transient_bytes,
             max_open_files=129,
             bypass_page_cache=True,
             eviction="lru",

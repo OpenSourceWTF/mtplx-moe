@@ -29,7 +29,6 @@ from bisect import bisect_right
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field, replace
-from heapq import nsmallest
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal, Self
@@ -43,6 +42,9 @@ import numpy as np
 
 QWEN38_FLASH_NEXT_REPO = "Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP"
 QWEN38_FLASH_NEXT_REVISION = "43a82b3f0ff64fa417fd09ca046580f08d19b0d6"
+QWEN38_FLASH_NEXT_NGRAM_MANIFEST_SHA256 = (
+    "2de8c0579123e43add47a5f6e4f251482523d31405346ac88c98d8651ddbf897"
+)
 NGRAM_MANIFEST_FORMAT = "mtplx-qwen4-ngram-manifest-v1"
 # The production artifact has exactly 128 n-gram shards.  At under 8 KiB of
 # metadata per shard, 1 MiB leaves generous headroom without accepting an
@@ -1867,7 +1869,7 @@ class NGramCacheConfig:
     max_inflight_io_bytes: int
     max_open_files: int
     bypass_page_cache: bool
-    eviction: Literal["lru", "frequency"]
+    eviction: Literal["lru"]
     allocation_alignment_bytes: int = 1
 
     def __post_init__(self) -> None:
@@ -1885,18 +1887,15 @@ class NGramCacheConfig:
                 raise ValueError(f"{name} must be positive")
         if type(self.bypass_page_cache) is not bool:
             raise TypeError("bypass_page_cache must be an exact boolean")
-        if type(self.eviction) is not str or self.eviction not in {
-            "lru",
-            "frequency",
-        }:
-            raise ValueError("eviction must be 'lru' or 'frequency'")
+        if type(self.eviction) is not str or self.eviction != "lru":
+            raise ValueError("eviction must be 'lru'")
         if self.allocation_alignment_bytes & (self.allocation_alignment_bytes - 1):
             raise ValueError("allocation_alignment_bytes must be a power of two")
 
 
 _EMPTY_ROW = (1 << 32) - 1
 _EMPTY_SLOT = (1 << 32) - 1
-_SLOT_METADATA_BYTES = 8 + 4 + 4 + 1 + 4 + 8
+_SLOT_METADATA_BYTES = 8 + 4 + 4 + 1 + 4 + 8 + 4 + 4
 _ROUTE_ENTRY_BYTES = 4 + 4
 
 
@@ -1988,6 +1987,31 @@ def _checked_mul_bytes(left: int, right: int, *, label: str) -> int:
     return value
 
 
+def qwen4_ngram_transient_bytes(prefill_chunk_tokens: int) -> int:
+    """Exact cold-miss staging bytes for one pinned Qwen4 prefill chunk."""
+
+    if type(prefill_chunk_tokens) is not int:
+        raise TypeError("prefill_chunk_tokens must be an exact integer")
+    if prefill_chunk_tokens < 1:
+        raise ValueError("prefill_chunk_tokens must be positive")
+    geometry = NGramGeometry.qwen38()
+    heads = _checked_mul_bytes(
+        geometry.ngram_size - 1,
+        geometry.heads_per_ngram,
+        label="Qwen4 n-gram transient heads",
+    )
+    rows = _checked_mul_bytes(
+        prefill_chunk_tokens,
+        heads,
+        label="Qwen4 n-gram transient rows",
+    )
+    return _checked_mul_bytes(
+        rows,
+        100,
+        label="Qwen4 n-gram transient bytes",
+    )
+
+
 def _aligned_bytes(value: int, alignment: int, *, label: str) -> int:
     padded = _checked_add_bytes(value, alignment - 1, label=label)
     return padded & -alignment
@@ -2055,7 +2079,7 @@ def plan_ngram_cache(
     transient_metadata_bytes = transient_slots
     slot_backings = tuple(
         _checked_mul_bytes(slot_count, item_bytes, label="slot metadata backing")
-        for item_bytes in (8, 4, 4, 1, 4, 8)
+        for item_bytes in (8, 4, 4, 1, 4, 8, 4, 4)
     )
     route_backings = (
         _checked_mul_bytes(route_capacity, 4, label="route-key backing"),
@@ -2103,7 +2127,7 @@ def plan_production_ngram_cache(
     max_inflight_io_bytes: int,
     max_open_files: int,
     bypass_page_cache: bool,
-    eviction: Literal["lru", "frequency"],
+    eviction: Literal["lru"],
 ) -> NGramProductionCachePlan:
     """Solve the largest exact stored-row cache under the measured runtime budget."""
 
@@ -2203,8 +2227,13 @@ class _PackedCacheIndex:
     __slots__ = (
         "access",
         "frequency",
+        "free_head",
         "generations",
         "loaded",
+        "lru_head",
+        "lru_next",
+        "lru_prev",
+        "lru_tail",
         "pins",
         "route_keys",
         "route_mask",
@@ -2221,6 +2250,12 @@ class _PackedCacheIndex:
         self.loaded = bytearray(plan.slot_count)
         self.frequency = array("I", [0]) * plan.slot_count
         self.access = array("Q", [0]) * plan.slot_count
+        self.lru_prev = array("I", [_EMPTY_SLOT]) * plan.slot_count
+        self.lru_next = array("I", range(1, plan.slot_count + 1))
+        self.lru_next[-1] = _EMPTY_SLOT
+        self.free_head = 0
+        self.lru_head = _EMPTY_SLOT
+        self.lru_tail = _EMPTY_SLOT
         self.route_keys = array("I", [_EMPTY_ROW]) * plan.route_capacity
         self.route_slots = array("I", [_EMPTY_SLOT]) * plan.route_capacity
         self.route_mask = plan.route_capacity - 1
@@ -2230,10 +2265,69 @@ class _PackedCacheIndex:
             or self.pins.itemsize != 4
             or self.frequency.itemsize != 4
             or self.access.itemsize != 8
+            or self.lru_prev.itemsize != 4
+            or self.lru_next.itemsize != 4
             or self.route_keys.itemsize != 4
             or self.route_slots.itemsize != 4
         ):
             raise RuntimeError("platform packed integer widths do not match the cache plan")
+
+    def pop_free_slot(self) -> int | None:
+        slot = self.free_head
+        if slot == _EMPTY_SLOT:
+            return None
+        self.free_head = int(self.lru_next[slot])
+        self.lru_prev[slot] = _EMPTY_SLOT
+        self.lru_next[slot] = _EMPTY_SLOT
+        return int(slot)
+
+    def _unlink_lru(self, slot: int) -> None:
+        previous = int(self.lru_prev[slot])
+        following = int(self.lru_next[slot])
+        if self.lru_head == slot:
+            self.lru_head = following
+        elif previous != _EMPTY_SLOT:
+            self.lru_next[previous] = following
+        else:
+            return
+        if self.lru_tail == slot:
+            self.lru_tail = previous
+        elif following != _EMPTY_SLOT:
+            self.lru_prev[following] = previous
+        self.lru_prev[slot] = _EMPTY_SLOT
+        self.lru_next[slot] = _EMPTY_SLOT
+
+    def touch_lru(self, slot: int) -> None:
+        self._unlink_lru(slot)
+        previous = self.lru_tail
+        self.lru_prev[slot] = previous
+        self.lru_next[slot] = _EMPTY_SLOT
+        if previous == _EMPTY_SLOT:
+            self.lru_head = slot
+        else:
+            self.lru_next[previous] = slot
+        self.lru_tail = slot
+
+    def remove_lru(self, slot: int) -> None:
+        self._unlink_lru(slot)
+
+    def recycle_slot(self, slot: int) -> None:
+        self._unlink_lru(slot)
+        self.lru_prev[slot] = _EMPTY_SLOT
+        self.lru_next[slot] = self.free_head
+        self.free_head = slot
+
+    def oldest_unpinned_slots(
+        self, count: int, *, protected: set[int]
+    ) -> tuple[int, ...]:
+        selected: list[int] = []
+        slot = self.lru_head
+        while slot != _EMPTY_SLOT and len(selected) < count:
+            following = int(self.lru_next[slot])
+            if self.pins[slot] == 0 and slot not in protected:
+                selected.append(int(slot))
+            slot = following
+        return tuple(selected)
 
     def _probe(self, row: int) -> tuple[int, bool]:
         index = (row * 2_654_435_761) & self.route_mask
@@ -2293,6 +2387,13 @@ class _PackedCacheIndex:
             self.loaded[slot] = 0
             self.frequency[slot] = 0
             self.access[slot] = 0
+            self.lru_prev[slot] = _EMPTY_SLOT
+            self.lru_next[slot] = (
+                slot + 1 if slot + 1 < self.slot_count else _EMPTY_SLOT
+            )
+        self.free_head = 0
+        self.lru_head = _EMPTY_SLOT
+        self.lru_tail = _EMPTY_SLOT
         for index in range(self.route_mask + 1):
             self.route_keys[index] = _EMPTY_ROW
             self.route_slots[index] = _EMPTY_SLOT
@@ -2304,6 +2405,11 @@ class _PackedCacheIndex:
         self.loaded = bytearray()
         self.frequency = array("I")
         self.access = array("Q")
+        self.lru_prev = array("I")
+        self.lru_next = array("I")
+        self.free_head = _EMPTY_SLOT
+        self.lru_head = _EMPTY_SLOT
+        self.lru_tail = _EMPTY_SLOT
         self.route_keys = array("I")
         self.route_slots = array("I")
         self.slot_count = 0
@@ -3018,7 +3124,6 @@ class NGramRowCache:
         self._read_group = (
             self._read_segmented_group if segmented else self._read_contiguous_group
         )
-        self._victim_key = self._lru_key if config.eviction == "lru" else self._frequency_key
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._executor = executor
@@ -3085,20 +3190,12 @@ class NGramRowCache:
         with self._lock:
             return self._state == "CLOSED"
 
-    def _lru_key(self, slot: int) -> tuple[int]:
-        return (int(self._packed.access[slot]),)
-
-    def _frequency_key(self, slot: int) -> tuple[int, int]:
-        return (
-            int(self._packed.frequency[slot]),
-            int(self._packed.access[slot]),
-        )
-
     def _touch(self, slot: int) -> None:
         self._tick += 1
         self._packed.access[slot] = self._tick
         if self._packed.frequency[slot] < (1 << 32) - 1:
             self._packed.frequency[slot] += 1
+        self._packed.touch_lru(slot)
 
     def _ticket(self, slot: int) -> SlotTicket:
         return SlotTicket(slot, int(self._packed.generations[slot]), self._token)
@@ -3110,7 +3207,9 @@ class NGramRowCache:
             and 0 <= ticket.slot < self._packed.slot_count
         )
 
-    def _invalidate_ticket(self, ticket: SlotTicket) -> None:
+    def _invalidate_ticket(
+        self, ticket: SlotTicket, *, recycle_slot: bool = True
+    ) -> None:
         if not self._ticket_owned(ticket):
             return
         slot = ticket.slot
@@ -3126,6 +3225,9 @@ class NGramRowCache:
         self._packed.loaded[slot] = 0
         self._packed.frequency[slot] = 0
         self._packed.access[slot] = 0
+        self._packed.remove_lru(slot)
+        if recycle_slot:
+            self._packed.recycle_slot(slot)
 
     def _release_ticket_pin(self, ticket: SlotTicket, *, cancel_loading: bool) -> None:
         if not self._ticket_owned(ticket):
@@ -3235,6 +3337,32 @@ class NGramRowCache:
                 f"descriptor-relative n-gram read failed: {failure}"
             )
 
+    def _read_publish_batch(
+        self,
+        jobs: tuple[
+            tuple[
+                int,
+                int,
+                int,
+                int,
+                int,
+                tuple[tuple[int, SlotTicket], ...],
+            ],
+            ...,
+        ],
+    ) -> None:
+        """Run one bounded worker task while releasing every reservation."""
+
+        first_failure: BaseException | None = None
+        for job in jobs:
+            try:
+                self._read_publish(*job)
+            except BaseException as exc:  # noqa: BLE001 - drain every fixed job
+                if first_failure is None:
+                    first_failure = exc
+        if first_failure is not None:
+            raise first_failure
+
     def _poison_locked(self, cause: Exception) -> None:
         if self._poison_message is not None:
             return
@@ -3261,21 +3389,18 @@ class NGramRowCache:
         if count == 0:
             return ()
         selected: list[int] = []
-        for slot in range(self._packed.slot_count):
-            if self._packed.rows[slot] == _EMPTY_ROW and slot not in protected:
-                selected.append(slot)
-                if len(selected) == count:
-                    return tuple(selected)
+        while len(selected) < count:
+            slot = self._packed.pop_free_slot()
+            if slot is None:
+                break
+            selected.append(slot)
         needed = count - len(selected)
-        candidates = (
-            slot
-            for slot in range(self._packed.slot_count)
-            if self._packed.rows[slot] != _EMPTY_ROW
-            and self._packed.pins[slot] == 0
-            and slot not in protected
+        selected.extend(
+            self._packed.oldest_unpinned_slots(needed, protected=protected)
         )
-        selected.extend(nsmallest(needed, candidates, key=self._victim_key))
         if len(selected) != count:
+            for slot in reversed(selected[: count - needed]):
+                self._packed.recycle_slot(slot)
             raise NGramCacheFull("no unpinned slots for complete n-gram miss set")
         return tuple(selected)
 
@@ -3371,7 +3496,9 @@ class NGramRowCache:
             new_tickets: dict[int, SlotTicket] = {}
             for row, slot_index in zip(missing, selected, strict=True):
                 if self._packed.rows[slot_index] != _EMPTY_ROW:
-                    self._invalidate_ticket(self._ticket(slot_index))
+                    self._invalidate_ticket(
+                        self._ticket(slot_index), recycle_slot=False
+                    )
                 self._packed.generations[slot_index] += 1
                 self._packed.rows[slot_index] = row
                 self._packed.pins[slot_index] = 1
@@ -3385,46 +3512,52 @@ class NGramRowCache:
                 new_tickets[row] = ticket
 
             self._inflight_bytes += miss_bytes
-            submitted: list[Future[None]] = []
-            submitted_bytes = 0
-            submitted_reservations = 0
-            try:
-                for group_index, group_offset, group_start, group_count in reservations:
-                    shard_index, base_offset, _base_length, all_group_rows = groups[
-                        group_index
-                    ]
-                    group_rows = all_group_rows[
-                        group_offset : group_offset + group_count
-                    ]
-                    offset = base_offset + group_offset * self._row_bytes
-                    length = group_count * self._row_bytes
-                    future = self._executor.submit(
-                        self._read_publish,
+            jobs: list[
+                tuple[
+                    int,
+                    int,
+                    int,
+                    int,
+                    int,
+                    tuple[tuple[int, SlotTicket], ...],
+                ]
+            ] = []
+            job_rows: list[int] = []
+            for group_index, group_offset, group_start, group_count in reservations:
+                shard_index, base_offset, _base_length, all_group_rows = groups[
+                    group_index
+                ]
+                group_rows = all_group_rows[group_offset : group_offset + group_count]
+                jobs.append(
+                    (
                         shard_index,
-                        offset,
-                        length,
+                        base_offset + group_offset * self._row_bytes,
+                        group_count * self._row_bytes,
                         group_start,
                         group_count,
                         group_rows,
                     )
-                    submitted.append(future)
-                    submitted_bytes += length
-                    submitted_reservations += 1
+                )
+                job_rows.extend(row for row, _ticket in group_rows)
+            try:
+                submitted: tuple[Future[None], ...] = ()
+                if jobs:
+                    future = self._executor.submit(
+                        self._read_publish_batch, tuple(jobs)
+                    )
+                    submitted = (future,)
                     self._worker_futures.add(future)
-                    group_row_ids = tuple(row for row, _ticket in group_rows)
+                    owned_rows = tuple(job_rows)
+                    for row in owned_rows:
+                        self._loading_futures[row] = future
                     future.add_done_callback(
-                        lambda completed, owned=group_row_ids: self._discard_worker(
+                        lambda completed, owned=owned_rows: self._discard_worker(
                             completed, owned
                         )
                     )
-                    for row in group_row_ids:
-                        self._loading_futures[row] = future
             except Exception as exc:
-                unsent = miss_bytes - submitted_bytes
-                self._inflight_bytes -= unsent
-                for _group, _offset, start, count in reservations[
-                    submitted_reservations:
-                ]:
+                self._inflight_bytes -= miss_bytes
+                for _group, _offset, start, count in reservations:
                     self._transient_pool.release(start, count)
                 for ticket in existing_tickets.values():
                     self._release_ticket_pin(ticket, cancel_loading=False)
@@ -3730,6 +3863,7 @@ class NGramRowCache:
 __all__ = [
     "QWEN38_FLASH_NEXT_REPO",
     "QWEN38_FLASH_NEXT_REVISION",
+    "QWEN38_FLASH_NEXT_NGRAM_MANIFEST_SHA256",
     "NGramAcquireFuture",
     "NGramCacheClosed",
     "NGramCacheConfig",
@@ -3753,6 +3887,7 @@ __all__ = [
     "load_ngram_manifest",
     "plan_ngram_cache",
     "plan_production_ngram_cache",
+    "qwen4_ngram_transient_bytes",
     "qwen4_kv_mtp_reserve_bytes",
     "qwen38_ngram_manifest",
     "save_ngram_manifest",

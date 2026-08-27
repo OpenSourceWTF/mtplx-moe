@@ -11982,6 +11982,47 @@ def test_server_state_passes_step_adapter_quant_contract_to_load(monkeypatch):
     assert captured["kwargs"]["merge_mtp_adapter"] is True
 
 
+def test_server_state_passes_selected_context_to_resident_load(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(openai, "apply_profile_env", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai,
+        "_configure_mlx_cache_limit",
+        lambda _args: {"configured": False},
+    )
+    monkeypatch.setattr(
+        openai,
+        "_resolve_context_window",
+        lambda _tokenizer, _model: 262_144,
+    )
+
+    def stop_after_load(model, mtp, contract, **kwargs):
+        del model, mtp, contract
+        captured.update(kwargs)
+        raise RuntimeError("stop after load")
+
+    monkeypatch.setattr(openai, "load", stop_after_load)
+    args = parse_args(
+        [
+            "--model",
+            "models/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP",
+            "--context-window",
+            "131072",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="stop after load"):
+        openai.ServerState(args)
+
+    assert captured["ngram_context_tokens"] == 131_072
+    assert captured["ngram_prefill_chunk_tokens"] == 32_768
+
+
 def test_normalize_stop_sequences_accepts_string_list_and_caps_at_four():
     assert openai._normalize_stop_sequences(None) == []
     assert openai._normalize_stop_sequences("END") == ["END"]

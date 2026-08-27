@@ -88,12 +88,51 @@ def test_preflight_rejects_before_mlx_when_resident_weights_exceed_target() -> N
         )
 
 
+def test_preflight_accounts_configured_prefill_transient_bytes() -> None:
+    from mtplx.qwen4_preflight import plan_qwen4_resident_preflight
+
+    common = {
+        "resident_weight_bytes": 1 * 1024**3,
+        "manifest": _manifest(),
+        "context_tokens": 17_408,
+        "payload_ceiling_bytes": 2 * 1024**3,
+        "target_residency_bytes": 8 * 1024**3,
+    }
+    small = plan_qwen4_resident_preflight(
+        **common,
+        prefill_chunk_tokens=2_048,
+    )
+    large = plan_qwen4_resident_preflight(
+        **common,
+        prefill_chunk_tokens=4_096,
+    )
+
+    assert large.cache_overhead_bytes - small.cache_overhead_bytes == 3_309_568
+
+
 def test_preflight_rejects_non_oq4_artifact_contract() -> None:
     from mtplx.qwen4_preflight import validate_qwen4_oq4_contract
 
     with pytest.raises(ValueError, match="published oQ4"):
         validate_qwen4_oq4_contract(
             {"model_type": "qwen4_exp", "quantization": {"bits": 8}},
+            _manifest(),
+        )
+
+
+def test_preflight_rejects_self_asserted_qwen4_manifest_provenance() -> None:
+    from mtplx.qwen4_preflight import validate_qwen4_oq4_contract
+
+    with pytest.raises(ValueError, match="published oQ4"):
+        validate_qwen4_oq4_contract(
+            {
+                "model_type": "qwen4_exp",
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 32,
+                    "mode": "affine",
+                },
+            },
             _manifest(),
         )
 

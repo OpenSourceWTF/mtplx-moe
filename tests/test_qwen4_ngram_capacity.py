@@ -9,6 +9,7 @@ from mtplx.qwen4_ngram import (
     NGramShard,
     plan_ngram_cache,
     plan_production_ngram_cache,
+    qwen4_ngram_transient_bytes,
     qwen4_kv_mtp_reserve_bytes,
 )
 
@@ -53,7 +54,7 @@ def test_capacity_accounts_slots_metadata_routes_alignment_and_transients() -> N
 
     assert plan.slot_count == 10
     assert plan.payload_bytes == 1_000
-    assert plan.slot_metadata_bytes == 10 * (8 + 4 + 4 + 1 + 4 + 8)
+    assert plan.slot_metadata_bytes == 10 * (8 + 4 + 4 + 1 + 4 + 8 + 4 + 4)
     assert plan.route_capacity == 32
     assert plan.route_table_bytes == 32 * (4 + 4)
     assert plan.transient_bytes == 300
@@ -72,6 +73,43 @@ def test_capacity_accounts_slots_metadata_routes_alignment_and_transients() -> N
 def test_checked_kv_capacity_arithmetic_rejects_signed_64_bit_overflow() -> None:
     with pytest.raises(OverflowError, match="signed 64-bit"):
         qwen4_kv_mtp_reserve_bytes((1 << 63) - 1)
+
+
+def test_qwen4_transient_bytes_follow_configured_prefill_geometry() -> None:
+    assert qwen4_ngram_transient_bytes(4_096) == 4_096 * 16 * 100
+
+
+def test_qwen4_transient_bytes_reject_overflow() -> None:
+    with pytest.raises(OverflowError, match="signed 64-bit"):
+        qwen4_ngram_transient_bytes((1 << 63) - 1)
+
+
+def test_packed_lru_uses_free_chain_then_oldest_unprotected_slots() -> None:
+    from mtplx.qwen4_ngram import _PackedCacheIndex
+
+    plan = plan_ngram_cache(
+        _manifest(rows=3),
+        NGramCacheConfig(
+            cache_limit_bytes=300,
+            transient_limit_bytes=100,
+            max_inflight_io_bytes=100,
+            max_open_files=2,
+            bypass_page_cache=True,
+            eviction="lru",
+        ),
+    )
+    packed = _PackedCacheIndex(plan)
+    try:
+        assert [packed.pop_free_slot() for _ in range(4)] == [0, 1, 2, None]
+        for slot, row in enumerate((10, 11, 12)):
+            packed.rows[slot] = row
+            packed.touch_lru(slot)
+        packed.touch_lru(0)
+        packed.pins[2] = 1
+
+        assert packed.oldest_unpinned_slots(2, protected={1}) == (0,)
+    finally:
+        packed.release()
 
 
 def test_production_budget_rejects_runtime_without_minimum_cache() -> None:

@@ -39,6 +39,35 @@ if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
 
 
+def _construction_prefill_chunk_tokens(explicit: int | None) -> int:
+    """Resolve the largest configured prefill chunk once, before loading."""
+
+    if explicit is not None:
+        if type(explicit) is not int or explicit < 1:
+            raise ValueError(
+                "ngram_prefill_chunk_tokens must be a positive exact integer"
+            )
+        return explicit
+
+    def configured(name: str, default: int) -> int:
+        raw_value = (os.environ.get(name) or str(default)).strip()
+        try:
+            return max(1, int(raw_value))
+        except ValueError:
+            return default
+
+    raw = (os.environ.get("MTPLX_PREFILL_CHUNK_SIZE") or "2048").strip().lower()
+    if raw == "auto":
+        return max(
+            configured("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2_048),
+            configured("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2_048),
+        )
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 2_048
+
+
 def _construct_qwen4_ngram_runtime(*args: Any, **kwargs: Any) -> Any:
     from .qwen4_runtime import construct_qwen4_ngram_runtime
 
@@ -51,6 +80,7 @@ def _construct_qwen4_ngram_resources(
     config: dict[str, Any],
     *,
     context_tokens: int,
+    prefill_chunk_tokens: int,
     payload_ceiling_bytes: int,
     target_residency_bytes: int,
     mx_module: Any,
@@ -65,6 +95,7 @@ def _construct_qwen4_ngram_resources(
         model,
         config=config,
         context_tokens=context_tokens,
+        prefill_chunk_tokens=prefill_chunk_tokens,
         payload_ceiling_bytes=payload_ceiling_bytes,
         target_residency_bytes=target_residency_bytes,
         mx_module=mx_module,
@@ -84,6 +115,7 @@ def _preflight_qwen4_resident(
     config: dict[str, Any],
     *,
     context_tokens: int,
+    prefill_chunk_tokens: int,
     payload_ceiling_bytes: int,
     target_residency_bytes: int,
 ) -> dict[str, Any] | None:
@@ -107,6 +139,7 @@ def _preflight_qwen4_resident(
         resident_weight_bytes=inventory.resident_bytes,
         manifest=manifest,
         context_tokens=context_tokens,
+        prefill_chunk_tokens=prefill_chunk_tokens,
         payload_ceiling_bytes=payload_ceiling_bytes,
         target_residency_bytes=target_residency_bytes,
         available_memory_bytes=available,
@@ -194,6 +227,7 @@ class MTPLXRuntime:
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
     ngram_cache: Any | None = None
     ngram_artifact: Any | None = None
+    ngram_cache_limit_restore: Callable[[], Any] | None = None
     ngram_memory_report: dict[str, Any] | None = None
     ngram_preflight_report: dict[str, Any] | None = None
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
@@ -213,7 +247,8 @@ class MTPLXRuntime:
 
         cache = self.ngram_cache
         artifact = self.ngram_artifact
-        if cache is None and artifact is None:
+        restore_cache_limit = self.ngram_cache_limit_restore
+        if cache is None and artifact is None and restore_cache_limit is None:
             return
         first_failure: BaseException | None = None
         if cache is not None:
@@ -229,8 +264,15 @@ class MTPLXRuntime:
             except BaseException as exc:  # noqa: BLE001 - release all owners
                 if first_failure is None:
                     first_failure = exc
+        if restore_cache_limit is not None:
+            try:
+                restore_cache_limit()
+            except BaseException as exc:  # noqa: BLE001 - restore global owner
+                if first_failure is None:
+                    first_failure = exc
         self.ngram_cache = None
         self.ngram_artifact = None
+        self.ngram_cache_limit_restore = None
         if first_failure is not None:
             raise first_failure
 
@@ -697,6 +739,7 @@ def load(
     proj_requant: str | None = None,
     ngram_cache_limit_bytes: int = _DEFAULT_NGRAM_CACHE_LIMIT_BYTES,
     ngram_context_tokens: int = _DEFAULT_QWEN4_CONTEXT_TOKENS,
+    ngram_prefill_chunk_tokens: int | None = None,
     ngram_target_residency_bytes: int = _QWEN4_RUNTIME_TARGET_BYTES,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
@@ -707,9 +750,13 @@ def load(
     to the trunk only, before MTP injection, so a draft head's precision is
     never reduced.
     """
+    resolved_ngram_prefill_chunk_tokens = _construction_prefill_chunk_tokens(
+        ngram_prefill_chunk_tokens
+    )
     for name, value in (
         ("ngram_cache_limit_bytes", ngram_cache_limit_bytes),
         ("ngram_context_tokens", ngram_context_tokens),
+        ("ngram_prefill_chunk_tokens", resolved_ngram_prefill_chunk_tokens),
         ("ngram_target_residency_bytes", ngram_target_residency_bytes),
     ):
         if type(value) is not int or value <= 0:
@@ -760,6 +807,7 @@ def load(
         path,
         config,
         context_tokens=ngram_context_tokens,
+        prefill_chunk_tokens=resolved_ngram_prefill_chunk_tokens,
         payload_ceiling_bytes=ngram_cache_limit_bytes,
         target_residency_bytes=ngram_target_residency_bytes,
     )
@@ -1130,6 +1178,7 @@ def load(
             model,
             config,
             context_tokens=ngram_context_tokens,
+            prefill_chunk_tokens=resolved_ngram_prefill_chunk_tokens,
             payload_ceiling_bytes=ngram_cache_limit_bytes,
             target_residency_bytes=ngram_target_residency_bytes,
             mx_module=mx,
@@ -1138,6 +1187,9 @@ def load(
         if ngram_resources is not None:
             runtime.ngram_cache = ngram_resources.cache
             runtime.ngram_artifact = ngram_resources.artifact
+            runtime.ngram_cache_limit_restore = (
+                ngram_resources.restore_cache_limit
+            )
             runtime.ngram_memory_report = ngram_resources.report
             ngram_owners.clear()
     except BaseException:

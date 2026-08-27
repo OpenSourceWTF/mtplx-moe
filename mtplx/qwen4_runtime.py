@@ -12,10 +12,12 @@ from .qwen4_ngram import (
     NGramRowCache,
     NGramRuntimeBudget,
     PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES,
+    QWEN38_FLASH_NEXT_NGRAM_MANIFEST_SHA256,
     QWEN38_FLASH_NEXT_REPO,
     QWEN38_FLASH_NEXT_REVISION,
     load_ngram_manifest,
     plan_production_ngram_cache,
+    qwen4_ngram_transient_bytes,
     qwen4_kv_mtp_reserve_bytes,
     verify_ngram_manifest,
 )
@@ -25,8 +27,6 @@ QWEN4_NGRAM_MANIFEST_NAME = "ngram-manifest.json"
 QWEN4_NGRAM_MINIMUM_PAYLOAD_BYTES = 1 * _GIB
 QWEN4_NGRAM_METAL_WORKING_RESERVE_BYTES = 2 * _GIB
 QWEN4_NGRAM_SAFETY_MARGIN_BYTES = 2 * _GIB
-QWEN4_NGRAM_TRANSIENT_LIMIT_BYTES = 16 * 2048 * 100
-QWEN4_NGRAM_MAX_INFLIGHT_IO_BYTES = QWEN4_NGRAM_TRANSIENT_LIMIT_BYTES
 QWEN4_NGRAM_MAX_OPEN_FILES = 129
 QWEN4_NGRAM_ALLOCATION_ALIGNMENT_BYTES = 16 * 1024
 
@@ -36,6 +36,7 @@ class Qwen4NGramRuntimeResources:
     cache: Any
     artifact: Any
     report: dict[str, Any]
+    restore_cache_limit: Any
 
 
 def _text_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -83,6 +84,7 @@ def _validate_pinned_manifest(manifest: Any) -> None:
     expected = {
         "source_repo": QWEN38_FLASH_NEXT_REPO,
         "source_revision": QWEN38_FLASH_NEXT_REVISION,
+        "digest": QWEN38_FLASH_NEXT_NGRAM_MANIFEST_SHA256,
         "storage": "affine-q4-g32",
         "row_width": 160,
         "row_bytes": 100,
@@ -125,6 +127,7 @@ def construct_qwen4_ngram_runtime(
     *,
     config: Mapping[str, Any],
     context_tokens: int,
+    prefill_chunk_tokens: int,
     payload_ceiling_bytes: int,
     target_residency_bytes: int,
     mx_module: Any,
@@ -133,6 +136,7 @@ def construct_qwen4_ngram_runtime(
 
     if type(context_tokens) is not int or context_tokens < 1:
         raise ValueError("Qwen4 context_tokens must be a positive exact integer")
+    transient_bytes = qwen4_ngram_transient_bytes(prefill_chunk_tokens)
     if (
         type(payload_ceiling_bytes) is not int
         or not 0 < payload_ceiling_bytes <= PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES
@@ -154,6 +158,7 @@ def construct_qwen4_ngram_runtime(
 
     artifact = None
     cache = None
+    previous_cache_limit: int | None = None
     try:
         artifact = verify_ngram_manifest(
             root,
@@ -183,8 +188,8 @@ def construct_qwen4_ngram_runtime(
         production = plan_production_ngram_cache(
             manifest,
             budget,
-            transient_limit_bytes=QWEN4_NGRAM_TRANSIENT_LIMIT_BYTES,
-            max_inflight_io_bytes=QWEN4_NGRAM_MAX_INFLIGHT_IO_BYTES,
+            transient_limit_bytes=transient_bytes,
+            max_inflight_io_bytes=transient_bytes,
             max_open_files=QWEN4_NGRAM_MAX_OPEN_FILES,
             bypass_page_cache=True,
             eviction="lru",
@@ -212,6 +217,7 @@ def construct_qwen4_ngram_runtime(
             "previous_mlx_cache_limit_bytes": previous_cache_limit,
             "safety_margin_bytes": QWEN4_NGRAM_SAFETY_MARGIN_BYTES,
             "requested_payload_ceiling_bytes": payload_ceiling_bytes,
+            "prefill_chunk_tokens": prefill_chunk_tokens,
             "payload_formula_ceiling_bytes": (
                 production.payload_formula_ceiling_bytes
             ),
@@ -231,9 +237,16 @@ def construct_qwen4_ngram_runtime(
             cache=cache,
             artifact=artifact,
             report=report,
+            restore_cache_limit=(
+                lambda previous=previous_cache_limit: set_cache_limit(previous)
+            ),
         )
     except BaseException:
-        _close_construction_resources(cache, artifact)
+        try:
+            _close_construction_resources(cache, artifact)
+        finally:
+            if previous_cache_limit is not None:
+                set_cache_limit(previous_cache_limit)
         raise
 
 

@@ -131,6 +131,7 @@ def test_ngram_resources_attach_to_normal_resident_model(monkeypatch) -> None:
         model,
         {"model_type": "qwen4_exp"},
         context_tokens=17_408,
+        prefill_chunk_tokens=2_048,
         payload_ceiling_bytes=10 * 1024**3,
         target_residency_bytes=75 * 1024**3,
         mx_module=object(),
@@ -142,6 +143,7 @@ def test_ngram_resources_attach_to_normal_resident_model(monkeypatch) -> None:
     assert captured["kwargs"] == {
         "config": {"model_type": "qwen4_exp"},
         "context_tokens": 17_408,
+        "prefill_chunk_tokens": 2_048,
         "payload_ceiling_bytes": 10 * 1024**3,
         "target_residency_bytes": 75 * 1024**3,
         "mx_module": captured["kwargs"]["mx_module"],

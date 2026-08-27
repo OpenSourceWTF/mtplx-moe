@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,35 @@ MTP_SIDECAR_FALLBACKS = (
 )
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 SOURCE_MARKER_FILE = ".mtplx-source.json"
+
+
+def _finalize_qwen4_ngram_sources(destination: Path) -> None:
+    """Make a pulled exact-row artifact satisfy its immutable load contract."""
+
+    manifest_path = destination / "ngram-manifest.json"
+    if not manifest_path.is_file():
+        return
+    from mtplx.qwen4_ngram import load_ngram_manifest
+
+    manifest = load_ngram_manifest(manifest_path)
+    names = {
+        component.name
+        for shard in manifest.shards
+        for component in shard.components
+    }
+    names.update(shard.name for shard in manifest.shards if not shard.components)
+    for name in sorted(names):
+        source = destination / name
+        metadata = source.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError(
+                f"pulled Qwen4 n-gram source must be a single-link regular file: {name}"
+            )
+        source.chmod(stat.S_IMODE(metadata.st_mode) & ~0o222)
+    manifest_metadata = manifest_path.lstat()
+    if not stat.S_ISREG(manifest_metadata.st_mode):
+        raise RuntimeError("pulled Qwen4 n-gram manifest must be a regular file")
+    manifest_path.chmod(stat.S_IMODE(manifest_metadata.st_mode) & ~0o222)
 
 
 @dataclass(frozen=True)
@@ -982,6 +1012,7 @@ def pull_model(
         resolved = destination
         reused_existing = True
         resumed_existing = False
+        _finalize_qwen4_ngram_sources(resolved)
         validation = validate_mtplx_model_files(resolved)
         _validate_pinned_laguna_files(resolved, repo_id)
         if repo_id.lower().startswith("youssofal/qwen3.6-27b-mtplx") and not validation["ok"]:
@@ -1080,6 +1111,7 @@ def pull_model(
                 "total_bytes": total_bytes,
             },
         )
+        _finalize_qwen4_ngram_sources(resolved)
         validation = validate_mtplx_model_files(resolved)
         if not cached_model_is_complete(resolved):
             raise RuntimeError(
