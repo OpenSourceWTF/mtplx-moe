@@ -2434,3 +2434,33 @@ def test_forge_vision_validation_fails_closed_on_blind_artifact(tmp_path):
     forge._ensure_vision_tower(source, destination)
     with pytest.raises(forge.ForgeError, match="vision"):
         forge._validate_vision_payload(source, destination)
+
+
+def test_runtime_stamp_carries_family_sampler_law(tmp_path):
+    # The contract stamps the FAMILY's sampler, not a fixed 0.6 — the
+    # qwen4_exp / Qwen3.8 families serve at temperature 1.0 (founder law);
+    # a 0.6 stamp would mis-sample every contract-honoring client.
+    _write_json(
+        tmp_path / "config.json",
+        {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+        },
+    )
+
+    runtime = forge._stamp_runtime_metadata(
+        tmp_path,
+        branded_name="Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+        source_repo="Qwen/Qwen3.8-Flash-Next",
+        source_sha="",
+        source_format=forge.SOURCE_MLX_AFFINE_WITH_MTP,
+        recipe={},
+        forge_inputs={"lane": "verify-stamp"},
+        rows=[{"depth": 0, "tok_s": 50.0, "acceptance_by_position": []}],
+        mtp_contract={},
+        existing=None,
+    )
+
+    assert runtime["sampler"]["temperature"] == 1.0
+    assert runtime["sampler"]["top_p"] == 0.95
+    assert runtime["sampler"]["top_k"] == 20

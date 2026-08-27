@@ -3139,6 +3139,19 @@ def build_parser() -> argparse.ArgumentParser:
     forge_verify_p.add_argument("--max", action="store_true")
     forge_verify_p.add_argument("--max-tokens", type=int, default=2048)
     forge_verify_p.add_argument("--suite", help="Verification prompt suite")
+    forge_verify_p.add_argument(
+        "--stamp",
+        action="store_true",
+        help=(
+            "After the rows pass, write/update the pack's mtplx_runtime.json "
+            "in place (the first-load smoke baseline that clears the "
+            "'unverified' marker) — no rebuild or copy"
+        ),
+    )
+    forge_verify_p.add_argument(
+        "--source-repo",
+        help="Provenance for --stamp: the upstream repo this pack was converted from",
+    )
     forge_verify_p.set_defaults(func=cmd_forge_public)
 
     forge_cancel_p = forge_sub.add_parser(

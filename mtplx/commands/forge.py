@@ -987,15 +987,45 @@ def _cmd_verify(args: Any) -> int:
         run = _run_dir(args.out, args.run_id)
     else:
         run = _run_dir(Path("outputs/forge-verify"), f"verify-{int(time.time())}")
+    existing = _read_runtime(model_path)
+    mtp_contract = _runtime_or_default_mtp_contract(existing, model_path)
     rows = _run_verify(
         model_path,
         run,
         max_fans=bool(getattr(args, "max", False)),
-        mtp_contract=_runtime_or_default_mtp_contract(_read_runtime(model_path), model_path),
+        mtp_contract=mtp_contract,
         max_tokens=_forge_verify_max_tokens(args),
         prompt_suite=_forge_verify_prompt_suite(args),
     )
-    payload = {"rows": rows}
+    payload: dict[str, Any] = {"rows": rows}
+    if rows and bool(getattr(args, "stamp", False)):
+        # In-place first-load smoke stamp: the same metadata stamper the
+        # build lane uses, fed by the rows just measured — no rebuild, no
+        # tree copy. This is what clears the 'unverified' marker on packs
+        # that were converted outside the forge build lane.
+        existing_provenance = (existing or {}).get("forge_provenance") or {}
+        source_repo = (
+            str(getattr(args, "source_repo", "") or "")
+            or str((existing or {}).get("base_trunk") or "")
+            or str(existing_provenance.get("source_repo") or "")
+            or model_path.name
+        )
+        probe = probe_source(str(model_path))
+        runtime_metadata = _stamp_runtime_metadata(
+            model_path,
+            branded_name=model_path.name,
+            source_repo=source_repo,
+            source_sha=str(existing_provenance.get("source_sha") or ""),
+            source_format=str(probe.get("source_format") or SOURCE_UNKNOWN),
+            recipe={},
+            forge_inputs={"lane": "verify-stamp"},
+            rows=rows,
+            mtp_contract=mtp_contract,
+            existing=existing,
+        )
+        atomic_write_json(model_path / "mtplx_runtime.json", runtime_metadata)
+        payload["stamped"] = str(model_path / "mtplx_runtime.json")
+        _err(f"[forge] runtime contract stamped in place: {payload['stamped']}")
     if bool(getattr(args, "json", False)):
         _json_out(payload)
     else:
@@ -3097,7 +3127,20 @@ def _stamp_runtime_metadata(
         "recommended_profile",
         _recommended_profile_stamp(model_path, best_depth=best_depth),
     )
-    metadata.setdefault("sampler", {"temperature": 0.6, "top_p": 0.95, "top_k": 20})
+    # Stamp the FAMILY's sampler law, not a fixed 0.6 — the Qwen3.8/Qwen4
+    # families serve at temperature 1.0, and a contract advertising 0.6
+    # would mis-sample every client that honors it (the 27B misattribution
+    # class). Unknown families keep the historical default.
+    try:
+        from mtplx.backends.descriptors import sampler_defaults_for_model
+
+        family_sampler = sampler_defaults_for_model(
+            model_ref=str(model_path),
+            inspection=inspection.to_dict() if inspection is not None else None,
+        ).to_dict()
+    except Exception:
+        family_sampler = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+    metadata.setdefault("sampler", family_sampler)
     metadata["verified_on"] = {
         "timestamp": _now_iso(),
         "hardware": platform.platform(),
