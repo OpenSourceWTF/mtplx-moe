@@ -13,6 +13,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+import mtplx.proj_fusion as proj_fusion
 from mtplx.proj_fusion import (
     FUSE_ENV,
     FusedProjectionMember,
@@ -62,18 +63,27 @@ class _Mlp(nn.Module):
         self.up_proj = _qlinear(64, 9)
 
 
+class _Hyper(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.input_mix_weight_down = _qlinear(64, 10)
+        self.block_inject_weight = _qlinear(4, 11)
+
+
 class _Model(nn.Module):
     def __init__(self):
         super().__init__()
         self.gdn = _Gdn()
         self.attn = _Attn()
         self.mlp = _Mlp()
+        self.hyper = _Hyper()
 
 
 _GROUPS = {
     "gdn": ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
     "attn": ("q_proj", "k_proj", "v_proj"),
     "mlp": ("gate_proj", "up_proj"),
+    "hyper": ("input_mix_weight_down", "block_inject_weight"),
 }
 
 
@@ -87,10 +97,34 @@ def _originals(model: _Model) -> dict[str, list[nn.QuantizedLinear]]:
 def test_env_parsing(monkeypatch):
     monkeypatch.delenv(FUSE_ENV, raising=False)
     assert requested_groups() == set()
+
+
+def test_hyper_fusion_serves_split_views_without_contiguous_copies(monkeypatch):
+    monkeypatch.setenv(FUSE_ENV, "hyper")
+    monkeypatch.delenv("MTPLX_PACKED_PROJ_CONCATS", raising=False)
+    model = _Model()
+    contiguous_calls = 0
+    original_contiguous = proj_fusion.mx.contiguous
+
+    def counted_contiguous(value):
+        nonlocal contiguous_calls
+        contiguous_calls += 1
+        return original_contiguous(value)
+
+    monkeypatch.setattr(proj_fusion.mx, "contiguous", counted_contiguous)
+    configure_fused_projections(model)
+    x = mx.ones((1, 2, K), dtype=mx.bfloat16)
+    down = model.hyper.input_mix_weight_down(x)
+    inject = model.hyper.block_inject_weight(x)
+    mx.eval(down, inject)
+
+    assert contiguous_calls == 0
     monkeypatch.setenv(FUSE_ENV, "1")
     assert requested_groups() == {"gdn", "attn"}
     monkeypatch.setenv(FUSE_ENV, "all")
-    assert requested_groups() == {"gdn", "attn", "mlp"}
+    assert requested_groups() == {"gdn", "attn", "mlp", "hyper"}
+    monkeypatch.setenv(FUSE_ENV, "hyper")
+    assert requested_groups() == {"hyper"}
     monkeypatch.setenv(FUSE_ENV, "mlp, attn")
     assert requested_groups() == {"attn", "mlp"}
     monkeypatch.setenv(FUSE_ENV, "off")
@@ -102,7 +136,12 @@ def test_all_groups_fuse_and_members_stay_quantized_linear(monkeypatch):
     monkeypatch.delenv("MTPLX_PACKED_PROJ_CONCATS", raising=False)
     model = _Model()
     stats = configure_fused_projections(model)
-    assert (stats["gdn"], stats["attn"], stats["mlp"]) == (1, 1, 1)
+    assert (stats["gdn"], stats["attn"], stats["mlp"], stats["hyper"]) == (
+        1,
+        1,
+        1,
+        1,
+    )
     assert stats["skipped"] == 0
     assert stats["freed_bytes"] > 0
     for owner, names in _GROUPS.items():

@@ -9,7 +9,7 @@ patches on ``nn.QuantizedLinear.__call__`` still route it. Members fall back to 
 unfused computation outside the row window where fusion is bitwise exact.
 
 Default off. ``MTPLX_FUSE_PROJ`` selects families: ``gdn``, ``attn``, ``mlp``,
-``1``/``on``/``yes`` == ``gdn,attn``, ``all`` == ``gdn,attn,mlp``.
+``hyper``; ``1``/``on``/``yes`` == ``gdn,attn``, and ``all`` selects every family.
 ``MTPLX_FUSE_PROJ_MAX_ROWS`` overrides the row window ceiling.
 
 Unlike packed_concats (which calls mx.quantized_matmul directly and therefore
@@ -36,6 +36,7 @@ MAX_ROWS_ENV = "MTPLX_FUSE_PROJ_MAX_ROWS"
 _GDN_NAMES = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 _ATTN_NAMES = ("q_proj", "k_proj", "v_proj")
 _MLP_NAMES = ("gate_proj", "up_proj")
+_HYPER_NAMES = ("input_mix_weight_down", "block_inject_weight")
 
 _STATS: dict[str, Any] = {
     "enabled": False,
@@ -43,6 +44,7 @@ _STATS: dict[str, Any] = {
     "gdn": 0,
     "attn": 0,
     "mlp": 0,
+    "hyper": 0,
     "skipped": 0,
     "skip_reasons": [],
     "max_fused_rows": 0,
@@ -63,9 +65,9 @@ def requested_groups() -> set[str]:
     if raw in {"1", "true", "yes", "on"}:
         return {"gdn", "attn"}
     if raw == "all":
-        return {"gdn", "attn", "mlp"}
+        return {"gdn", "attn", "mlp", "hyper"}
     parts = {p.strip() for p in raw.replace(";", ",").split(",")}
-    return {p for p in parts if p in {"gdn", "attn", "mlp"}}
+    return {p for p in parts if p in {"gdn", "attn", "mlp", "hyper"}}
 
 
 def fuse_projections_enabled() -> bool:
@@ -97,12 +99,29 @@ class _FusionHub:
     """Runs one fused matmul per distinct input (identity-keyed) and serves each
     member a slice, dropping the memo once every member has been served."""
 
-    __slots__ = ("fused", "split_points", "n_parts", "_full_mask", "_key", "_outs", "_served")
+    __slots__ = (
+        "fused",
+        "split_points",
+        "n_parts",
+        "contiguous_outputs",
+        "_full_mask",
+        "_key",
+        "_outs",
+        "_served",
+    )
 
-    def __init__(self, fused: nn.QuantizedLinear, split_points: list[int], n_parts: int):
+    def __init__(
+        self,
+        fused: nn.QuantizedLinear,
+        split_points: list[int],
+        n_parts: int,
+        *,
+        contiguous_outputs: bool,
+    ):
         self.fused = fused
         self.split_points = list(split_points)
         self.n_parts = int(n_parts)
+        self.contiguous_outputs = bool(contiguous_outputs)
         self._full_mask = (1 << int(n_parts)) - 1
         self._key: Any = None
         self._outs: tuple[mx.array, ...] | None = None
@@ -121,9 +140,11 @@ class _FusionHub:
             # sdpa) onto a different reduction variant — measured as a rare
             # 1-ulp logit flip that broke sampled-trajectory identity
             # (packed_concats seed-825 scar, 2026-08-19).
-            _outs = tuple(
-                mx.contiguous(t)
-                for t in mx.split(self.fused(x), self.split_points, axis=-1)
+            split = mx.split(self.fused(x), self.split_points, axis=-1)
+            _outs = (
+                tuple(mx.contiguous(t) for t in split)
+                if self.contiguous_outputs
+                else tuple(split)
             )
             self._key = x
             self._outs = _outs
@@ -280,7 +301,14 @@ def _default_max_rows() -> int:
     return 4
 
 
-def _fuse_group(owner: Any, names: tuple[str, ...], fused_attr: str, max_rows: int) -> str | None:
+def _fuse_group(
+    owner: Any,
+    names: tuple[str, ...],
+    fused_attr: str,
+    max_rows: int,
+    *,
+    contiguous_outputs: bool = True,
+) -> str | None:
     """Replace ``names`` on ``owner`` with one fused projection. Returns a skip reason."""
 
     modules = tuple(getattr(owner, name, None) for name in names)
@@ -321,7 +349,12 @@ def _fuse_group(owner: Any, names: tuple[str, ...], fused_attr: str, max_rows: i
         running += n
         split_points.append(running)
 
-    hub = _FusionHub(fused, split_points, len(modules))
+    hub = _FusionHub(
+        fused,
+        split_points,
+        len(modules),
+        contiguous_outputs=contiguous_outputs,
+    )
     # Underscore-prefixed so Module.valid_parameter_filter skips it: as a registered
     # child it would double-count with the member views and materialise copies.
     setattr(owner, fused_attr, fused)
@@ -370,6 +403,7 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
     _STATS["gdn"] = 0
     _STATS["attn"] = 0
     _STATS["mlp"] = 0
+    _STATS["hyper"] = 0
     _STATS["skipped"] = 0
     _STATS["skip_reasons"] = []
     _STATS["freed_bytes"] = 0
@@ -429,14 +463,28 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
                 since_release = _maybe_release(since_release + 1)
             else:
                 _note_skip("mlp", reason)
+        if "hyper" in groups and all(hasattr(module, n) for n in _HYPER_NAMES):
+            reason = _fuse_group(
+                module,
+                _HYPER_NAMES,
+                "_mtplx_fused_hyper_input_proj",
+                max_rows,
+                contiguous_outputs=False,
+            )
+            if reason is None:
+                _STATS["hyper"] += 1
+                since_release = _maybe_release(since_release + 1)
+            else:
+                _note_skip("hyper", reason)
 
-    if _STATS["gdn"] or _STATS["attn"] or _STATS["mlp"]:
+    if _STATS["gdn"] or _STATS["attn"] or _STATS["mlp"] or _STATS["hyper"]:
         mx.clear_cache()
     reset_fused_projection_counters()
     # logger.info does not reach the serve console.
     print(
         f"[proj-fusion] groups={_STATS['groups']} gdn={_STATS['gdn']} "
-        f"attn={_STATS['attn']} mlp={_STATS['mlp']} skipped={_STATS['skipped']} "
+        f"attn={_STATS['attn']} mlp={_STATS['mlp']} hyper={_STATS['hyper']} "
+        f"skipped={_STATS['skipped']} "
         f"max_fused_rows={_STATS['max_fused_rows']} "
         f"freed={_STATS['freed_bytes'] / 2 ** 30:.2f}GiB "
         f"reasons={_STATS['skip_reasons']}",
