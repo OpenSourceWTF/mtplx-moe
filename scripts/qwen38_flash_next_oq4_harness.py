@@ -81,9 +81,10 @@ def build_exact_python_prompt(
     budget = target_tokens - fixed
     repeats = (budget + len(context_ids) - 1) // len(context_ids)
     tokens = prefix_ids + (context_ids * repeats)[:budget] + instruction_ids + suffix_ids
+    # The explicit IDs are the workload contract. BPE decode is not a canonical
+    # inverse of encode: adjacent newline tokens, for example, may re-encode as
+    # one merged token even though they decode to identical text.
     prompt = str(tokenizer.decode(tokens))
-    if list(tokenizer.encode(prompt)) != tokens:
-        raise RuntimeError("exact Python prompt does not round-trip through tokenizer")
     return prompt, tokens
 
 
