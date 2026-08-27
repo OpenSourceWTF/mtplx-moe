@@ -1043,6 +1043,9 @@ class Qwen4ExpTextModel(nn.Module):
         h = mx.tile(h, (1, 1, self.args.hc_count))
         for layer, c in zip(self.layers, cache):
             h = layer(h, input_ids=inputs, ssm_mask=ssm_mask, cache=c)
+        # The MTP head consumes the pre-mixer widened stream; keep the last
+        # one reachable (lazy ref, freed on the next step).
+        self._last_widened = h
         return self.hyper_connection_mixer(h)
 
 
@@ -1070,6 +1073,49 @@ class TextModel(nn.Module):
             else:
                 caches.append(ArraysCache(size=2))
         return caches
+
+
+class Qwen4ExpMTP(nn.Module):
+    """Flash-Next MTP head, reconstructed from the shipped tensors (no public
+    reference implements it — transformers ships only the trunk).
+
+    Wiring (the only reading consistent with every tensor shape): the trunk's
+    pre-mixer WIDENED stream [B,S,hc*d] is RMS-normed at full width
+    (pre_fc_norm_hidden is [hc*d]); each 2560-wide substream goes through the
+    SHARED fc_hidden [d,d]; the normed+projected token embedding
+    (pre_fc_norm_embedding -> fc_embedding, both [d]-sized) is broadcast-added
+    into every substream; the fused widened stream runs ONE full-attention
+    DecoderLayer (QSA + MoE + hyper-connections, its own tensors) and this
+    head's own mixer collapses back to d for the SHARED trunk lm_head.
+
+    Correctness is graded by measured acceptance — the probability-ratio
+    verify contract keeps outputs exact for ANY draft head, so a mis-wiring
+    can only cost speed, never quality.
+    """
+
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        d = args.hidden_size
+        self.pre_fc_norm_embedding = nn.RMSNorm(d, eps=args.rms_norm_eps)
+        self.pre_fc_norm_hidden = nn.RMSNorm(d * args.hc_count, eps=args.rms_norm_eps)
+        self.fc_embedding = nn.Linear(d, d, bias=False)
+        self.fc_hidden = nn.Linear(d, d, bias=False)
+        fa_idx = next(
+            i for i, t in enumerate(args.layer_types)
+            if t != "linear_attention" and (i + 1) not in args.ple_layer_ids
+        )
+        self.layers = [DecoderLayer(args, fa_idx)]
+        self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
+        self._hc = args.hc_count
+
+    def __call__(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
+        B, S, W = widened.shape
+        hn = self.pre_fc_norm_hidden(widened).reshape(B, S, self._hc, -1)
+        en = self.fc_embedding(self.pre_fc_norm_embedding(tok_emb))
+        fused = self.fc_hidden(hn) + en[:, :, None, :]
+        h = fused.reshape(B, S, W)
+        h = self.layers[0](h, input_ids=None, ssm_mask=None, cache=cache)
+        return self.hyper_connection_mixer(h)
 
 
 @dataclass
@@ -1107,6 +1153,70 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    # ---- MTP attach -------------------------------------------------------
+
+    def attach_mtp(self, model_path) -> bool:
+        """Build + load the MTP head from mtp.safetensors. Per-module quant
+        recipes are inferred from the packed tensor shapes (bits from the
+        u32 column count vs the module's in_features, group from the scales
+        columns) — the sidecar is self-describing."""
+        path = Path(model_path) / "mtp.safetensors"
+        if not path.exists():
+            return False
+        raw = mx.load(str(path))
+        args = self.language_model.args
+        mtp = Qwen4ExpMTP(args)
+
+        flat = dict(raw)
+        stripped = {}
+        for name, v in flat.items():
+            if not name.startswith("mtp."):
+                continue
+            stripped[name[len("mtp."):]] = v
+        # The converter's +1 norm shift covers the trunk-suffix norms only;
+        # the head's pre_fc norms ship raw zero-centered ((1+w) convention).
+        for n in ("pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight"):
+            if n in stripped and stripped[n].ndim == 1:
+                stripped[n] = (stripped[n].astype(mx.float32) + 1.0).astype(
+                    stripped[n].dtype
+                )
+
+        from mlx.utils import tree_flatten as _tf
+
+        module_in = {}
+        for pth, arr in _tf(mtp.parameters()):
+            if pth.endswith(".weight") and arr.ndim >= 2:
+                module_in[pth[: -len(".weight")]] = int(arr.shape[-1])
+
+        qmap = {}
+        for mod, in_f in module_in.items():
+            w = stripped.get(f"{mod}.weight")
+            s = stripped.get(f"{mod}.scales")
+            if w is None or s is None or w.dtype != mx.uint32:
+                continue
+            bits = int(w.shape[-1]) * 32 // in_f
+            group = in_f // int(s.shape[-1])
+            qmap[mod] = {"bits": bits, "group_size": group}
+
+        def predicate(pth, module):
+            cfg = qmap.get(pth)
+            return cfg if cfg else False
+
+        nn.quantize(mtp, group_size=64, bits=8, class_predicate=predicate)
+        mtp.load_weights(list(stripped.items()), strict=True)
+        mtp.eval()
+        self.mtp = mtp
+        return True
+
+    def make_mtp_cache(self):
+        return [QSACache()]
+
+    def mtp_draft_logits(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
+        """Draft logits from the trunk's widened stream + the next token's
+        embedding, through the shared trunk lm_head."""
+        h = self.mtp(widened, tok_emb, cache)
+        return self.language_model.lm_head(h)
 
     def post_weight_load(self, model_path) -> None:
         """Attach the SSD-resident n-gram sidecar after weights load."""
