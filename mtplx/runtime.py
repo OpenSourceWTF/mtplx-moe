@@ -30,8 +30,108 @@ from .mtp_patch import MTPContract, inject_mtp_support, validate_mtp_support
 
 logger = logging.getLogger(__name__)
 
+_GIB = 1024**3
+_DEFAULT_NGRAM_CACHE_LIMIT_BYTES = 10 * _GIB
+_DEFAULT_QWEN4_CONTEXT_TOKENS = 17_408
+_QWEN4_RUNTIME_TARGET_BYTES = 75 * _GIB
+
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
+
+
+def _construct_qwen4_ngram_runtime(*args: Any, **kwargs: Any) -> Any:
+    from .qwen4_runtime import construct_qwen4_ngram_runtime
+
+    return construct_qwen4_ngram_runtime(*args, **kwargs)
+
+
+def _construct_qwen4_ngram_resources(
+    model_path: Path | str,
+    model: Any,
+    config: dict[str, Any],
+    *,
+    context_tokens: int,
+    payload_ceiling_bytes: int,
+    target_residency_bytes: int,
+    mx_module: Any,
+    temporary_owners: list[Any],
+) -> Any | None:
+    """Bind the sole externalized Qwen resource: its exact n-gram rows."""
+
+    if str(config.get("model_type") or "").lower() != "qwen4_exp":
+        return None
+    resources = _construct_qwen4_ngram_runtime(
+        model_path,
+        model,
+        config=config,
+        context_tokens=context_tokens,
+        payload_ceiling_bytes=payload_ceiling_bytes,
+        target_residency_bytes=target_residency_bytes,
+        mx_module=mx_module,
+    )
+    temporary_owners[:] = [resources.cache, resources.artifact]
+    return resources
+
+
+def _unbind_qwen4_ngram_resources(model: Any, cache: Any) -> int:
+    from .models.qwen4_ngram_mlx import unbind_streamed_ngram_rows
+
+    return unbind_streamed_ngram_rows(model, cache)
+
+
+def _preflight_qwen4_resident(
+    model_path: Path,
+    config: dict[str, Any],
+    *,
+    context_tokens: int,
+    payload_ceiling_bytes: int,
+    target_residency_bytes: int,
+) -> dict[str, Any] | None:
+    """Prove a full-resident Qwen load fits before importing MLX."""
+
+    if str(config.get("model_type") or "").lower() != "qwen4_exp":
+        return None
+    from .qwen4_ngram import load_ngram_manifest
+    from .qwen4_preflight import (
+        plan_qwen4_resident_preflight,
+        scan_qwen4_weight_bytes,
+        validate_qwen4_oq4_contract,
+    )
+
+    manifest = load_ngram_manifest(model_path / "ngram-manifest.json")
+    validate_qwen4_oq4_contract(config, manifest)
+    inventory = scan_qwen4_weight_bytes(model_path)
+    available = None
+    try:
+        import psutil
+
+        available = int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    plan = plan_qwen4_resident_preflight(
+        resident_weight_bytes=inventory.resident_bytes,
+        manifest=manifest,
+        context_tokens=context_tokens,
+        payload_ceiling_bytes=payload_ceiling_bytes,
+        target_residency_bytes=target_residency_bytes,
+        available_memory_bytes=available,
+    )
+    return {
+        "total_weight_bytes": inventory.total_bytes,
+        "resident_weight_bytes": inventory.resident_bytes,
+        "resident_moe_bytes": inventory.resident_moe_bytes,
+        "ngram_ssd_bytes": inventory.ngram_bytes,
+        "embedded_mtp_bytes": inventory.mtp_bytes,
+        "tensor_count": inventory.tensor_count,
+        "available_memory_bytes": available,
+        "kv_mtp_reserve_bytes": plan.kv_mtp_reserve_bytes,
+        "cache_payload_bytes": plan.cache_payload_bytes,
+        "cache_overhead_bytes": plan.cache_overhead_bytes,
+        "metal_working_reserve_bytes": plan.metal_working_reserve_bytes,
+        "safety_margin_bytes": plan.safety_margin_bytes,
+        "projected_residency_bytes": plan.projected_residency_bytes,
+        "target_residency_bytes": plan.target_residency_bytes,
+    }
 
 
 def _detect_total_system_memory_bytes() -> int | None:
@@ -97,6 +197,10 @@ class MTPLXRuntime:
     a3b_compiled_target_prefix_factory: A3BCompiledTargetPrefixFactory | None = None
     a3b_whole_moe_installed: bool = False
     qwen_row_owned_router_report: dict[str, Any] = field(default_factory=dict)
+    ngram_cache: Any | None = None
+    ngram_artifact: Any | None = None
+    ngram_memory_report: dict[str, Any] | None = None
+    ngram_preflight_report: dict[str, Any] | None = None
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
         init=False,
@@ -108,6 +212,32 @@ class MTPLXRuntime:
     diagnostic_counters: dict[str, int] = field(default_factory=dict)
     _forward_ar_supports_emit_logits: bool | None = field(default=None, init=False, repr=False)
     _forward_ar_supports_logits_keep: bool | None = field(default=None, init=False, repr=False)
+
+    def close(self) -> None:
+        """Release construction-owned n-gram resources, if installed."""
+
+        cache = self.ngram_cache
+        artifact = self.ngram_artifact
+        if cache is None and artifact is None:
+            return
+        first_failure: BaseException | None = None
+        if cache is not None:
+            try:
+                _unbind_qwen4_ngram_resources(self.model, cache)
+            except BaseException as exc:  # noqa: BLE001 - release all owners
+                first_failure = exc
+        for owner in (cache, artifact):
+            if owner is None:
+                continue
+            try:
+                owner.close()
+            except BaseException as exc:  # noqa: BLE001 - release all owners
+                if first_failure is None:
+                    first_failure = exc
+        self.ngram_cache = None
+        self.ngram_artifact = None
+        if first_failure is not None:
+            raise first_failure
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.diagnostic_counters[key] = int(self.diagnostic_counters.get(key, 0)) + int(amount)
@@ -570,6 +700,9 @@ def load(
     gemma4_target_distribution_mode: str | None = None,
     proj_quant: str | None = None,
     proj_requant: str | None = None,
+    ngram_cache_limit_bytes: int = _DEFAULT_NGRAM_CACHE_LIMIT_BYTES,
+    ngram_context_tokens: int = _DEFAULT_QWEN4_CONTEXT_TOKENS,
+    ngram_target_residency_bytes: int = _QWEN4_RUNTIME_TARGET_BYTES,
 ) -> MTPLXRuntime:
     """Load an MLX model and optionally inject native MTP support.
 
@@ -579,6 +712,15 @@ def load(
     to the trunk only, before MTP injection, so a draft head's precision is
     never reduced.
     """
+    for name, value in (
+        ("ngram_cache_limit_bytes", ngram_cache_limit_bytes),
+        ("ngram_context_tokens", ngram_context_tokens),
+        ("ngram_target_residency_bytes", ngram_target_residency_bytes),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive exact integer")
+    if ngram_cache_limit_bytes > _DEFAULT_NGRAM_CACHE_LIMIT_BYTES:
+        raise ValueError("ngram_cache_limit_bytes must not exceed 10 GiB")
     path = Path(model_path)
     from .gemma4_pair import resolve_gemma4_pair_paths
 
@@ -619,6 +761,13 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    qwen4_preflight_report = _preflight_qwen4_resident(
+        path,
+        config,
+        context_tokens=ngram_context_tokens,
+        payload_ceiling_bytes=ngram_cache_limit_bytes,
+        target_residency_bytes=ngram_target_residency_bytes,
+    )
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(
@@ -723,7 +872,12 @@ def load(
         )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
 
-        if is_deepseek_v4_mtp_config(config):
+        if str(config.get("model_type") or "").lower() == "qwen4_exp":
+            # The OMLX-derived model owns the checkpoint's embedded native MTP
+            # module already. Validate and publish that surface; never build a
+            # second qwen3.5 head or reload its tensors.
+            mtp_enabled = validate_mtp_support(model)
+        elif is_deepseek_v4_mtp_config(config):
             # Native draft head: the block binds through the ordinary load path
             # and the model already carries the runtime surface, so this only
             # publishes it. Placed ahead of is_deepseek_mtp_config defensively --
@@ -954,6 +1108,7 @@ def load(
         a3b_compiled_target_prefix_factory=compiled_target_factory,
         a3b_whole_moe_installed=False,
         qwen_row_owned_router_report=router_report,
+        ngram_preflight_report=qwen4_preflight_report,
     )
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
@@ -971,6 +1126,32 @@ def load(
         )
         runtime.a3b_whole_moe_installed = True
         logger.info("[a3b-whole-moe] %s", whole_moe_report)
+    ngram_owners: list[Any] = []
+    try:
+        import mlx.core as mx
+
+        ngram_resources = _construct_qwen4_ngram_resources(
+            path,
+            model,
+            config,
+            context_tokens=ngram_context_tokens,
+            payload_ceiling_bytes=ngram_cache_limit_bytes,
+            target_residency_bytes=ngram_target_residency_bytes,
+            mx_module=mx,
+            temporary_owners=ngram_owners,
+        )
+        if ngram_resources is not None:
+            runtime.ngram_cache = ngram_resources.cache
+            runtime.ngram_artifact = ngram_resources.artifact
+            runtime.ngram_memory_report = ngram_resources.report
+            ngram_owners.clear()
+    except BaseException:
+        for owner in ngram_owners:
+            try:
+                owner.close()
+            except BaseException:
+                pass
+        raise
     # The server prints this as its startup engagement receipt; logger.info
     # alone is invisible under `python -m mtplx.server.openai` (no handler).
     runtime.laguna_fused_report = fused_report
@@ -1010,8 +1191,13 @@ def _is_laguna_s_2_1_mlx_4bit_config(config: dict[str, Any]) -> bool:
 def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | None:
     """Return MTPLX-owned model classes for architectures missing in mlx-lm."""
 
-    if str(config.get("model_type") or "").lower() == "deepseek_v4":
+    model_type = str(config.get("model_type") or "").lower()
+    if model_type == "deepseek_v4":
         from .models.deepseek_v4 import Model, ModelArgs
+
+        return Model, ModelArgs
+    if model_type == "qwen4_exp":
+        from .models.qwen4_omlx import Model, ModelArgs
 
         return Model, ModelArgs
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
