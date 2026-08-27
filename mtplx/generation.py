@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+import contextlib
 import inspect
 import json
 import os
@@ -46,6 +47,7 @@ from .cache_state import (
     trim_verified_window_without_snapshot,
     snapshot_cache,
     snapshot_untrimmable_cache,
+    snapshot_untrimmable_cache_lazy,
     tail_owned_attention_kv_stats,
     trim_verified_window_to_prefix,
 )
@@ -279,6 +281,16 @@ def _env_falsey(name: str) -> bool:
         "no",
         "off",
     }
+
+
+def _family_capture_commit_enabled() -> bool:
+    """qwen4_exp layer-owned capture-commit (``MTPLX_FAMILY_CAPTURE_COMMIT``).
+
+    Commits a rejected verify window by replaying only the GDN recurrences
+    from captured rows (+ trims for trimmable entries) instead of the
+    rollback + trunk re-forward fallback (~27ms per rejected round measured
+    2026-08-27). Default off while live receipts accumulate."""
+    return env_bool("MTPLX_FAMILY_CAPTURE_COMMIT", default=False)
 
 
 def _defer_repair_eval() -> bool:
@@ -8714,6 +8726,15 @@ def generate_mtpk(
         base_temperature=float(draft_sampler.temperature),
         blockers=_dtemp_blockers,
     )
+    # Family layer-owned capture-commit (qwen4_exp): the model retains its
+    # GDN recurrence rows during the verify forward and commits a rejected
+    # window by replaying only those recurrences — no trunk re-forward, no
+    # full-cache restore. Env-gated while receipts accumulate.
+    family_capture_commit_active = (
+        _family_capture_commit_enabled()
+        and callable(getattr(rt.model, "commit_verified_window", None))
+        and callable(getattr(rt.model, "verify_capture_scope", None))
+    )
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly
@@ -10053,7 +10074,14 @@ def generate_mtpk(
                 event["snapshot"] = "skipped_capture_commit_required"
             else:
                 started = time.perf_counter()
-                before_verify = snapshot_untrimmable_cache(cache)
+                # The family capture lane only rebinds cache slots (never
+                # setitem-mutates), so zero-copy lazy views are COW-safe and
+                # skip the per-round eager clone of every GDN state.
+                before_verify = (
+                    snapshot_untrimmable_cache_lazy(cache)
+                    if family_capture_commit_active
+                    else snapshot_untrimmable_cache(cache)
+                )
                 elapsed_snapshot = time.perf_counter() - started
                 snapshot_time += elapsed_snapshot
                 _add_timing(event, "snapshot", elapsed_snapshot)
@@ -10130,9 +10158,15 @@ def generate_mtpk(
         set_native_mlp_context(len(tokens))
         started_forward = time.perf_counter()
         captures = None
+        family_capture_scope = (
+            rt.model.verify_capture_scope()
+            if family_capture_commit_active
+            else contextlib.nullcontext()
+        )
         with (
             attention_phase("decode_verify"),
             model_forward_kind("target_verify"),
+            family_capture_scope,
         ):
             if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
                 if compiled_verify_bank is not None:
@@ -11167,6 +11201,23 @@ def generate_mtpk(
                 capture_commit_detach_arrays += int(commit_detach_stats["arrays"])
                 capture_commit_detach_bytes += int(commit_detach_stats["bytes"])
             _add_timing(event, "capture_commit", elapsed_commit)
+
+        if (
+            not committed_from_capture
+            and family_capture_commit_active
+            and before_verify is not None
+        ):
+            started_commit = time.perf_counter()
+            committed_from_capture = rt.model.commit_verified_window(
+                cache,
+                before_verify.states,
+                keep_tokens=committed_prefix_len,
+                verified_tokens=verified_token_count,
+            )
+            elapsed_commit = time.perf_counter() - started_commit
+            if committed_from_capture:
+                capture_commit_time += elapsed_commit
+                _add_timing(event, "family_capture_commit", elapsed_commit)
 
         if (
             not committed_from_capture

@@ -35,6 +35,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import math
 import os
@@ -283,6 +285,16 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
 
         q = inv_scale * _l2norm(q)
         k = _l2norm(k)
+
+        if cache is not None and _VERIFY_CAPTURE.get():
+            # Family capture-commit: retain the exact rows gated_delta_update
+            # consumed (plus the pre-conv stream for the conv-state tail) so a
+            # rejected speculative window commits by replaying ONLY this
+            # recurrence from the pre-verify state — no trunk re-forward.
+            # These references are already materialized by this forward; at
+            # mx.compile trace time they are tracers the compiled step
+            # surfaces as extra outputs.
+            cache._mtplx_verify_rows = (qkv, q, k, v, a, b)
 
         out, state = gated_delta_update(
             q,
@@ -582,6 +594,23 @@ def _fuse_gate_up_sanitize(model, out: dict) -> dict:
     if fused:
         print(f"[qwen4_exp] sanitize fused gate+up: {fused} modules", flush=True)
     return out
+
+
+# Armed around a speculative verify forward: GDN layers retain the exact
+# recurrence rows so a rejected window commits by replaying only the
+# gated-delta recurrence (see Qwen4ExpTextModel.commit_verified_window).
+_VERIFY_CAPTURE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "qwen4_exp_verify_capture", default=False
+)
+
+
+@contextlib.contextmanager
+def verify_capture_scope():
+    token = _VERIFY_CAPTURE.set(True)
+    try:
+        yield
+    finally:
+        _VERIFY_CAPTURE.reset(token)
 
 
 class QSACache:
@@ -1457,6 +1486,7 @@ class Qwen4ExpTextModel(nn.Module):
         )
         self._gdn_compiled_lane = False
         self._decode_runs = None
+        self._decode_run_fns = {}
 
     def __call__(self, inputs, cache=None, input_embeddings=None):
         h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
@@ -1480,7 +1510,14 @@ class Qwen4ExpTextModel(nn.Module):
         ):
             h = self._decode_layers_compiled(h, inputs, cache)
         else:
+            capture = _VERIFY_CAPTURE.get()
             for layer, c in zip(self.layers, cache):
+                if (
+                    capture
+                    and c is not None
+                    and getattr(layer, "ple", None) is not None
+                ):
+                    c._mtplx_verify_ple = (h, inputs)
                 h = layer(h, input_ids=inputs, ssm_mask=ssm_mask, cache=c)
         # The MTP head consumes the pre-mixer widened stream; keep the last
         # one reachable (lazy ref, freed on the next step).
@@ -1504,18 +1541,19 @@ class Qwen4ExpTextModel(nn.Module):
                 cur.append(i)
             else:
                 if cur:
-                    runs.append(("run", (tuple(cur), self._compiled_run_fn(cur))))
+                    runs.append(("run", tuple(cur)))
                     cur = []
                 runs.append(("eager", i))
         if cur:
-            runs.append(("run", (tuple(cur), self._compiled_run_fn(cur))))
+            runs.append(("run", tuple(cur)))
         return runs
 
-    def _compiled_run_fn(self, idxs):
+    def _compiled_run_fn(self, idxs, capture: bool = False):
         layers = [self.layers[i] for i in idxs]
 
         def step(h, *flat):
             out_states = []
+            rows = []
             k = 0
             for layer in layers:
                 c = ArraysCache(size=2)
@@ -1523,21 +1561,37 @@ class Qwen4ExpTextModel(nn.Module):
                 k += 2
                 h = layer(h, input_ids=None, ssm_mask=None, cache=c)
                 out_states.extend((c[0], c[1]))
-            return (h, *out_states)
+                if capture:
+                    # __call__ ran under the capture scope during THIS trace,
+                    # so the temp cache carries the tracer rows — surface
+                    # them as compiled outputs.
+                    rows.extend(c._mtplx_verify_rows)
+            return (h, *out_states, *rows)
 
         return mx.compile(step)
+
+    def _get_run_fn(self, idxs, capture: bool):
+        key = (idxs, bool(capture))
+        fn = self._decode_run_fns.get(key)
+        if fn is None:
+            fn = self._compiled_run_fn(idxs, capture=capture)
+            self._decode_run_fns[key] = fn
+        return fn
 
     def _decode_layers_compiled(self, h, inputs, cache):
         if self._decode_runs is None:
             self._decode_runs = self._build_decode_runs()
+        capture = _VERIFY_CAPTURE.get()
         for kind, payload in self._decode_runs:
             if kind == "eager":
                 i = payload
+                if capture and getattr(self.layers[i], "ple", None) is not None:
+                    cache[i]._mtplx_verify_ple = (h, inputs)
                 h = self.layers[i](
                     h, input_ids=inputs, ssm_mask=None, cache=cache[i]
                 )
                 continue
-            idxs, fn = payload
+            idxs = payload
             flat = []
             usable = True
             for i in idxs:
@@ -1552,14 +1606,131 @@ class Qwen4ExpTextModel(nn.Module):
                         h, input_ids=inputs, ssm_mask=None, cache=cache[i]
                     )
                 continue
-            out = fn(h, *flat)
+            out = self._get_run_fn(idxs, capture)(h, *flat)
             h = out[0]
             k = 1
             for i in idxs:
                 cache[i][0] = out[k]
                 cache[i][1] = out[k + 1]
                 k += 2
+            if capture:
+                for i in idxs:
+                    cache[i]._mtplx_verify_rows = tuple(out[k : k + 6])
+                    k += 6
         return h
+
+    def clear_verify_capture(self, cache) -> None:
+        for entry in cache:
+            if entry is None:
+                continue
+            for attr in ("_mtplx_verify_rows", "_mtplx_verify_ple"):
+                if getattr(entry, attr, None) is not None:
+                    setattr(entry, attr, None)
+
+    def commit_verified_window(
+        self,
+        cache,
+        snapshot_states,
+        *,
+        keep_tokens: int,
+        verified_tokens: int,
+    ) -> bool:
+        """Repair-free commit of a speculative verify window.
+
+        Trimmable entries (QSA attention) trim their uncommitted tail; each
+        pure-GDN layer replays ONLY its gated-delta recurrence over the kept
+        rows from the pre-verify snapshot state; the single PLE-carrying
+        layer replays its full (cheap, <=window-rows) layer forward from its
+        snapshot slots. Everything is lazy — no eval here; the next round's
+        eval pulls the replay. Validates every entry before mutating any so
+        a refusal leaves the cache intact for the rollback+re-forward
+        fallback. Returns True when the commit landed.
+        """
+        from mlx_lm.models.gated_delta import gated_delta_update
+
+        keep_tokens = int(keep_tokens)
+        verified_tokens = int(verified_tokens)
+        trim_n = verified_tokens - keep_tokens
+        if keep_tokens < 1 or trim_n < 0 or len(cache) != len(self.layers):
+            return False
+
+        plan = []
+        for i, (layer, entry) in enumerate(zip(self.layers, cache)):
+            if entry is None:
+                return False
+            if callable(getattr(entry, "is_trimmable", None)) and entry.is_trimmable():
+                plan.append(("trim", i, None))
+                continue
+            pre = snapshot_states[i] if snapshot_states is not None else None
+            if pre is None:
+                return False
+            if getattr(layer, "ple", None) is not None:
+                cap = getattr(entry, "_mtplx_verify_ple", None)
+                if cap is None or cap[0].shape[1] != verified_tokens:
+                    return False
+                if len(pre) < 4:
+                    return False
+                plan.append(("ple", i, cap))
+                continue
+            rows = getattr(entry, "_mtplx_verify_rows", None)
+            if rows is None or rows[0].shape[1] != verified_tokens:
+                return False
+            if len(pre) < 2 or pre[1] is None:
+                return False
+            plan.append(("gdn", i, rows))
+
+        for kind, i, payload in plan:
+            entry = cache[i]
+            layer = self.layers[i]
+            if kind == "trim":
+                if trim_n:
+                    entry.trim(trim_n)
+                continue
+            pre = snapshot_states[i]
+            if kind == "gdn":
+                qkv, q, k, v, a, b = payload
+                gdn = layer.linear_attn
+                conv_pre = pre[0]
+                if conv_pre is None:
+                    conv_pre = mx.zeros(
+                        (qkv.shape[0], gdn.conv_kernel_size - 1, qkv.shape[2]),
+                        dtype=qkv.dtype,
+                    )
+                _, new_state = gated_delta_update(
+                    q[:, :keep_tokens],
+                    k[:, :keep_tokens],
+                    v[:, :keep_tokens],
+                    a[:, :keep_tokens],
+                    b[:, :keep_tokens],
+                    gdn.A_log,
+                    gdn.dt_bias,
+                    pre[1],
+                    None,
+                    use_kernel=not gdn.training,
+                )
+                conv_input = mx.concatenate(
+                    [conv_pre, qkv[:, :keep_tokens]], axis=1
+                )
+                entry[0] = mx.contiguous(
+                    conv_input[:, -(gdn.conv_kernel_size - 1) :, :]
+                )
+                entry[1] = new_state
+                entry._mtplx_verify_rows = None
+            else:  # ple
+                h_in, ids = payload
+                for j in range(len(pre)):
+                    entry[j] = pre[j]
+                ple = layer.ple
+                kept_ids = ids[:, :keep_tokens]
+                ple.ple_embedding.stage(kept_ids, entry, ple.NGRAM_IDX)
+                layer(
+                    h_in[:, :keep_tokens],
+                    input_ids=kept_ids,
+                    ssm_mask=None,
+                    cache=entry,
+                )
+                entry._mtplx_verify_ple = None
+        return True
 
 
 class TextModel(nn.Module):
@@ -1877,6 +2048,24 @@ class Model(nn.Module):
         if ready:
             self.language_model.model._gdn_compiled_lane = bool(enabled)
         return ready
+
+    # -- family capture-commit (repair-free verify rollback) ----------------
+
+    def verify_capture_scope(self):
+        return verify_capture_scope()
+
+    def clear_verify_capture(self, cache) -> None:
+        self.language_model.model.clear_verify_capture(cache)
+
+    def commit_verified_window(
+        self, cache, snapshot_states, *, keep_tokens: int, verified_tokens: int
+    ) -> bool:
+        return self.language_model.model.commit_verified_window(
+            cache,
+            snapshot_states,
+            keep_tokens=keep_tokens,
+            verified_tokens=verified_tokens,
+        )
 
     # -- weight plumbing ---------------------------------------------------
 
