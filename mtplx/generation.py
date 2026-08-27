@@ -291,6 +291,14 @@ def _skip_verify_snapshot() -> bool:
     return env_bool("MTPLX_SKIP_VERIFY_SNAPSHOT", default=False)
 
 
+def _runtime_skip_verify_snapshot(rt: Any) -> bool:
+    """Resolve snapshot ownership once from the installed model contract."""
+
+    if getattr(rt.model, "speculative_cache_mode", None) == "snapshot_rollback":
+        return False
+    return _skip_verify_snapshot()
+
+
 def _draft_confidence_trace() -> bool:
     """Head-cal diagnostic (default OFF): record the draft head's softmax
     p(drafted token) per depth and attribute it to accept/reject at verify.
@@ -6836,6 +6844,7 @@ def generate_mtpk(
     if mtp_cache_policy not in {"persistent", "fresh"}:
         raise ValueError("mtp_cache_policy must be 'persistent' or 'fresh'")
     mtp_history_policy = _normalize_mtp_history_policy(mtp_history_policy)
+    skip_verify_snapshot = _runtime_skip_verify_snapshot(rt)
     if online_hidden_corrector_alpha < 0:
         raise ValueError("online_hidden_corrector_alpha must be >= 0")
     if not 0 <= online_hidden_corrector_decay < 1:
@@ -9483,7 +9492,7 @@ def generate_mtpk(
 
         before_verify = None
         if a3b_target_prefix_route is None:
-            if _skip_verify_snapshot():
+            if skip_verify_snapshot:
                 event["snapshot"] = "skipped_capture_commit_required"
             else:
                 started = time.perf_counter()

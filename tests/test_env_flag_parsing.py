@@ -9,6 +9,7 @@ asked about the same spelling and must answer the same thing.
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 
 import pytest
 
@@ -244,6 +245,19 @@ def test_skip_verify_snapshot_single_parse(
     else:
         monkeypatch.setenv("MTPLX_SKIP_VERIFY_SNAPSHOT", spelling)
     assert _skip_verify_snapshot() is expected
+
+
+def test_snapshot_rollback_runtime_overrides_profile_snapshot_skip(monkeypatch) -> None:
+    from mtplx.generation import _runtime_skip_verify_snapshot
+
+    monkeypatch.setenv("MTPLX_SKIP_VERIFY_SNAPSHOT", "1")
+    snapshot_runtime = SimpleNamespace(
+        model=SimpleNamespace(speculative_cache_mode="snapshot_rollback")
+    )
+    trim_runtime = SimpleNamespace(model=SimpleNamespace())
+
+    assert _runtime_skip_verify_snapshot(snapshot_runtime) is False
+    assert _runtime_skip_verify_snapshot(trim_runtime) is True
 
 
 @pytest.mark.parametrize(
