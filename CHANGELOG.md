@@ -8,6 +8,24 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Added
 
+- **Qwen 3.8 Flash-Next, day-0 native.** A new first-class model family
+  (`qwen4_exp`): the 125B-A6B Qwen4-generation preview with GDN hybrid
+  MoE, Qwen Sparse Attention, and the 32 GB n-gram memory sidecar —
+  served by an in-tree MLX backend that is parity-exact against the
+  reference implementation, with the native MTP draft head running
+  through MTPLX's standard speculative lane (measured 1.6-1.7× over AR
+  through the real server). Two packs: **Bare Speed** (flat 4-bit,
+  fastest) and **Optimized Speed** (dynamic quant with 8-bit attention,
+  higher quality). The n-gram table streams from SSD by default, so the
+  packs fit 96 GB+ Macs with headroom; both appear in the app and CLI
+  model pickers on machines that fit them, with the family's own serving
+  contract (temperature 1.0, adaptive draft depth) applied end to end.
+- `mtplx forge verify --stamp`: records a first-load smoke baseline and
+  writes the pack's `mtplx_runtime.json` in place — the step that turns a
+  "family-compatible-unverified" model into a verified one — without
+  rebuilding or copying the artifact. Families the tune instrument cannot
+  measure (Flash-Next today) take their rows through a locally booted
+  `mtplx serve`, the lane that actually applies their family contract.
 - Streaming endpoints (`/v1/chat/completions`, `/v1/completions`,
   `/v1/messages`) emit a `: keep-alive` SSE comment every 5 seconds
   while a stream is still silent before its first token (#358). Long
@@ -42,6 +60,11 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- The serve daemon and tune/bench children now start Python with `-P`,
+  so the directory you launch from can never shadow the installed
+  runtime. Previously, running `mtplx serve` from any folder containing
+  an `mtplx/` package (a source checkout, a vendored copy) silently
+  served that folder's code instead of the installed release.
 - **Unexecuted tool calls are no longer silently swallowed** (#349). A
   fresh-install user asking the built-in chat about their files saw the
   model "invoke" tools (`ls`, `find`, `search_files`, `read_file`) and
