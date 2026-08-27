@@ -65,6 +65,12 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- `mtplx connect opencode` now actually writes `~/.config/opencode/opencode.json`
+  (merge-preserving: other providers and plugins survive). It previously built
+  the config, printed the config path, and wrote nothing — so a `--model-id`
+  for a newly served model never reached OpenCode's provider models map and
+  runs failed with `ProviderModelNotFoundError` surfaced as "Unexpected
+  server error". Found wiring Flash-Next day-0.
 - The serve daemon and tune/bench children now start Python with `-P`,
   so the directory you launch from can never shadow the installed
   runtime. Previously, running `mtplx serve` from any folder containing
