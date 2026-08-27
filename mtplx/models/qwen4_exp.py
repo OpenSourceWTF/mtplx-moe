@@ -259,6 +259,31 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
 
         if mask is not None:
             qkv = mx.where(mask[..., None], qkv, 0)
+        if self._fused_step_applies(B, S, mask, cache):
+            # One-dispatch GDN step: conv+silu+l2norm + g/beta + delta +
+            # gated norm in a single kernel between the two library GEMVs.
+            # Verify rows (S>1) never take this branch, so capture-commit's
+            # stash contract below is untouched.
+            from mtplx.kernels.gdn_step_fused import fused_gdn_step
+
+            y, new_conv, new_delta = fused_gdn_step(
+                qkv.reshape(-1),
+                z.reshape(-1),
+                a.reshape(-1),
+                b.reshape(-1),
+                conv_state.reshape(self.conv_kernel_size - 1, self.conv_dim),
+                self.conv1d.weight,
+                self.A_log,
+                self.dt_bias,
+                cache[1],
+                self.norm.weight,
+            )
+            cache[0] = new_conv.reshape(B, self.conv_kernel_size - 1, self.conv_dim)
+            cache[1] = new_delta.reshape(
+                B, self.num_v_heads, self.head_v_dim, self.head_k_dim
+            )
+            cache.advance(S)
+            return self.out_proj(y.reshape(B, S, -1))
         if self._fused_conv_norm_applies(B, S, mask, cache):
             from mtplx.kernels.gdn_conv_norm import fused_gdn_conv_norm
 
@@ -371,6 +396,33 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
         if getattr(self.conv1d, "bias", None) is not None:
             return False
         return True
+
+    def _fused_step_applies(self, B, S, mask, cache) -> bool:
+        # One-dispatch GDN step (MTPLX_FUSED_GDN_STEP): decode rows only,
+        # family geometry, sigmoid-gated norm, live fp32 delta state. Mirrors
+        # _fused_conv_norm_applies plus the recurrence/epilogue requirements;
+        # anything else runs the staged chain.
+        if B != 1 or S != 1 or mask is not None or cache is None:
+            return False
+        if not _fused_gdn_step_enabled() or self.training:
+            return False
+        if _VERIFY_CAPTURE.get():
+            return False
+        if getattr(cache, "lengths", None) is not None:
+            return False
+        if cache[1] is None:
+            return False
+        if self.conv_dim != 10240 or self.key_dim != 2048:
+            return False
+        if self.conv_kernel_size != 4 or self.head_k_dim != 128:
+            return False
+        if self.num_v_heads != 48 or self.head_v_dim != 128 or self.num_k_heads != 16:
+            return False
+        if getattr(self.conv1d, "bias", None) is not None:
+            return False
+        if not isinstance(self.norm, SigmoidRMSNormGated):
+            return False
+        return cache[1].dtype == mx.float32
 
     def _fused_out_applies(self, B: int, S: int) -> bool:
         # Fused norm+gate+out_proj (MTPLX_FUSED_GDN_OUT): decode rows only,
@@ -844,6 +896,11 @@ def _fused_gdn_out_enabled() -> bool:
 
 def _fused_gdn_conv_norm_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_GDN_CONVNORM") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_gdn_step_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GDN_STEP") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
