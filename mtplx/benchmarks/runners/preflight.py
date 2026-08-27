@@ -15,7 +15,12 @@ BENCH_RE = re.compile(
     r"(python|mlx|mtplx|benchmark|mtp-depth|mtp1|verify-ratio|verify-profile|hf download)",
     re.IGNORECASE,
 )
-SELF_EXCLUDE_RE = re.compile(r"(rg -i|Codex|Electron|python -m server|bench-preflight|hermes_cli)")
+# /opt/sovereign/: the Pulse deep-tier operator prep keeps a long-lived
+# low-CPU python keeper (keep-amfi.py) resident; it is system prep, not a
+# benchmark, and flagging it deadlocks every deep-tier gated cell.
+SELF_EXCLUDE_RE = re.compile(
+    r"(rg -i|Codex|Electron|python -m server|bench-preflight|hermes_cli|/opt/sovereign/)"
+)
 
 
 def _run(args: list[str]) -> tuple[int, str]:
