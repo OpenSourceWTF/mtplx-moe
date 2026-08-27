@@ -443,7 +443,12 @@ QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
     # the serve battery before any further tune.
     default=3,
     minimum=1,
-    maximum=3,
+    # Ceiling 5, default 3: this head's depth-3 CONDITIONAL acceptance
+    # measured 86% (serve battery 2026-08-27), unlike the 27B head whose
+    # D4-8 cells were falsified (acceptance could not fill the window) —
+    # that family keeps its own cap. Deeper DEFAULTS stay founder-gated;
+    # this only lets clients and the depth battery request D4/D5.
+    maximum=5,
     unit="depth",
 )
 QWEN3_8_REASONING_CODEC = ReasoningCodec(
@@ -1499,6 +1504,29 @@ def descriptor_from_runtime(runtime: Any, args: Any | None = None) -> BackendDes
         and _runtime_is_lfm2(runtime)
     ):
         return MLX_LM_AR_LFM2_DESCRIPTOR
+    # The server validates request depth and reports sampler defaults from
+    # THIS descriptor, but the family contracts (qwen3_8 / qwen4_exp draft
+    # semantics + sampler law) were only resolved on the CLI launch path —
+    # so a family whose ceiling or sampler differs from the generic
+    # native-contract descriptor was silently mis-served (found 2026-08-27:
+    # qwen4_exp depth-4 requests 400'd against the generic max=3 while the
+    # family ceiling says 5, and /health reported temperature 0.6 against
+    # the family law 1.0). Rebind the family truth once, at resolution.
+    model_ref = getattr(args, "model", None) if args is not None else None
+    if model_ref is None:
+        model_ref = getattr(runtime, "model_path", None)
+    ref_text = str(model_ref or "")
+    family_semantics = draft_semantics_for_model(ref_text, None, descriptor)
+    family_sampler = sampler_defaults_for_model(ref_text, None, descriptor)
+    if (
+        family_semantics != descriptor.draft_semantics
+        or family_sampler != descriptor.sampler_defaults
+    ):
+        descriptor = replace(
+            descriptor,
+            draft_semantics=family_semantics,
+            sampler_defaults=family_sampler,
+        )
     return descriptor
 
 
