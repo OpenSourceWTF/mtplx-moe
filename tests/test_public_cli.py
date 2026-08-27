@@ -5935,7 +5935,10 @@ def test_serve_dispatches_packaged_openai_server(monkeypatch, capsys):
     assert "[2/6] Model resolved: models/example" in captured
     assert "[3/6] Runtime contract verified" in captured
     assert "Loading the model can take about a minute" in captured
-    assert calls["cmd"][1:3] == ["-m", "mtplx.server.openai"]
+    # -P is load-bearing: without it a serve launched from a directory
+    # containing an mtplx/ folder imports THAT folder's code (the 2026-08-26
+    # battery-contamination bug, commit 5b226817).
+    assert calls["cmd"][1:4] == ["-P", "-m", "mtplx.server.openai"]
     assert "--model" in calls["cmd"]
     assert calls["cmd"][calls["cmd"].index("--api-key") + 1] == "test-key"
     assert calls["cmd"][calls["cmd"].index("--rate-limit") + 1] == "120"
