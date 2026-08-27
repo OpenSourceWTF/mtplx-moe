@@ -532,7 +532,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--verify-core", default="stock")
     parser.add_argument("--warmup-runs", type=int, default=0)
-    parser.add_argument("--ngram-cache-gib", type=int, default=10)
+    parser.add_argument("--ngram-cache-gib", type=int, default=1)
     parser.add_argument("--runtime-target-gib", type=int, default=82)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--headline", action="store_true")

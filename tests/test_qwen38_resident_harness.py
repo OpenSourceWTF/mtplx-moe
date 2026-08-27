@@ -52,6 +52,7 @@ def test_production_workload_is_16k_1k_thinking_sampler_contract() -> None:
     args = harness._parse_args([])
 
     assert (args.prompt_tokens, args.max_tokens) == (16_384, 1_024)
+    assert args.ngram_cache_gib == 1
     assert harness._sampler_contract(headline=False) == {
         "temperature": 1.0,
         "top_p": 0.95,
