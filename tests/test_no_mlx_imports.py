@@ -192,14 +192,18 @@ def test_inspect_local_non_mtp_model_without_mlx(tmp_path: Path) -> None:
         ["-m", "mtplx.cli", "inspect", str(model), "--json"],
     )
 
-    assert proc.returncode == 2, proc.stderr
+    # Constructable-models contract: llama runs through the bundled mlx-lm
+    # module, so with mlx/mlx_lm unimportable the honest verdict is a
+    # capability gap in this environment — not the old table-only "no-MTP".
+    # The point of this suite is unchanged: no traceback, parseable JSON.
+    assert proc.returncode == 4, proc.stderr
     payload = json.loads(proc.stdout)
     assert payload["config_exists"] is True
     assert payload["model_type"] == "llama"
     assert payload["passes_primary_gate"] is False
     assert payload["mtp"]["exists"] is False
-    assert payload["compatibility"]["tier"] == "no-MTP"
-    assert payload["compatibility"]["exit_code"] == 2
+    assert payload["compatibility"]["tier"] == "incompatible-architecture"
+    assert payload["compatibility"]["exit_code"] == 4
 
 
 def test_legacy_inspect_model_form_still_works_without_mlx(tmp_path: Path) -> None:
@@ -212,9 +216,9 @@ def test_legacy_inspect_model_form_still_works_without_mlx(tmp_path: Path) -> No
         ["-m", "mtplx.cli", "inspect", "model", str(model), "--json"],
     )
 
-    assert proc.returncode == 2, proc.stderr
+    assert proc.returncode == 4, proc.stderr
     payload = json.loads(proc.stdout)
-    assert payload["compatibility"]["tier"] == "no-MTP"
+    assert payload["compatibility"]["tier"] == "incompatible-architecture"
 
 
 def test_run_refuses_non_mtp_model_without_importing_mlx(tmp_path: Path) -> None:
@@ -227,11 +231,11 @@ def test_run_refuses_non_mtp_model_without_importing_mlx(tmp_path: Path) -> None
         ["-m", "mtplx.cli", "run", "hello", "--model", str(model), "--json"],
     )
 
-    assert proc.returncode == 2, proc.stderr
+    assert proc.returncode == 4, proc.stderr
     assert "Traceback" not in proc.stderr
     payload = json.loads(proc.stdout)
     assert payload["error"] == "model failed MTP primary gate"
-    assert payload["model"]["compatibility"]["tier"] == "no-MTP"
+    assert payload["model"]["compatibility"]["tier"] == "incompatible-architecture"
 
 
 def test_run_reports_uncached_hf_model_without_importing_mlx(tmp_path: Path) -> None:

@@ -2341,7 +2341,7 @@ def test_quickstart_public_quality_alias_missing_cache_is_not_no_mtp(tmp_path, c
     assert code == 1
     assert "error: model is not available locally" in captured
     assert "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality" in captured
-    assert "try: mtplx quickstart --download" in captured
+    assert "try: mtplx pull Qwen3.6-27B-MTPLX-Optimized-Quality" in captured
     assert "error: model cannot run with MTPLX" not in captured
     assert "tier: no-MTP" not in captured
 
@@ -7629,7 +7629,7 @@ def test_inspect_human_output_is_default(tmp_path, capsys):
     assert f"model: {model}" in captured
     assert "tier: no-MTP" in captured
     assert "can_run: false" in captured
-    assert "message: Model has no MTP head." in captured
+    assert "message: this folder contains no model weights (*.safetensors)." in captured
 
 
 def test_start_gate_failure_is_human_readable_for_config_only_qwen(tmp_path, capsys):

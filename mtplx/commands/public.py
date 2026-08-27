@@ -14687,7 +14687,9 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
                 "tier": "no-MTP",
                 "arch_id": None,
                 "can_run": False,
-                "runtime_compatibility": "unsupported",
+                # Config-only fixture: the weights check precedes the
+                # unsupported label for constructable trunks.
+                "runtime_compatibility": "missing-model-weights",
             },
         },
         {
