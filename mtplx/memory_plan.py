@@ -82,6 +82,47 @@ DEFAULT_DENSE_KV_BYTES_PER_TOKEN = 65536
 KV_QUANT_BYTE_FACTOR = {"off": 1.0, "q8": 0.55, "q4": 0.30}
 
 
+def dense_kv_bytes_per_token_from_config(config: dict | None) -> int | None:
+    """Derive dense-attention KV bytes/token from a model config.
+
+    n_full_attention_layers x (K+V) x kv_heads x head_dim x 2 bytes (bf16).
+    Reproduces the flagship constant exactly (16 x 2 x 4 x 256 x 2 = 65,536)
+    and generalizes to hybrids with different attention geometry — e.g.
+    qwen4_exp's 12 x 2 x 2 x 256 x 2 = 24,576, which the flat default would
+    over-plan 2.7x. Returns None when the config doesn't say enough.
+    """
+    if not isinstance(config, dict):
+        return None
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    layer_types = text.get("layer_types")
+    n_full: int | None = None
+    if isinstance(layer_types, list) and layer_types:
+        n_full = sum(1 for t in layer_types if t != "linear_attention")
+    else:
+        n_layers = text.get("num_hidden_layers")
+        interval = text.get("full_attention_interval")
+        if isinstance(n_layers, int) and isinstance(interval, int) and interval > 0:
+            n_full = n_layers // interval
+        elif isinstance(n_layers, int):
+            n_full = n_layers  # pure-attention families
+    kv_heads = text.get("num_key_value_heads")
+    head_dim = text.get("head_dim")
+    if head_dim is None and isinstance(text.get("hidden_size"), int) and isinstance(
+        text.get("num_attention_heads"), int
+    ) and text["num_attention_heads"] > 0:
+        head_dim = text["hidden_size"] // text["num_attention_heads"]
+    if not (
+        isinstance(n_full, int)
+        and n_full > 0
+        and isinstance(kv_heads, int)
+        and kv_heads > 0
+        and isinstance(head_dim, int)
+        and head_dim > 0
+    ):
+        return None
+    return n_full * 2 * kv_heads * head_dim * 2
+
+
 def detect_total_ram_bytes() -> int | None:
     """Physical RAM, PATH-immune.
 

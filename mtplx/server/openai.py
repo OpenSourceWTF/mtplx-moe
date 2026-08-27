@@ -2381,12 +2381,31 @@ class ServerState:
         _plan_weights_bytes = _model_weights_bytes(
             getattr(self.runtime, "model_path", None)
         )
+        # env override > model-config-derived geometry > flagship default
+        _plan_kv_bytes_per_token = 0
         try:
             _plan_kv_bytes_per_token = int(
-                os.environ.get("MTPLX_DENSE_KV_BYTES_PER_TOKEN") or 65536
+                os.environ.get("MTPLX_DENSE_KV_BYTES_PER_TOKEN") or 0
             )
         except (TypeError, ValueError):
-            _plan_kv_bytes_per_token = 65536
+            _plan_kv_bytes_per_token = 0
+        if _plan_kv_bytes_per_token <= 0:
+            from mtplx.memory_plan import (
+                dense_kv_bytes_per_token_from_config as _plan_kv_from_config,
+            )
+
+            _plan_model_path = getattr(self.runtime, "model_path", None)
+            _plan_model_config: dict[str, Any] | None = None
+            if _plan_model_path is not None:
+                try:
+                    _plan_model_config = json.loads(
+                        (Path(_plan_model_path) / "config.json").read_text()
+                    )
+                except (OSError, ValueError):
+                    _plan_model_config = None
+            _plan_kv_bytes_per_token = (
+                _plan_kv_from_config(_plan_model_config) or 65536
+            )
         _plan_metal_limit: int | None = None
         _caps = getattr(self, "metal_memory_caps", None)
         if isinstance(_caps, dict):
