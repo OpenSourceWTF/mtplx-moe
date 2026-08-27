@@ -1016,6 +1016,12 @@ def _deepseek_v4_model_classes() -> tuple[type, type]:
     return Model, ModelArgs
 
 
+def _qwen4_exp_model_classes() -> tuple[type, type]:
+    from .models.qwen4_exp import Model, ModelArgs
+
+    return Model, ModelArgs
+
+
 # model_type -> loader of MTPLX-owned (Model, ModelArgs) classes for
 # architectures the pinned mlx-lm does not implement. A new in-tree
 # architecture (e.g. the Qwen3.8-Flash-Next backend) registers its loader
@@ -1024,6 +1030,7 @@ def _deepseek_v4_model_classes() -> tuple[type, type]:
 # geometry-gated special case below because its match is not model_type-keyed.
 _INTREE_MODEL_CLASS_LOADERS: dict[str, Callable[[], tuple[type, type]]] = {
     "deepseek_v4": _deepseek_v4_model_classes,
+    "qwen4_exp": _qwen4_exp_model_classes,
 }
 
 
@@ -1072,6 +1079,11 @@ def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
                 "quantization_config": module_quantization,
             }
         model, _loaded_config = load_model(path, **load_kwargs)
+        # In-tree models with SSD-resident sidecars (e.g. the qwen4_exp
+        # n-gram table) finish wiring here — after weights, before serving.
+        post_load = getattr(model, "post_weight_load", None)
+        if callable(post_load):
+            post_load(path)
         return model, tokenizer
 
     from mlx_lm.utils import load as mlx_lm_load

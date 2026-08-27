@@ -228,7 +228,16 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         support_level="experimental-trunk-pending-kernels",
         runtime_compatibility="native-ar-only",
         can_run_verified=False,
-        aliases=("qwen4", "qwen3_8", "qwen3_9", "flash_next"),
+        # The real T-0 strings (config landed 2026-08-26 15:00 UTC):
+        # model_type qwen4_exp / qwen4_exp_text, Qwen4ExpForConditionalGeneration.
+        # The speculative pre-drop aliases (qwen4/qwen3_8/qwen3_9) are gone —
+        # qwen3_8-shaped names must never be swallowed into this family (#268).
+        aliases=(
+            "qwen4_exp",
+            "Qwen4ExpForConditionalGeneration",
+            "Qwen4ExpForCausalLM",
+            "flash_next",
+        ),
         config_markers=(),
         family_gate="mlx-lm-ar",
         references=(
@@ -1157,7 +1166,7 @@ _DECLARED_MODULES_LOWERED = {
 # deliberately absent: its runnability is decided by the pinned-artifact
 # geometry/sidecar gate on its catalog row (supply-chain fence), never by
 # model_type alone.
-_INTREE_MODEL_TYPES = {"deepseek_v4"}
+_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp"}
 
 # Families whose catalog family_gate is an artifact-integrity fence (pinned
 # geometry + pinned sidecars). A gate failure here refuses outright and is
