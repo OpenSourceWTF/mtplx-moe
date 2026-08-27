@@ -3811,6 +3811,10 @@ final class MTPLXAppCoreTests: XCTestCase {
             "qwen38-27b-optimized-speed",
             "qwen38-27b-bare-speed",
             "qwen38-27b-optimized-quality",
+            // Flash-Next pair (2026-08-27): visible only on big Macs —
+            // the 78/87 GiB peaks pass the 128 GiB filter here.
+            "flash-next-bare-speed",
+            "flash-next-optimized-speed",
             "optimized-speed-v2",
             "optimized-speed",
             "optimized-quality",

@@ -572,6 +572,60 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             peakMemoryGiB: 33.0,
             recommendedFor: [.legacyApple]
         ),
+        // Qwen 3.8 Flash-Next (day-0 native, 2026-08-26): the 125B-A6B
+        // Qwen4-generation preview (GDN hybrid MoE + Qwen Sparse Attention +
+        // n-gram memory sidecar). The 32 GB n-gram table streams from SSD by
+        // default, so resident peak is weights + MTP + working set, not the
+        // full download size. Big-Mac exclusive: the peak-memory filter
+        // hides both entries below ~96 GB unified memory.
+        MTPLXModelOption(
+            id: "flash-next-bare-speed",
+            displayName: "Qwen 3.8 Flash-Next Bare Speed",
+            shortName: "Flash-Next Bare Speed",
+            detail: "Flat 4-bit 125B MoE. Fastest Flash-Next; needs a 96GB+ Mac.",
+            hfModelID: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+            localCandidates: [
+                "~/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+                "~/.mtplx/models/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+            ],
+            aliases: [
+                "mtplx-flash-next-bare-speed",
+                "Qwen3.8 Flash-Next Bare Speed",
+                "Flash-Next Bare Speed",
+                "Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+            ],
+            // Exact byte sum of the local pack (2026-08-27 audit); includes
+            // the 32 GB SSD-streamed n-gram table and the vision tower.
+            sizeBytes: 106_336_779_939,
+            // Weights 72.6 GB + MTP 1.7 GB resident (n-gram on SSD) plus
+            // KV/working headroom at the default profile.
+            peakMemoryGiB: 78.0,
+            recommendedFor: [.modernApple]
+        ),
+        MTPLXModelOption(
+            id: "flash-next-optimized-speed",
+            displayName: "Qwen 3.8 Flash-Next Optimized Speed",
+            shortName: "Flash-Next Optimized Speed",
+            detail: "Dynamic quant with 8-bit attention. Higher quality, slightly slower; needs a 96GB+ Mac.",
+            hfModelID: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+            localCandidates: [
+                "~/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+                "~/.mtplx/models/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+            ],
+            aliases: [
+                "mtplx-flash-next-optimized-speed",
+                "Qwen3.8 Flash-Next Optimized Speed",
+                "Flash-Next Optimized Speed",
+                "Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+            ],
+            // Exact byte sum of the local pack (2026-08-27 audit); includes
+            // the 32 GB SSD-streamed n-gram table and the vision tower.
+            sizeBytes: 115_061_220_772,
+            // Weights 81.4 GB + MTP 1.7 GB resident (n-gram on SSD) plus
+            // KV/working headroom at the default profile.
+            peakMemoryGiB: 87.0,
+            recommendedFor: [.modernApple]
+        ),
         MTPLXModelOption(
             id: "optimized-speed-v2",
             displayName: "Qwen 3.6 27B Optimized Speed V2",
@@ -887,6 +941,12 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 quality27: "optimized-quality",
                 trio38: qwen38TrioIDs
             )
+            // Flash-Next rides right behind the 3.8 trio on big modern
+            // Macs. Modern tier only (bf16 packs, no fp16 sibling); the
+            // peak-memory filter hides both entries below ~96 GB unified.
+            if let trioEnd = ids.lastIndex(where: { qwen38TrioIDs.contains($0) }) {
+                ids.insert(contentsOf: flashNextIDs, at: ids.index(after: trioEnd))
+            }
             ids.append(contentsOf: tinyIDs)
             return ids
         }
@@ -904,6 +964,8 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         "qwen38-27b-optimized-speed",
         "qwen38-27b-bare-speed",
         "qwen38-27b-optimized-quality",
+        "flash-next-bare-speed",
+        "flash-next-optimized-speed",
         "optimized-speed-v2",
         "optimized-speed",
         "optimized-quality",
@@ -923,6 +985,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         "qwen38-27b-optimized-speed",
         "qwen38-27b-bare-speed",
         "qwen38-27b-optimized-quality",
+    ]
+
+    /// Qwen 3.8 Flash-Next pair (2026-08-27): Bare Speed first (the fast
+    /// flat-4-bit pick), then Optimized Speed. Modern-tier, big-Mac only.
+    /// Mirrors model_catalog.FLASH_NEXT_IDS.
+    private static let flashNextIDs = [
+        "flash-next-bare-speed",
+        "flash-next-optimized-speed",
     ]
 
     private static func recommendationIDs(
@@ -1095,6 +1165,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if normalized.contains("gemma4") || normalized.contains("gemma-4") {
             return "gemma4"
         }
+        // Flash-Next must resolve BEFORE the 3.8 version token: the pack
+        // names carry "Qwen3.8-Flash-Next", which would otherwise be
+        // swallowed into the dense-27B qwen3_8 contract (engine F21/#268
+        // twin — the families share a marketing version, not a behavior
+        // contract).
+        if normalized.contains("flash-next") || normalized.contains("flashnext") {
+            return "qwen4_exp"
+        }
         if matchesQwen38VersionToken(normalized) {
             return "qwen3_8"
         }
@@ -1229,6 +1307,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if normalized.contains("step") { return "step" }
         if normalized.contains("deepseek") { return "deepseek" }
         if normalized.contains("glm") { return "glm" }
+        if normalized.contains("qwen4") { return "qwen4_exp" }
         if normalized.contains("qwen") { return "qwen3_6" }
         return nil
     }
@@ -1239,6 +1318,11 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if normalized.contains("step") { return "step" }
         if normalized.contains("deepseek") { return "deepseek" }
         if normalized.contains("glm") { return "glm" }
+        if normalized.contains("qwen4_exp") || normalized.contains("qwen4-exp")
+            || normalized.contains("flash-next") || normalized.contains("flash_next")
+        {
+            return "qwen4_exp"
+        }
         if normalized.range(
             of: "qwen3[._-]?8(?![0-9]*b)",
             options: .regularExpression
