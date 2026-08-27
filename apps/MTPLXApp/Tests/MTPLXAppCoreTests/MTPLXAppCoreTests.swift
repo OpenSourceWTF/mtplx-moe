@@ -5575,7 +5575,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(backend.modelDownloadProgress?.statusMessage, "Incomplete")
         XCTAssertEqual(backend.pendingModelDownload, request)
         XCTAssertEqual(backend.daemonState, .stopped)
-        XCTAssertTrue(backend.modelDownloadFailure?.contains("missing required MTPLX files") ?? false)
+        XCTAssertTrue(backend.modelDownloadFailure?.contains("files the source repo ships are still missing") ?? false)
     }
 
     @MainActor
