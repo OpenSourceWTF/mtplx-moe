@@ -56,11 +56,13 @@ def _tiny_args() -> TextArgs:
 
 @pytest.fixture()
 def tm():
+    prev = mx.default_device()
     mx.set_default_device(mx.cpu)
     mx.random.seed(0)
     model = TextModel(_tiny_args())
     mx.eval(model.parameters())
-    return model
+    yield model
+    mx.set_default_device(prev)
 
 
 def _ids(tokens: int, seed: int) -> mx.array:

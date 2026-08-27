@@ -42,11 +42,13 @@ def _tiny_args() -> TextArgs:
 
 @pytest.fixture()
 def attn():
+    prev = mx.default_device()
     mx.set_default_device(mx.cpu)
     mx.random.seed(0)
     layer = Attention(_tiny_args())
     mx.eval(layer.parameters())
-    return layer
+    yield layer
+    mx.set_default_device(prev)
 
 
 def _hidden(tokens: int, seed: int) -> mx.array:
