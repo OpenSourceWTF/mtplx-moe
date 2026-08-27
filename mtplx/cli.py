@@ -795,6 +795,19 @@ def _add_adaptive_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--adaptive-ev-exploration-interval", type=int, default=32)
 
 
+def _add_ngram_cache_limit_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ngram-cache-limit",
+        default=None,
+        metavar="SIZE",
+        help=(
+            "Qwen4 n-gram row-cache payload ceiling. Accepts human-readable "
+            "sizes such as 1GB, 1GiB, 4096MiB, or 1.5GB. Defaults to 1GiB; "
+            "the construction-time memory planner may select a smaller size."
+        ),
+    )
+
+
 def cmd_bench_public(args: argparse.Namespace) -> int:
     from .commands.public import cmd_bench_public as handler
 
@@ -2429,6 +2442,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start the local MTPLX server",
     )
     quickstart_server_p.add_argument("--model", default=default_model)
+    _add_ngram_cache_limit_arg(quickstart_server_p)
     quickstart_server_p.add_argument("--cache-dir")
     quickstart_server_p.add_argument(
         "--download",
@@ -3312,6 +3326,7 @@ def build_parser() -> argparse.ArgumentParser:
         "serve", help="Choose model/mode, then start the OpenAI-compatible MTPLX server"
     )
     serve_p.add_argument("--model", default=default_model)
+    _add_ngram_cache_limit_arg(serve_p)
     serve_p.add_argument("--cache-dir")
     serve_p.add_argument(
         "--download",

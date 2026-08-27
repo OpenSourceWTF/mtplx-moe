@@ -6,6 +6,7 @@
 - [Profiles](profiles.md)
 - [Benchmarks](benchmarks.md)
 - [Server](server.md)
+- [Qwen3.8 Flash-Next n-gram cache](qwen4-resident-ngram-cache.md)
 - [Concurrency modes](concurrency.md)
 - [API](api.md)
 - [Dashboard](dashboard.md)

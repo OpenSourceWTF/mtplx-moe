@@ -24,7 +24,6 @@ from .qwen4_ngram import (
 
 _GIB = 1024**3
 _MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024**2
-_MINIMUM_NGRAM_PAYLOAD_BYTES = 1 * _GIB
 _METAL_WORKING_RESERVE_BYTES = 2 * _GIB
 _SAFETY_MARGIN_BYTES = 2 * _GIB
 _ALIGNMENT_BYTES = 16 * 1024
@@ -248,7 +247,7 @@ def plan_qwen4_resident_preflight(
         kv_mtp_reserve_bytes=kv_mtp,
         metal_working_reserve_bytes=_METAL_WORKING_RESERVE_BYTES,
         safety_margin_bytes=_SAFETY_MARGIN_BYTES,
-        minimum_payload_bytes=_MINIMUM_NGRAM_PAYLOAD_BYTES,
+        minimum_payload_bytes=manifest.row_bytes,
         allocation_alignment_bytes=_ALIGNMENT_BYTES,
         target_residency_bytes=effective_target,
         payload_ceiling_bytes=payload_ceiling_bytes,

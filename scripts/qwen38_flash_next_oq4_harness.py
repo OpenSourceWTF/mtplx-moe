@@ -421,8 +421,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("production mode requires exactly 16,384 input and 1,024 output")
     if not 1 <= args.depth <= 8:
         raise ValueError("depth must be in [1, 8]")
-    if not 1 <= args.ngram_cache_gib <= 10:
-        raise ValueError("ngram cache payload must be in [1, 10] GiB")
+    if args.ngram_cache_gib < 1:
+        raise ValueError("ngram cache payload must be at least 1 GiB")
     if not 1 <= args.runtime_target_gib <= 82:
         raise ValueError("runtime target must be in [1, 82] GiB")
     if not 0 <= args.guard_race_retries <= 64:

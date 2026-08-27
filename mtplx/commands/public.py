@@ -9432,6 +9432,9 @@ def cmd_serve_public(args: Any) -> int:
     context_window = getattr(args, "context_window", None)
     if context_window is not None:
         cmd.extend(["--context-window", str(context_window)])
+    ngram_cache_limit = getattr(args, "ngram_cache_limit", None)
+    if ngram_cache_limit is not None:
+        cmd.extend(["--ngram-cache-limit", str(ngram_cache_limit)])
     mtp_adapter = getattr(args, "mtp_adapter", None)
     if mtp_adapter:
         cmd.extend(["--mtp-adapter", str(mtp_adapter)])
@@ -12453,6 +12456,7 @@ def _with_server_policy_args(target: Any, source: Any) -> Any:
         ("retrieval_max_tokens", 0),
         ("retrieval_idle_timeout", 0.0),
         ("retrieval_trust_remote_code", False),
+        ("ngram_cache_limit", None),
         ("api_key_file", None),
         ("api_key_source", "none"),
         ("default_presence_penalty", 0.0),

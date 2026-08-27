@@ -62,7 +62,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ByteSize, ConfigDict, Field, TypeAdapter
 
 from mtplx import progress_heartbeat
 from mtplx.a3b_mtp_batch import (
@@ -775,6 +775,29 @@ def _parse_byte_limit(value: str | int | None) -> int | None:
             number = text[: -len(suffix)]
             return int(float(number) * multiplier)
     return int(float(text))
+
+
+_BYTE_SIZE_ADAPTER = TypeAdapter(ByteSize)
+_DEFAULT_NGRAM_CACHE_LIMIT = "1GiB"
+
+
+def _resolve_ngram_cache_limit_bytes(args: argparse.Namespace) -> int:
+    raw = getattr(args, "ngram_cache_limit", None)
+    if raw is None:
+        raw = os.environ.get("MTPLX_NGRAM_CACHE_LIMIT", _DEFAULT_NGRAM_CACHE_LIMIT)
+    try:
+        resolved = int(_BYTE_SIZE_ADAPTER.validate_python(raw))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "--ngram-cache-limit must be a positive byte size such as "
+            "1GB, 1GiB, 4096MiB, or 1.5GB"
+        ) from exc
+    if resolved <= 0:
+        raise ValueError(
+            "--ngram-cache-limit must be a positive byte size such as "
+            "1GB, 1GiB, 4096MiB, or 1.5GB"
+        )
+    return resolved
 
 
 _MLX_CACHE_LIMIT_OFF_VALUES = {"off", "none", "unlimited", "default"}
@@ -1928,6 +1951,7 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
 
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
+        self.ngram_cache_limit_bytes = _resolve_ngram_cache_limit_bytes(args)
         _validate_mtp_batch_settings(args)
         self.args = args
         try:
@@ -2106,6 +2130,7 @@ class ServerState:
                     startup_backend,
                 ),
                 ngram_context_tokens=int(self.context_window),
+                ngram_cache_limit_bytes=self.ngram_cache_limit_bytes,
                 # Live settings can raise the request-local chunk after model
                 # construction. Reserve the complete supported range once so
                 # no later request can outgrow the exact n-gram staging arena.
@@ -32350,6 +32375,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "when set, otherwise a RAM-tiered default (2-8 GiB) bounds the "
             "allocator so freed transients cannot accumulate for the process "
             "lifetime (#150)."
+        ),
+    )
+    parser.add_argument(
+        "--ngram-cache-limit",
+        default=None,
+        metavar="SIZE",
+        help=(
+            "Qwen4 n-gram row-cache payload ceiling. Accepts human-readable "
+            "sizes such as 1GB, 1GiB, 4096MiB, or 1.5GB. Defaults to "
+            "MTPLX_NGRAM_CACHE_LIMIT when set, otherwise 1GiB. The memory "
+            "planner may select a smaller size."
         ),
     )
     parser.add_argument(

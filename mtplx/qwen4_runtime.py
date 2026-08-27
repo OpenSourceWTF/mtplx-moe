@@ -11,7 +11,6 @@ from .qwen4_ngram import (
     NGramGeometry,
     NGramRowCache,
     NGramRuntimeBudget,
-    PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES,
     QWEN38_FLASH_NEXT_NGRAM_MANIFEST_SHA256,
     QWEN38_FLASH_NEXT_REPO,
     QWEN38_FLASH_NEXT_REVISION,
@@ -24,7 +23,6 @@ from .qwen4_ngram import (
 
 _GIB = 1024**3
 QWEN4_NGRAM_MANIFEST_NAME = "ngram-manifest.json"
-QWEN4_NGRAM_MINIMUM_PAYLOAD_BYTES = 1 * _GIB
 QWEN4_NGRAM_METAL_WORKING_RESERVE_BYTES = 2 * _GIB
 QWEN4_NGRAM_SAFETY_MARGIN_BYTES = 2 * _GIB
 QWEN4_NGRAM_MAX_OPEN_FILES = 129
@@ -137,11 +135,8 @@ def construct_qwen4_ngram_runtime(
     if type(context_tokens) is not int or context_tokens < 1:
         raise ValueError("Qwen4 context_tokens must be a positive exact integer")
     transient_bytes = qwen4_ngram_transient_bytes(prefill_chunk_tokens)
-    if (
-        type(payload_ceiling_bytes) is not int
-        or not 0 < payload_ceiling_bytes <= PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES
-    ):
-        raise ValueError("Qwen4 n-gram payload ceiling must be within (0, 10 GiB]")
+    if type(payload_ceiling_bytes) is not int or payload_ceiling_bytes <= 0:
+        raise ValueError("Qwen4 n-gram payload ceiling must be positive")
     get_active_memory = getattr(mx_module, "get_active_memory", None)
     if not callable(get_active_memory):
         raise TypeError("MLX must expose get_active_memory for Qwen4 construction")
@@ -180,7 +175,7 @@ def construct_qwen4_ngram_runtime(
             kv_mtp_reserve_bytes=kv_mtp_reserve,
             metal_working_reserve_bytes=QWEN4_NGRAM_METAL_WORKING_RESERVE_BYTES,
             safety_margin_bytes=QWEN4_NGRAM_SAFETY_MARGIN_BYTES,
-            minimum_payload_bytes=QWEN4_NGRAM_MINIMUM_PAYLOAD_BYTES,
+            minimum_payload_bytes=manifest.row_bytes,
             allocation_alignment_bytes=QWEN4_NGRAM_ALLOCATION_ALIGNMENT_BYTES,
             target_residency_bytes=target_residency_bytes,
             payload_ceiling_bytes=payload_ceiling_bytes,

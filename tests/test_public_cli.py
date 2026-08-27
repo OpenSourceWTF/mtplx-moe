@@ -372,6 +372,20 @@ def test_server_cli_surfaces_default_to_sustained_profile():
     assert serve_args.profile == "sustained"
 
 
+def test_server_cli_surfaces_accept_ngram_cache_limit() -> None:
+    parser = build_parser()
+
+    quickstart_args = parser.parse_args(
+        ["quickstart", "--ngram-cache-limit", "1.5GB"]
+    )
+    serve_args = parser.parse_args(
+        ["serve", "--yes", "--ngram-cache-limit", "1TiB"]
+    )
+
+    assert quickstart_args.ngram_cache_limit == "1.5GB"
+    assert serve_args.ngram_cache_limit == "1TiB"
+
+
 def test_serve_parser_accepts_legacy_app_profile_strings():
     # Shipped app builds persisted profile "auto" / "sustained-max"; the
     # parser must canonicalize them instead of exiting 2 at startup.
@@ -6473,6 +6487,49 @@ def _serve_execvpe_harness(monkeypatch):
 
     monkeypatch.setattr(public.os, "execvpe", fake_execvpe)
     return calls
+
+
+def test_serve_forwards_ngram_cache_limit_unchanged(monkeypatch) -> None:
+    calls = _serve_execvpe_harness(monkeypatch)
+    args = build_parser().parse_args(
+        [
+            "serve",
+            "--model",
+            "/tmp/model",
+            "--yes",
+            "--ngram-cache-limit",
+            "1.5GiB",
+            "--warmup-tokens",
+            "0",
+        ]
+    )
+    args._cli_flags = {
+        "model",
+        "yes",
+        "ngram-cache-limit",
+        "warmup-tokens",
+    }
+
+    with pytest.raises(SystemExit) as exc:
+        public.cmd_serve_public(args)
+
+    assert exc.value.code == 0
+    cmd = calls["cmd"]
+    assert isinstance(cmd, list)
+    assert cmd[cmd.index("--ngram-cache-limit") + 1] == "1.5GiB"
+
+
+def test_quickstart_handoff_preserves_ngram_cache_limit() -> None:
+    source = SimpleNamespace(
+        ngram_cache_limit="4GiB",
+        _cli_flags={"ngram-cache-limit"},
+    )
+    target = SimpleNamespace()
+
+    public._with_server_policy_args(target, source)
+
+    assert target.ngram_cache_limit == "4GiB"
+    assert "ngram-cache-limit" in target._cli_flags
 
 
 @pytest.mark.parametrize(

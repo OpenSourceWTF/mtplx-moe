@@ -285,6 +285,69 @@ def test_vetted_verify_strategies_still_skip(strategy: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Qwen4 n-gram cache payload ceiling
+
+
+def test_ngram_cache_limit_defaults_to_one_gib(monkeypatch) -> None:
+    from mtplx.server.openai import _resolve_ngram_cache_limit_bytes, parse_args
+
+    monkeypatch.delenv("MTPLX_NGRAM_CACHE_LIMIT", raising=False)
+
+    assert _resolve_ngram_cache_limit_bytes(parse_args([])) == 1024**3
+
+
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [
+        ("1GB", 1_000_000_000),
+        ("1GiB", 1024**3),
+        ("4096MiB", 4096 * 1024**2),
+        ("1.5 GB", 1_500_000_000),
+        ("1TiB", 1024**4),
+        ("1073741824", 1024**3),
+    ],
+)
+def test_ngram_cache_limit_accepts_human_readable_unbounded_sizes(
+    monkeypatch, spelling: str, expected: int
+) -> None:
+    from mtplx.server.openai import _resolve_ngram_cache_limit_bytes, parse_args
+
+    monkeypatch.delenv("MTPLX_NGRAM_CACHE_LIMIT", raising=False)
+
+    assert _resolve_ngram_cache_limit_bytes(
+        parse_args(["--ngram-cache-limit", spelling])
+    ) == expected
+
+
+def test_ngram_cache_limit_cli_beats_environment(monkeypatch) -> None:
+    from mtplx.server.openai import _resolve_ngram_cache_limit_bytes, parse_args
+
+    monkeypatch.setenv("MTPLX_NGRAM_CACHE_LIMIT", "2GiB")
+
+    assert _resolve_ngram_cache_limit_bytes(parse_args([])) == 2 * 1024**3
+    assert _resolve_ngram_cache_limit_bytes(
+        parse_args(["--ngram-cache-limit", "3GiB"])
+    ) == 3 * 1024**3
+
+
+@pytest.mark.parametrize("spelling", ["0", "-1GB", "not-a-size"])
+def test_ngram_cache_limit_rejects_non_positive_or_invalid_sizes(
+    monkeypatch, spelling: str
+) -> None:
+    from mtplx.server.openai import _resolve_ngram_cache_limit_bytes, parse_args
+
+    monkeypatch.delenv("MTPLX_NGRAM_CACHE_LIMIT", raising=False)
+
+    with pytest.raises(ValueError, match="--ngram-cache-limit"):
+        argv = (
+            [f"--ngram-cache-limit={spelling}"]
+            if spelling.startswith("-")
+            else ["--ngram-cache-limit", spelling]
+        )
+        _resolve_ngram_cache_limit_bytes(parse_args(argv))
+
+
+# ---------------------------------------------------------------------------
 # --chat-template-profile provenance
 
 

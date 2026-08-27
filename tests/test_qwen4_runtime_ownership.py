@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from inspect import signature
 from pathlib import Path
 
 import mtplx.runtime as runtime
@@ -47,3 +48,9 @@ def test_construction_reserves_largest_auto_prefill_chunk(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", "4096")
 
     assert runtime._construction_prefill_chunk_tokens(None) == 4_096
+
+
+def test_runtime_ngram_cache_limit_defaults_to_one_gib() -> None:
+    assert signature(runtime.load).parameters["ngram_cache_limit_bytes"].default == (
+        1024**3
+    )

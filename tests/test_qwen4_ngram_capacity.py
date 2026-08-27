@@ -135,3 +135,31 @@ def test_production_budget_rejects_runtime_without_minimum_cache() -> None:
             bypass_page_cache=True,
             eviction="lru",
         )
+
+
+def test_production_budget_accepts_unbounded_user_ceiling_and_caps_to_fit() -> None:
+    manifest = _manifest()
+    budget = NGramRuntimeBudget(
+        measured_base_residency_bytes=100_000,
+        kv_mtp_reserve_bytes=50_000,
+        metal_working_reserve_bytes=25_000,
+        safety_margin_bytes=25_000,
+        minimum_payload_bytes=manifest.row_bytes,
+        allocation_alignment_bytes=64,
+        target_residency_bytes=1_000_000,
+        payload_ceiling_bytes=1024**4,
+    )
+
+    planned = plan_production_ngram_cache(
+        manifest,
+        budget,
+        transient_limit_bytes=100,
+        max_inflight_io_bytes=100,
+        max_open_files=2,
+        bypass_page_cache=True,
+        eviction="lru",
+    )
+
+    assert planned.payload_formula_ceiling_bytes == 800_000
+    assert planned.cache.payload_bytes <= 800_000
+    assert planned.projected_residency_bytes <= budget.target_residency_bytes

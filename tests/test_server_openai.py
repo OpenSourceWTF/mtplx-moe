@@ -11854,6 +11854,35 @@ def _monkeypatch_server_state_load(monkeypatch):
     )
 
 
+def test_server_state_forwards_resolved_ngram_cache_limit(monkeypatch) -> None:
+    _monkeypatch_server_state_load(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def capture_load(model, mtp, contract, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            model_path=Path(model),
+            mtp_enabled=mtp,
+            tokenizer=SimpleNamespace(),
+        )
+
+    monkeypatch.setattr(openai, "load", capture_load)
+    args = parse_args(
+        [
+            "--model",
+            "models/example",
+            "--warmup-tokens",
+            "0",
+            "--ngram-cache-limit",
+            "1.5GiB",
+        ]
+    )
+
+    openai.ServerState(args)
+
+    assert captured["ngram_cache_limit_bytes"] == int(1.5 * 1024**3)
+
+
 def test_server_state_downgrades_kv_quant_for_unsupported_family(monkeypatch):
     """Engine-side policy gate: q8 on a family without a validated KV-quant
     policy must downgrade to off (and scrub the env pair) instead of reaching

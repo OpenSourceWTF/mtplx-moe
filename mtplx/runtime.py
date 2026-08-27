@@ -31,7 +31,7 @@ from .mtp_patch import MTPContract, inject_mtp_support, validate_mtp_support
 logger = logging.getLogger(__name__)
 
 _GIB = 1024**3
-_DEFAULT_NGRAM_CACHE_LIMIT_BYTES = 10 * _GIB
+_DEFAULT_NGRAM_CACHE_LIMIT_BYTES = 1 * _GIB
 _DEFAULT_QWEN4_CONTEXT_TOKENS = 17_408
 _QWEN4_RUNTIME_TARGET_BYTES = 82 * _GIB
 
@@ -761,8 +761,6 @@ def load(
     ):
         if type(value) is not int or value <= 0:
             raise ValueError(f"{name} must be a positive exact integer")
-    if ngram_cache_limit_bytes > _DEFAULT_NGRAM_CACHE_LIMIT_BYTES:
-        raise ValueError("ngram_cache_limit_bytes must not exceed 10 GiB")
     path = Path(model_path)
     from .gemma4_pair import resolve_gemma4_pair_paths
 

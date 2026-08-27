@@ -70,7 +70,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _STORAGES = frozenset(("bf16", "affine-q4-g32"))
 _GIB = 1024**3
 PRODUCTION_RUNTIME_TARGET_BYTES = 82 * _GIB
-PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES = 10 * _GIB
+DEFAULT_NGRAM_PAYLOAD_CEILING_BYTES = 1 * _GIB
 
 
 class NGramManifestError(ValueError):
@@ -1926,7 +1926,7 @@ class NGramRuntimeBudget:
     minimum_payload_bytes: int
     allocation_alignment_bytes: int
     target_residency_bytes: int = PRODUCTION_RUNTIME_TARGET_BYTES
-    payload_ceiling_bytes: int = PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES
+    payload_ceiling_bytes: int = DEFAULT_NGRAM_PAYLOAD_CEILING_BYTES
 
     def __post_init__(self) -> None:
         for name in (
@@ -1952,10 +1952,8 @@ class NGramRuntimeBudget:
             raise ValueError("allocation_alignment_bytes must be a positive power of two")
         if not 0 < self.target_residency_bytes <= PRODUCTION_RUNTIME_TARGET_BYTES:
             raise ValueError("target_residency_bytes exceeds the pinned 82 GiB target")
-        if not 0 < self.payload_ceiling_bytes <= (
-            PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES
-        ):
-            raise ValueError("payload_ceiling_bytes exceeds the pinned 10 GiB maximum")
+        if self.payload_ceiling_bytes == 0:
+            raise ValueError("payload_ceiling_bytes must be positive")
 
 
 @dataclass(frozen=True)
