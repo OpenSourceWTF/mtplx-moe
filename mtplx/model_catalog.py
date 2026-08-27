@@ -258,7 +258,7 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
     CatalogModel(
         id="flash-next-bare-speed",
         display_name="Qwen 3.8 Flash-Next Bare Speed",
-        detail="Flat 4-bit 125B MoE. Fastest Flash-Next; needs a 96GB+ Mac.",
+        detail="Flat 4-bit quantization. Quickest Flash-Next speeds for chat and coding.",
         hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
         # Exact byte sum of the local pack (2026-08-27 audit); includes the
         # 32 GB SSD-streamed n-gram table and the vision tower.
@@ -278,8 +278,8 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         id="flash-next-optimized-speed",
         display_name="Qwen 3.8 Flash-Next Optimized Speed",
         detail=(
-            "Dynamic quant with 8-bit attention. Higher quality, slightly "
-            "slower; needs a 96GB+ Mac."
+            "Dynamic 4-bit quant with 8-bit attention. Higher quality and "
+            "slightly slower. Recommended."
         ),
         hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
         # Exact byte sum of the local pack (2026-08-27 audit); includes the
