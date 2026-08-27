@@ -47,6 +47,40 @@ mtplx serve \
 
 An explicit `--ngram-cache-limit` takes precedence over the environment.
 
+## Recommended generation settings
+
+Use Qwen thinking mode with the model's sampling preset:
+
+| Setting | Value |
+|---|---:|
+| `temperature` | `1.0` |
+| `top_p` | `0.95` |
+| `top_k` | `20` |
+| `presence_penalty` | `0.0` |
+| `min_p` | `0.0` (identity) |
+| `repetition_penalty` | `1.0` (identity) |
+
+For example, after starting the cached server above:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "<model-id>",
+    "messages": [{"role": "user", "content": "Write a Python LRU cache."}],
+    "max_tokens": 1024,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+    "enable_thinking": true
+  }'
+```
+
+`min_p=0.0` and `repetition_penalty=1.0` are neutral, so clients that do not
+send those fields already have the same sampling behavior. The n-gram cache
+limit is a server startup setting, not a per-request sampling option.
+
 ## Measured example
 
 The guarded 16,384-input / 1,024-output validation run used the earlier 10 GiB
