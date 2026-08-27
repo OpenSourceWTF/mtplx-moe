@@ -44,6 +44,23 @@ def test_harness_defaults_to_smallest_viable_resident_target() -> None:
     assert args.profile == "sustained"
 
 
+def test_guarded_child_waits_for_stopped_service_memory_to_become_reclaimable() -> None:
+    harness = _harness()
+    readings = iter((79 * 1024**3, 81 * 1024**3, 82 * 1024**3))
+    sleeps = []
+
+    available = harness._wait_for_resident_target_memory(
+        82 * 1024**3,
+        timeout_s=10,
+        read_available=lambda: next(readings),
+        sleep=lambda seconds: sleeps.append(seconds),
+        now=iter((0.0, 1.0, 2.0)).__next__,
+    )
+
+    assert available == 82 * 1024**3
+    assert sleeps == [1.0, 1.0]
+
+
 def test_smoke_uses_short_instruction_without_changing_exact_fixture(tmp_path) -> None:
     harness = _harness()
     prompt_file = tmp_path / "prompt.jsonl"
@@ -110,3 +127,14 @@ def test_outer_harness_retries_only_pre_child_canonical_lock_race() -> None:
     assert result == 0
     assert len(calls) == 2
     assert waits == [args.lock_timeout_seconds]
+
+
+def test_headline_forwards_requested_warmup_runs() -> None:
+    harness = _harness()
+    args = harness._parse_args(["--headline", "--warmup-runs", "1"])
+
+    command = harness._outer_command(args)
+
+    assert args.warmup_runs == 1
+    warmup_index = command.index("--warmup-runs")
+    assert command[warmup_index + 1] == "1"

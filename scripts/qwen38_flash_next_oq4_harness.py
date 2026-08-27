@@ -33,6 +33,10 @@ DEFAULT_PLIST = Path.home() / "Library/LaunchAgents/com.tea.qwen.plist"
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
 _CONTENT_SENTINEL = "MTPLX_QWEN38_RESIDENT_OQ4_CONTENT_17E3A1"
 _SMOKE_INSTRUCTION = "Write a Python function that adds two integers."
+_PALINDROME_INSTRUCTION = '''Complete this Python function. Return only the function body, with no markdown or explanation.
+
+def is_palindrome(text: str) -> bool:
+    """Return whether text reads the same forward and backward. Ignore whitespace, punctuation, and case, while handling Unicode letters and digits. Empty input counts as a palindrome. For example, "A man, a plan, a canal: Panama" is true and "hello" is false."""'''
 _MAX_ATTESTATION_BYTES = 16 * 1024
 _GIB = 1024**3
 _SERVICE_HEALTH_URL = "http://127.0.0.1:8080/health"
@@ -90,6 +94,20 @@ def build_exact_python_prompt(
     # one merged token even though they decode to identical text.
     prompt = str(tokenizer.decode(tokens))
     return prompt, tokens
+
+
+def build_exact_palindrome_prompt(tokenizer: Any) -> tuple[str, list[int]]:
+    tokens = list(
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": _PALINDROME_INSTRUCTION}],
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    )
+    if len(tokens) != 100:
+        raise ValueError(f"palindrome prompt is {len(tokens)} tokens, expected 100")
+    return str(tokenizer.decode(tokens)), tokens
 
 
 def _consume_guard_attestation(
@@ -198,6 +216,28 @@ def _static_preflight(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _wait_for_resident_target_memory(
+    target_bytes: int,
+    *,
+    timeout_s: float = 120.0,
+    read_available=None,
+    sleep=time.sleep,
+    now=time.monotonic,
+) -> int:
+    """Let the stopped service's pages become reclaimable inside the lock."""
+
+    if read_available is None:
+        from mtplx.qwen4_preflight import read_darwin_available_memory_bytes
+
+        read_available = read_darwin_available_memory_bytes
+    deadline = now() + float(timeout_s)
+    while True:
+        available = int(read_available())
+        if available >= int(target_bytes) or now() >= deadline:
+            return available
+        sleep(1.0)
+
+
 def _run_guarded_child(args: argparse.Namespace) -> int:
     guard = _consume_guard_attestation(os.environ, expected_lock=args.lock)
     if args.inner_started_marker is not None:
@@ -217,55 +257,79 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
     output = None
     started = time.perf_counter()
     try:
+        available = _wait_for_resident_target_memory(
+            int(args.runtime_target_gib) * _GIB
+        )
+        print(
+            "[qwen4-harness] pre-load available memory "
+            f"{available / _GIB:.2f} GiB",
+            flush=True,
+        )
         from mtplx.generation import generate_ar, generate_mtpk
         from mtplx.runtime import load
         from mtplx.sampling import SamplerConfig
 
         runtime = load(model, **_resident_load_kwargs(args))
-        _prompt, prompt_ids = build_exact_python_prompt(
-            runtime.tokenizer,
-            context=args.context_file.read_text(encoding="utf-8"),
-            instruction=_run_instruction(args.prompt_file, smoke=args.smoke),
-            target_tokens=args.prompt_tokens,
-            reasoning_effort=args.reasoning_effort,
-        )
-        sampler = SamplerConfig(1.0, 0.95, 20)
-        if args.mode == "ar":
-            output = generate_ar(
-                runtime,
-                prompt_ids,
-                max_tokens=args.max_tokens,
-                sampler=sampler,
-                seed=42,
-                stop_token_ids=set(),
-            )
+        if args.headline:
+            _prompt, prompt_ids = build_exact_palindrome_prompt(runtime.tokenizer)
         else:
-            output = generate_mtpk(
+            _prompt, prompt_ids = build_exact_python_prompt(
+                runtime.tokenizer,
+                context=args.context_file.read_text(encoding="utf-8"),
+                instruction=_run_instruction(args.prompt_file, smoke=args.smoke),
+                target_tokens=args.prompt_tokens,
+                reasoning_effort=args.reasoning_effort,
+            )
+        sampler = (
+            SamplerConfig(0.0, 1.0, 0)
+            if args.headline
+            else SamplerConfig(1.0, 0.95, 20)
+        )
+        stop_token_ids = None if args.headline else set()
+        def generate_once():
+            if args.mode == "ar":
+                return generate_ar(
+                    runtime,
+                    prompt_ids,
+                    max_tokens=args.max_tokens,
+                    sampler=sampler,
+                    seed=42,
+                    stop_token_ids=stop_token_ids,
+                )
+            return generate_mtpk(
                 runtime,
                 prompt_ids,
                 max_tokens=args.max_tokens,
                 sampler=sampler,
                 speculative_depth=args.depth,
                 seed=42,
-                stop_token_ids=set(),
+                stop_token_ids=stop_token_ids,
                 mtp_hidden_variant="post_norm",
                 mtp_cache_policy="persistent",
                 mtp_history_policy="committed",
-                verify_strategy="batched",
-                verify_core="stock",
+                verify_strategy=args.verify_strategy,
+                verify_core=args.verify_core,
             )
+
+        for _ in range(args.warmup_runs):
+            generate_once()
+        output = generate_once()
         wall_s = time.perf_counter() - started
         stats = output.stats
         generated = int(stats.generated_tokens)
-        if generated != args.max_tokens or len(output.tokens) != args.max_tokens:
+        if len(output.tokens) != generated or not 0 < generated <= args.max_tokens:
             raise RuntimeError(
-                f"generation count {generated}/{len(output.tokens)} != {args.max_tokens}"
+                f"generation count {generated}/{len(output.tokens)} is outside "
+                f"the 1..{args.max_tokens} contract"
             )
         receipt = {
             "schema": "mtplx-qwen38-resident-oq4-harness-v1",
             "status": "passed",
             "mode": args.mode,
             "profile": args.profile,
+            "verify_strategy": args.verify_strategy,
+            "verify_core": args.verify_core,
+            "warmup_runs": args.warmup_runs,
             "source_revision": _source_revision(model),
             "prompt_tokens": len(prompt_ids),
             "prompt_token_sha256": _token_sha256(prompt_ids),
@@ -276,6 +340,27 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
             "decode_tps": float(getattr(stats, "tok_s", 0.0) or 0.0),
             "peak_memory_bytes": int(getattr(stats, "peak_memory_bytes", 0) or 0),
             "accepted_by_depth": list(getattr(stats, "accepted_by_depth", []) or []),
+            "drafted_by_depth": list(getattr(stats, "drafted_by_depth", []) or []),
+            "accepted_drafts": int(getattr(stats, "accepted_drafts", 0) or 0),
+            "drafted_tokens": int(getattr(stats, "drafted_tokens", 0) or 0),
+            "verify_calls": int(getattr(stats, "verify_calls", 0) or 0),
+            "bonus_tokens": int(getattr(stats, "bonus_tokens", 0) or 0),
+            "correction_tokens": int(getattr(stats, "correction_tokens", 0) or 0),
+            "decode_elapsed_s": float(getattr(stats, "decode_elapsed_s", 0.0) or 0.0),
+            "verify_time_s": float(getattr(stats, "verify_time_s", 0.0) or 0.0),
+            "verify_forward_time_s": float(
+                getattr(stats, "verify_forward_time_s", 0.0) or 0.0
+            ),
+            "verify_eval_time_s": float(
+                getattr(stats, "verify_eval_time_s", 0.0) or 0.0
+            ),
+            "draft_time_s": float(getattr(stats, "draft_time_s", 0.0) or 0.0),
+            "snapshot_time_s": float(
+                getattr(stats, "snapshot_time_s", 0.0) or 0.0
+            ),
+            "capture_commit_time_s": float(
+                getattr(stats, "capture_commit_time_s", 0.0) or 0.0
+            ),
             "preflight": runtime.ngram_preflight_report,
             "ngram_cache": runtime.ngram_memory_report,
             "guard": {
@@ -321,12 +406,17 @@ def _outer_command(args: argparse.Namespace) -> list[str]:
         "--reasoning-effort", args.reasoning_effort,
         "--profile", args.profile,
         "--depth", str(args.depth),
+        "--verify-strategy", args.verify_strategy,
+        "--verify-core", args.verify_core,
+        "--warmup-runs", str(args.warmup_runs),
         "--ngram-cache-gib", str(args.ngram_cache_gib),
         "--runtime-target-gib", str(args.runtime_target_gib),
         "--lock", str(args.lock),
     ]
     if args.smoke:
         forwarded.append("--smoke")
+    if args.headline:
+        forwarded.append("--headline")
     if args.output:
         forwarded.extend(("--output", str(args.output)))
     if args.inner_started_marker is not None:
@@ -398,9 +488,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reasoning-effort", choices=("low", "xhigh"), default="low")
     parser.add_argument("--profile", default="sustained")
     parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument(
+        "--verify-strategy",
+        choices=("batched", "capture_commit", "graphbank_capture_commit"),
+        default="batched",
+    )
+    parser.add_argument("--verify-core", default="stock")
+    parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--ngram-cache-gib", type=int, default=10)
     parser.add_argument("--runtime-target-gib", type=int, default=82)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--headline", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--guard", type=Path, default=DEFAULT_GUARD)
@@ -412,7 +510,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--inner-guarded", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--inner-started-marker", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    if args.smoke:
+    if args.smoke and args.headline:
+        raise ValueError("smoke and headline modes are mutually exclusive")
+    if args.headline:
+        if (args.prompt_tokens, args.max_tokens) == (16_384, 1_024):
+            args.prompt_tokens = 100
+        if (args.prompt_tokens, args.max_tokens) != (100, 1_024):
+            raise ValueError(
+                "headline mode requires exactly 100 input and a 1,024-token ceiling"
+            )
+    elif args.smoke:
         if (args.prompt_tokens, args.max_tokens) == (16_384, 1_024):
             args.prompt_tokens, args.max_tokens = 128, 8
         if args.prompt_tokens > 128 or args.max_tokens > 32:
@@ -421,6 +528,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("production mode requires exactly 16,384 input and 1,024 output")
     if not 1 <= args.depth <= 8:
         raise ValueError("depth must be in [1, 8]")
+    if not 0 <= args.warmup_runs <= 3:
+        raise ValueError("warmup runs must be in [0, 3]")
     if args.ngram_cache_gib < 1:
         raise ValueError("ngram cache payload must be at least 1 GiB")
     if not 1 <= args.runtime_target_gib <= 82:
