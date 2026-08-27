@@ -416,8 +416,9 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
     def __call__(self, x: mx.array) -> mx.array:
         # Fused decode path (MTPLX_FUSED_MOE_DECODE=1 + sanitize-fused gu
         # weights): collapses gate_up -> GLU -> down -> weighted-sum into two
-        # dispatches. Requires the exact family shapes (4-bit/g32); anything
-        # else runs the stock chain.
+        # dispatches. Requires 4-bit affine at a shipped forge group size
+        # (32 or 64 — the 2026-08-27 01:35 reforge moved the pack to g64);
+        # anything else runs the stock chain.
         sw = self.switch_mlp
         if (
             x.shape[-2] == 1
@@ -425,7 +426,9 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
             and _fused_moe_decode_enabled()
             and isinstance(sw, _FusedGateUpSwitchGLU)
             and sw.bits == 4
-            and sw.group_size == 32
+            and sw.group_size in (32, 64)
+            and getattr(sw.down_proj, "bits", None) == 4
+            and getattr(sw.down_proj, "group_size", None) in (32, 64)
         ):
             from mtplx.kernels.moe_glu_decode import moe_glu_decode
 
@@ -448,6 +451,8 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
                 dn.biases,
                 idx.reshape(-1).astype(mx.uint32),
                 w.reshape(-1).astype(mx.float32),
+                gu_group_size=int(sw.group_size),
+                dn_group_size=int(dn.group_size),
             ).reshape(x.shape)
             shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
             return (y + shared).astype(x.dtype)
