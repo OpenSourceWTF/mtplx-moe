@@ -988,14 +988,28 @@ class Model(nn.Module):
                     stacked.setdefault(dest, {})[int(idx_s)] = v
                     continue
                 if ".mlp.experts.gate_up_proj" in k or ".mlp.experts.down_proj" in k:
-                    # packed bf16-repo layout: [E, in, out] -> switch weights
+                    # Two packed layouts exist. transformers save_pretrained
+                    # writes the runtime bmm orientation (gate_up [E, hidden,
+                    # 2*inter], down [E, inter, hidden]); the hub bf16 repo
+                    # ships Linear [out, in] halves (gate_up [E, 2*inter,
+                    # hidden], down [E, hidden, inter]). Keyed on which axis
+                    # equals hidden; square (test-config) tensors resolve to
+                    # the transformers branch, which parity validated.
                     prefix = k.split(".mlp.experts.", 1)[0]
+                    hid = self.language_model.args.hidden_size
                     if k.endswith("gate_up_proj"):
-                        gate, up = mx.split(v, 2, axis=-1)
-                        out[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate.swapaxes(1, 2)
-                        out[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up.swapaxes(1, 2)
+                        if v.shape[1] == hid:
+                            gate, up = mx.split(v, 2, axis=-1)
+                            gate = gate.swapaxes(1, 2)
+                            up = up.swapaxes(1, 2)
+                        else:
+                            gate, up = mx.split(v, 2, axis=1)
+                        out[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
+                        out[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
                     else:
-                        out[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = v.swapaxes(1, 2)
+                        if v.shape[2] == hid:
+                            v = v.swapaxes(1, 2)
+                        out[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = v
                     continue
                 if k.endswith("ple.conv1d.weight"):
                     out[k.replace("ple.conv1d.weight", "ple.conv_weight")] = v.moveaxis(2, 1)

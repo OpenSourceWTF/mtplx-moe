@@ -398,6 +398,56 @@ def main():
         if (gi + 1) % 24 == 0:
             print(f"[experts] {gi + 1}/{len(groups)} ({time.time() - t0:.0f}s)", flush=True)
 
+    # ---- 2b. packed experts (bf16 hub repo) -> stacked switch_mlp -----------
+    # The hub bf16 repo ships one 3D tensor per group: gate_up_proj
+    # [E, 2*inter, hidden] (Linear [out, in] halves stacked on the out axis)
+    # and down_proj [E, hidden, inter]. transformers save_pretrained instead
+    # writes the runtime bmm orientation (gate_up [E, hidden, 2*inter], down
+    # [E, inter, hidden]); keyed on which axis equals hidden_size.
+    packed_re = re.compile(r"^(.*)\.mlp\.experts\.(gate_up_proj|down_proj)(?:\.weight)?$")
+    hid = None
+    cfg_path = src / "config.json"
+    if cfg_path.exists():
+        c = json.loads(cfg_path.read_text())
+        hid = c.get("text_config", c).get("hidden_size")
+    packed_names = sorted(n for n in names if packed_re.match(n) and n not in accounted)
+    if packed_names:
+        print(f"[experts-packed] {len(packed_names)} packed tensors", flush=True)
+    for gi, n in enumerate(packed_names):
+        m = packed_re.match(n)
+        prefix, kind = m.group(1), m.group(2)
+        v = reader.bf16(n)
+        accounted[n] = "experts"
+        is_mtp = prefix.startswith("mtp.")
+        dest_prefix = prefix if is_mtp else rename_trunk(prefix + ".x")[: -len(".x")]
+        recipe = {
+            "bits": MTP_EXPERT_BITS if is_mtp else BASE_BITS,
+            "group_size": MTP_EXPERT_GROUP if is_mtp else BASE_GROUP,
+            "mode": "affine",
+        }
+        sink = (lambda k, w: mtp_out.__setitem__(k, w)) if is_mtp else writer.add
+        if kind == "gate_up_proj":
+            if hid is not None and v.shape[1] == hid:
+                gate, up = mx.split(v, 2, axis=-1)
+                gate = gate.swapaxes(1, 2)
+                up = up.swapaxes(1, 2)
+            else:
+                gate, up = mx.split(v, 2, axis=1)
+            halves = (("gate_proj", gate), ("up_proj", up))
+        else:
+            if hid is not None and v.shape[2] == hid:
+                v = v.swapaxes(1, 2)
+            halves = (("down_proj", v),)
+        for proj, w in halves:
+            dest = f"{dest_prefix}.mlp.switch_mlp.{proj}.weight"
+            quantize_into(dest, w, sink, recipe)
+            if not is_mtp:
+                quant_config[dest.rsplit(".weight", 1)[0]] = recipe
+        del v, halves
+        mx.clear_cache()
+        if (gi + 1) % 24 == 0:
+            print(f"[experts-packed] {gi + 1}/{len(packed_names)} ({time.time() - t0:.0f}s)", flush=True)
+
     # ---- 3. everything else -------------------------------------------------
     for n in names:
         if n in accounted:
