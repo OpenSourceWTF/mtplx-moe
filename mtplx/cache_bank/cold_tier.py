@@ -562,6 +562,45 @@ class SessionBankColdTier:
                 return False
         return True
 
+    def _warn_spill_size_capped(
+        self, entry: Any, estimated: int, effective_cap: int
+    ) -> None:
+        """One console line per session when a spill is refused for size.
+
+        skipped_size_cap was a silent in-memory counter — a session bigger
+        than min(cap, free_disk/4) lost durability with no trace, and the
+        user's next restart paid a full re-prefill with nothing to explain
+        it (the 2026-08-27 48G-sim finding: a 4 TB disk at 28 GiB free
+        capped the lane at ~7 GiB and every 100k+ session skipped mutely,
+        the exact #278 silence class in a new lane). Same dedup shape as
+        warn_oversized_snapshot_skip: first refusal per session speaks,
+        repeats stay counters.
+        """
+        session_id = getattr(entry, "session_id", None)
+        with self._stats_lock:
+            warned = getattr(self, "_size_cap_warned_sessions", None)
+            if warned is None:
+                warned = set()
+                self._size_cap_warned_sessions = warned
+            if session_id in warned:
+                return
+            warned.add(session_id)
+        try:
+            free_gib = shutil.disk_usage(self.base_dir).free / GIB
+        except Exception:
+            free_gib = -1.0
+        logger.warning(
+            "SessionBank SSD spill skipped for session %s: entry ~%.1f GiB "
+            "exceeds the effective cap %.1f GiB (min of configured cap and "
+            "free_disk/4; free disk %.1f GiB). The session stays warm in RAM "
+            "but will re-prefill after a restart. Free disk space to restore "
+            "durability for sessions this large.",
+            session_id or "<anon>",
+            estimated / GIB,
+            effective_cap / GIB,
+            free_gib,
+        )
+
     def spill_entry(
         self,
         entry: Any,
@@ -628,9 +667,11 @@ class SessionBankColdTier:
                 self._stats["effective_max_bytes"] = int(effective_cap)
             if estimated > effective_cap:
                 self._inc("skipped_size_cap")
+                self._warn_spill_size_capped(entry, estimated, effective_cap)
                 return False
             if not self._evict_until_room(estimated, cap_bytes=effective_cap):
                 self._inc("skipped_size_cap")
+                self._warn_spill_size_capped(entry, estimated, effective_cap)
                 return False
         should_abort: Callable[[], bool] | None = None
         if self._encode_yield_enabled and self.foreground_busy is not None:

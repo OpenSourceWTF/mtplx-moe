@@ -56,7 +56,12 @@ All notable user-facing changes to MTPLX. The format is based on
   through a tensor-by-tensor streaming writer (bounded memory, same
   on-disk format), instead of silently losing durability. Live-ref-only
   sessions reach the SSD tier for the first time; every remaining skip is
-  recorded, never silent.
+  recorded, never silent — including the disk-headroom size cap
+  (`min(configured cap, free_disk/4)`), which now prints one console line
+  per session naming the entry size, the effective cap, and free disk
+  when it refuses a spill (found live on a 4 TB disk at 28 GiB free,
+  which caps the lane at ~7 GiB and mutely excluded every 100k+-token
+  session — the same silence class as #278, in a brand-new lane).
 
 ### Fixed
 

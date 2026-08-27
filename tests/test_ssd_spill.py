@@ -254,3 +254,32 @@ def test_interrupted_live_ref_spill_redispatches(tmp_path):
         assert cold.stats()["spill_writes_completed"] == 1
     finally:
         cold.close()
+
+
+def test_size_capped_spill_warns_once_per_session(tmp_path, caplog):
+    """A spill refused for size must say so — once — instead of dying as a
+    silent counter (2026-08-27 48G-sim finding: a near-full disk capped the
+    lane at free/4 and every 100k+ session skipped with zero trace; the
+    operator-visible symptom was an unexplained full re-prefill after
+    restart, #278's silence class in a new lane)."""
+    import logging
+
+    cold = make_cold(tmp_path, max_bytes=1)  # effective cap ~1 byte
+    try:
+        bank = SessionBank()
+        entry = put_small_entry(bank)
+        assert entry is not None
+        with caplog.at_level(logging.WARNING, logger="mtplx.cache_bank.cold_tier"):
+            assert not cold.spill_entry(entry, capabilities=["ar_insert"])
+            assert not cold.spill_entry(entry, capabilities=["ar_insert"])
+        assert cold.stats()["skipped_size_cap"] == 2
+        warnings = [
+            record
+            for record in caplog.records
+            if "spill skipped" in record.getMessage()
+        ]
+        assert len(warnings) == 1, "one line per session, repeats stay counters"
+        message = warnings[0].getMessage()
+        assert "effective cap" in message and "re-prefill" in message
+    finally:
+        cold.close()
