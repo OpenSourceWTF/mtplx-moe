@@ -165,3 +165,21 @@ def test_headline_forwards_requested_warmup_runs() -> None:
     assert args.warmup_runs == 1
     warmup_index = command.index("--warmup-runs")
     assert command[warmup_index + 1] == "1"
+
+
+def test_receipt_includes_existing_generation_timing_breakdown() -> None:
+    harness = _harness()
+    stats = SimpleNamespace(
+        verify_target_distribution_time_s=1.25,
+        accept_time_s=2.5,
+        repair_time_s=3.75,
+        pre_first_token_setup_s=4.0,
+    )
+
+    receipt = harness._diagnostic_timing_receipt(stats)
+
+    assert receipt["verify_target_distribution_time_s"] == 1.25
+    assert receipt["accept_time_s"] == 2.5
+    assert receipt["repair_time_s"] == 3.75
+    assert receipt["pre_first_token_setup_s"] == 4.0
+    assert receipt["verify_joint_eval_time_s"] == 0.0

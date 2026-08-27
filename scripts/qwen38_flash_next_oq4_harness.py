@@ -60,12 +60,37 @@ _VANITY_SAMPLER = {
     "presence_penalty": 0.0,
     "repetition_penalty": 1.0,
 }
+_DIAGNOSTIC_TIMING_FIELDS = (
+    "verify_logits_eval_time_s",
+    "verify_hidden_eval_time_s",
+    "verify_joint_eval_time_s",
+    "verify_target_distribution_time_s",
+    "verify_eval_unattributed_time_s",
+    "target_forward_time_s",
+    "accept_time_s",
+    "rollback_time_s",
+    "repair_time_s",
+    "commit_time_s",
+    "pre_first_token_setup_s",
+    "first_primary_sample_time_s",
+    "prompt_target_prefill_time_s",
+    "prompt_mtp_history_time_s",
+)
 
 
 def _sampler_contract(*, headline: bool) -> dict[str, float | int]:
     """Return the exact benchmark sampler, including neutral identity knobs."""
 
     return dict(_VANITY_SAMPLER if headline else _PRODUCTION_SAMPLER)
+
+
+def _diagnostic_timing_receipt(stats: Any) -> dict[str, float]:
+    """Copy existing engine timers after generation; no hot-path probes."""
+
+    return {
+        field: float(getattr(stats, field, 0.0) or 0.0)
+        for field in _DIAGNOSTIC_TIMING_FIELDS
+    }
 
 
 def _resident_load_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -398,6 +423,7 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
             "capture_commit_time_s": float(
                 getattr(stats, "capture_commit_time_s", 0.0) or 0.0
             ),
+            **_diagnostic_timing_receipt(stats),
             "preflight": runtime.ngram_preflight_report,
             "ngram_cache": runtime.ngram_memory_report,
             "guard": {
