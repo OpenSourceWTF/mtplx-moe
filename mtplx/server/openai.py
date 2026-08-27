@@ -705,26 +705,32 @@ def _server_runtime_env_overrides(
     ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
     if generation_mode == "mtp" and _served_model_type_is_qwen4_exp(args):
-        # Flash-Next rejection rollback REQUIRES the recurrent-state snapshot
-        # until its native GDN capture backend lands: QSA KV trims, but the
-        # family's GDN/conv ArraysCache state cannot be trimmed or re-captured
-        # by the qwen3-next capture walker, so a rejected draft without
-        # before_verify is unrecoverable ("capture commit failed after
-        # MTPLX_SKIP_VERIFY_SNAPSHOT=1" fires for ANY strategy). The
-        # snapshot-optional strategy set is a cross-family assumption this
-        # architecture does not satisfy. Keyed on the served config's
+        # Flash-Next rejection rollback REQUIRES the recurrent-state
+        # snapshot: it is both the safety fallback and the pre-state source
+        # the family capture-commit replays from. (With the capture lane
+        # active the snapshot is the zero-copy lazy variant, so this is no
+        # longer a per-round clone.) Keyed on the served config's
         # model_type: the family rides the generic native_mtp descriptor, so
         # args.backend_id cannot identify it.
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
     if _served_model_type_is_qwen4_exp(args):
-        # Pipelined AR decode + compiled GDN runs (2026-08-27 receipts:
-        # 42.6 -> 51.9 t/s AR, GPU 57% -> 96.6% busy). The lane arms itself
-        # only when the n-gram table went resident (RAM-plan gated via
-        # MTPLX_NGRAM_RESIDENT=auto in the model loader); smaller machines
-        # keep the staged classic loop. An explicit operator export wins:
-        # profile-env application would otherwise overwrite it, so only
-        # default these when the launcher environment left them unset.
-        for key in ("MTPLX_AR_PIPELINE", "MTPLX_COMPILED_GDN"):
+        # Family speed lanes, defaulted only when the launcher environment
+        # left them unset (an explicit operator export wins):
+        # - Pipelined AR decode + compiled GDN runs (2026-08-27 receipts:
+        #   42.6 -> 51.9 t/s AR, GPU 57% -> 96.6% busy). Arms itself only
+        #   when the n-gram table went resident (RAM-plan gated via
+        #   MTPLX_NGRAM_RESIDENT=auto); smaller machines keep the staged
+        #   classic loop.
+        # - Layer-owned capture-commit (2026-08-27 receipts: verify round
+        #   51.7 -> 38.8 ms, repair re-forwards 8.2 -> 0 ms/round, MTP
+        #   recorder 75.25 -> 85.9 t/s record) — repair-free speculative
+        #   rollback; falls back to rollback+re-forward per round if a
+        #   capture is ever missing.
+        for key in (
+            "MTPLX_AR_PIPELINE",
+            "MTPLX_COMPILED_GDN",
+            "MTPLX_FAMILY_CAPTURE_COMMIT",
+        ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
     return overrides
