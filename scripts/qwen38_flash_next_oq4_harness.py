@@ -44,6 +44,28 @@ def is_palindrome(text: str) -> bool:
 _MAX_ATTESTATION_BYTES = 16 * 1024
 _GIB = 1024**3
 _SERVICE_HEALTH_URL = "http://127.0.0.1:8080/health"
+_PRODUCTION_SAMPLER = {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+}
+_VANITY_SAMPLER = {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+}
+
+
+def _sampler_contract(*, headline: bool) -> dict[str, float | int]:
+    """Return the exact benchmark sampler, including neutral identity knobs."""
+
+    return dict(_VANITY_SAMPLER if headline else _PRODUCTION_SAMPLER)
 
 
 def _resident_load_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -284,10 +306,13 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
                 target_tokens=args.prompt_tokens,
                 reasoning_effort=args.reasoning_effort,
             )
-        sampler = (
-            SamplerConfig(0.0, 1.0, 0)
-            if args.headline
-            else SamplerConfig(1.0, 0.95, 20)
+        sampler_contract = _sampler_contract(headline=args.headline)
+        sampler = SamplerConfig(
+            temperature=float(sampler_contract["temperature"]),
+            top_p=float(sampler_contract["top_p"]),
+            top_k=int(sampler_contract["top_k"]),
+            presence_penalty=float(sampler_contract["presence_penalty"]),
+            frequency_penalty=0.0,
         )
         stop_token_ids = None if args.headline else set()
         def generate_once():
@@ -326,6 +351,11 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
                 f"generation count {generated}/{len(output.tokens)} is outside "
                 f"the 1..{args.max_tokens} contract"
             )
+        if not args.smoke and not args.headline and generated != args.max_tokens:
+            raise RuntimeError(
+                f"benchmark generated {generated} tokens, expected exactly "
+                f"{args.max_tokens}"
+            )
         receipt = {
             "schema": "mtplx-qwen38-resident-oq4-harness-v1",
             "status": "passed",
@@ -334,6 +364,9 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
             "verify_strategy": args.verify_strategy,
             "verify_core": args.verify_core,
             "warmup_runs": args.warmup_runs,
+            "workload": "vanity-palindrome" if args.headline else "production-python",
+            "thinking_mode": not args.headline,
+            "sampler": sampler_contract,
             "source_revision": _source_revision(model),
             "prompt_tokens": len(prompt_ids),
             "prompt_token_sha256": _token_sha256(prompt_ids),

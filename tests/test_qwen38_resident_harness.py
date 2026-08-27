@@ -46,6 +46,30 @@ def test_harness_defaults_to_smallest_viable_resident_target() -> None:
     assert args.profile == "sustained"
 
 
+def test_production_workload_is_16k_1k_thinking_sampler_contract() -> None:
+    harness = _harness()
+
+    args = harness._parse_args([])
+
+    assert (args.prompt_tokens, args.max_tokens) == (16_384, 1_024)
+    assert harness._sampler_contract(headline=False) == {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    }
+    assert harness._sampler_contract(headline=True) == {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    }
+
+
 def test_guarded_child_waits_for_stopped_service_memory_to_become_reclaimable() -> None:
     harness = _harness()
     readings = iter((79 * 1024**3, 81 * 1024**3, 82 * 1024**3))
