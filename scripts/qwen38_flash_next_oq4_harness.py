@@ -29,6 +29,7 @@ DEFAULT_GUARD = WORKSPACE_ROOT / "bench/laguna/run_guarded.py"
 DEFAULT_PLIST = Path.home() / "Library/LaunchAgents/com.tea.qwen.plist"
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
 _CONTENT_SENTINEL = "MTPLX_QWEN38_RESIDENT_OQ4_CONTENT_17E3A1"
+_SMOKE_INSTRUCTION = "Write a Python function that adds two integers."
 _MAX_ATTESTATION_BYTES = 16 * 1024
 _GIB = 1024**3
 
@@ -151,6 +152,10 @@ def _prompt_instruction(path: Path) -> str:
     return str(rows[0]["prompt"])
 
 
+def _run_instruction(path: Path, *, smoke: bool) -> str:
+    return _SMOKE_INSTRUCTION if smoke else _prompt_instruction(path)
+
+
 def _source_revision(model: Path) -> str:
     manifest = json.loads((model / "ngram-manifest.json").read_text(encoding="utf-8"))
     revision = manifest.get("source_revision")
@@ -207,7 +212,7 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
         _prompt, prompt_ids = build_exact_python_prompt(
             runtime.tokenizer,
             context=args.context_file.read_text(encoding="utf-8"),
-            instruction=_prompt_instruction(args.prompt_file),
+            instruction=_run_instruction(args.prompt_file, smoke=args.smoke),
             target_tokens=args.prompt_tokens,
             reasoning_effort=args.reasoning_effort,
         )

@@ -41,3 +41,16 @@ def test_harness_defaults_to_smallest_viable_resident_target() -> None:
     args = harness._parse_args(["--smoke", "--preflight-only"])
 
     assert args.runtime_target_gib == 82
+
+
+def test_smoke_uses_short_instruction_without_changing_exact_fixture(tmp_path) -> None:
+    harness = _harness()
+    prompt_file = tmp_path / "prompt.jsonl"
+    prompt_file.write_text('{"prompt":"an intentionally long exact workload"}\n')
+
+    assert harness._run_instruction(prompt_file, smoke=True) == (
+        "Write a Python function that adds two integers."
+    )
+    assert harness._run_instruction(prompt_file, smoke=False) == (
+        "an intentionally long exact workload"
+    )
