@@ -4795,6 +4795,7 @@ def _tune_candidate_command(
 ) -> list[str]:
     command = [
         sys.executable,
+        "-P",  # never let the caller's cwd shadow the environment's mtplx
         "-m",
         "mtplx.cli",
         "tune",
@@ -8194,6 +8195,7 @@ def cmd_thermal_public(args: Any) -> int:
     run_id = args.run_id or f"cli-fanmax-{time.strftime('%Y%m%d-%H%M%S')}"
     child = [
         sys.executable,
+        "-P",  # never let the caller's cwd shadow the environment's mtplx
         "-m",
         "mtplx.cli",
         "bench",
@@ -9371,6 +9373,13 @@ def cmd_serve_public(args: Any) -> int:
         _print_serve_handoff(args, runtime_model, profile.name)
     cmd = [
         sys.executable,
+        # -P (safe path, 3.11+): -m alone puts the CWD on sys.path, so
+        # serving from any directory containing an mtplx/ package silently
+        # swapped the daemon's runtime to that directory's code — measured
+        # live 2026-08-27 when an A/B battery's "shipped 2.9.2" arm imported
+        # the checkout instead of its own venv. The daemon must run the code
+        # of the environment that launched it, never the caller's cwd.
+        "-P",
         "-m",
         "mtplx.server.openai",
         "--model",
