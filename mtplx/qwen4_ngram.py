@@ -67,7 +67,7 @@ _MAX_SIGNED_INT64 = (1 << 63) - 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _STORAGES = frozenset(("bf16", "affine-q4-g32"))
 _GIB = 1024**3
-PRODUCTION_RUNTIME_TARGET_BYTES = 75 * _GIB
+PRODUCTION_RUNTIME_TARGET_BYTES = 82 * _GIB
 PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES = 10 * _GIB
 
 
@@ -1952,7 +1952,7 @@ class NGramRuntimeBudget:
         ):
             raise ValueError("allocation_alignment_bytes must be a positive power of two")
         if not 0 < self.target_residency_bytes <= PRODUCTION_RUNTIME_TARGET_BYTES:
-            raise ValueError("target_residency_bytes exceeds the pinned 75 GiB target")
+            raise ValueError("target_residency_bytes exceeds the pinned 82 GiB target")
         if not 0 < self.payload_ceiling_bytes <= (
             PRODUCTION_NGRAM_PAYLOAD_CEILING_BYTES
         ):

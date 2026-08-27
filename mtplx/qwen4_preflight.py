@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import struct
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,13 @@ _METAL_WORKING_RESERVE_BYTES = 2 * _GIB
 _SAFETY_MARGIN_BYTES = 2 * _GIB
 _TRANSIENT_BYTES = 16 * 2048 * 100
 _ALIGNMENT_BYTES = 16 * 1024
+_MAX_SIGNED_64 = (1 << 63) - 1
+_VM_STAT_PAGE_SIZE = re.compile(r"\(page size of ([0-9]+) bytes\)")
+_VM_STAT_AVAILABLE_FIELDS = (
+    "Pages free",
+    "Pages inactive",
+    "Pages speculative",
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +56,70 @@ class Qwen4ResidentPreflight:
     safety_margin_bytes: int
     projected_residency_bytes: int
     target_residency_bytes: int
+
+
+def parse_darwin_available_memory_bytes(output: str) -> int:
+    """Parse a conservative, non-double-counted availability value."""
+
+    if type(output) is not str:
+        raise TypeError("vm_stat output must be a string")
+    lines = output.splitlines()
+    if not lines:
+        raise ValueError("vm_stat output is empty")
+    page_match = _VM_STAT_PAGE_SIZE.search(lines[0])
+    if page_match is None:
+        raise ValueError("vm_stat output has no page size")
+    page_size = int(page_match.group(1))
+    if page_size <= 0:
+        raise ValueError("vm_stat page size must be positive")
+
+    pages: dict[str, int] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        name, raw_value = line.split(":", 1)
+        name = name.strip().strip('"')
+        if name not in _VM_STAT_AVAILABLE_FIELDS:
+            continue
+        raw_value = raw_value.strip()
+        if raw_value.endswith("."):
+            raw_value = raw_value[:-1]
+        if not raw_value.isdecimal():
+            raise ValueError(f"vm_stat field {name!r} is not an exact count")
+        pages[name] = int(raw_value)
+
+    missing = [name for name in _VM_STAT_AVAILABLE_FIELDS if name not in pages]
+    if missing:
+        raise ValueError(f"vm_stat output is missing fields: {', '.join(missing)}")
+    page_count = sum(pages.values())
+    if page_count <= 0 or page_count > _MAX_SIGNED_64 // page_size:
+        raise ValueError("vm_stat available-memory arithmetic overflow")
+    return page_count * page_size
+
+
+def read_darwin_available_memory_bytes() -> int:
+    """Read macOS reclaimable memory once at the construction boundary."""
+
+    if sys.platform != "darwin":
+        raise RuntimeError("Qwen4 resident memory preflight requires macOS")
+    try:
+        result = subprocess.run(
+            ["/usr/bin/vm_stat"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("could not read macOS memory availability") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"vm_stat failed while reading memory availability: {result.returncode}"
+        )
+    try:
+        return parse_darwin_available_memory_bytes(result.stdout)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("could not validate macOS memory availability") from exc
 
 
 def validate_qwen4_oq4_contract(
@@ -206,6 +280,8 @@ __all__ = [
     "Qwen4ResidentPreflight",
     "Qwen4WeightInventory",
     "plan_qwen4_resident_preflight",
+    "parse_darwin_available_memory_bytes",
+    "read_darwin_available_memory_bytes",
     "scan_qwen4_weight_bytes",
     "validate_qwen4_oq4_contract",
 ]

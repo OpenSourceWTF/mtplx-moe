@@ -96,3 +96,35 @@ def test_preflight_rejects_non_oq4_artifact_contract() -> None:
             {"model_type": "qwen4_exp", "quantization": {"bits": 8}},
             _manifest(),
         )
+
+
+def test_darwin_available_memory_parser_counts_reclaimable_pages_once() -> None:
+    from mtplx.qwen4_preflight import parse_darwin_available_memory_bytes
+
+    output = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               10.
+Pages active:                             40.
+Pages inactive:                           20.
+Pages speculative:                         3.
+Pages purgeable:                            7.
+"""
+
+    # Purgeable pages are not added: vm_stat may report them as a subset of
+    # another category, and the safety gate must never double-count memory.
+    assert parse_darwin_available_memory_bytes(output) == 33 * 16_384
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n",
+        "Pages free: 1.\nPages inactive: 2.\nPages speculative: 3.\n",
+        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+        "Pages free: -1.\nPages inactive: 2.\nPages speculative: 3.\n",
+    ],
+)
+def test_darwin_available_memory_parser_rejects_untrusted_output(output) -> None:
+    from mtplx.qwen4_preflight import parse_darwin_available_memory_bytes
+
+    with pytest.raises(ValueError, match="vm_stat"):
+        parse_darwin_available_memory_bytes(output)

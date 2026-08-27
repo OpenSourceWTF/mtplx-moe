@@ -322,7 +322,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reasoning-effort", choices=("low", "xhigh"), default="low")
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--ngram-cache-gib", type=int, default=10)
-    parser.add_argument("--runtime-target-gib", type=int, default=75)
+    parser.add_argument("--runtime-target-gib", type=int, default=82)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -344,8 +344,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("depth must be in [1, 8]")
     if not 1 <= args.ngram_cache_gib <= 10:
         raise ValueError("ngram cache payload must be in [1, 10] GiB")
-    if not 1 <= args.runtime_target_gib <= 75:
-        raise ValueError("runtime target must be in [1, 75] GiB")
+    if not 1 <= args.runtime_target_gib <= 82:
+        raise ValueError("runtime target must be in [1, 82] GiB")
     return args
 
 

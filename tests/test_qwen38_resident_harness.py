@@ -33,3 +33,11 @@ def test_harness_loads_resident_model_and_only_configures_ngram_cache() -> None:
         "ngram_target_residency_bytes": 75 * 1024**3,
     }
     assert not any("expert" in key for key in kwargs)
+
+
+def test_harness_defaults_to_smallest_viable_resident_target() -> None:
+    harness = _harness()
+
+    args = harness._parse_args(["--smoke", "--preflight-only"])
+
+    assert args.runtime_target_gib == 82

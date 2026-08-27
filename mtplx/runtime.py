@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 _GIB = 1024**3
 _DEFAULT_NGRAM_CACHE_LIMIT_BYTES = 10 * _GIB
 _DEFAULT_QWEN4_CONTEXT_TOKENS = 17_408
-_QWEN4_RUNTIME_TARGET_BYTES = 75 * _GIB
+_QWEN4_RUNTIME_TARGET_BYTES = 82 * _GIB
 
 if TYPE_CHECKING:
     from .a3b_compiled_target_prefix import A3BCompiledTargetPrefixFactory
@@ -94,6 +94,7 @@ def _preflight_qwen4_resident(
     from .qwen4_ngram import load_ngram_manifest
     from .qwen4_preflight import (
         plan_qwen4_resident_preflight,
+        read_darwin_available_memory_bytes,
         scan_qwen4_weight_bytes,
         validate_qwen4_oq4_contract,
     )
@@ -101,13 +102,7 @@ def _preflight_qwen4_resident(
     manifest = load_ngram_manifest(model_path / "ngram-manifest.json")
     validate_qwen4_oq4_contract(config, manifest)
     inventory = scan_qwen4_weight_bytes(model_path)
-    available = None
-    try:
-        import psutil
-
-        available = int(psutil.virtual_memory().available)
-    except Exception:
-        pass
+    available = read_darwin_available_memory_bytes()
     plan = plan_qwen4_resident_preflight(
         resident_weight_bytes=inventory.resident_bytes,
         manifest=manifest,
