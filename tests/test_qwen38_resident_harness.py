@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 
@@ -16,6 +17,7 @@ def _harness():
 
 def test_harness_loads_resident_model_and_only_configures_ngram_cache() -> None:
     harness = _harness()
+    assert sys.path[0] == str(harness.ROOT)
     args = SimpleNamespace(
         mode="mtp",
         prompt_tokens=32,

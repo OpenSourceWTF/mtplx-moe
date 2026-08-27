@@ -21,6 +21,10 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = ROOT.parents[1]
+_ROOT_IMPORT = str(ROOT)
+if _ROOT_IMPORT in sys.path:
+    sys.path.remove(_ROOT_IMPORT)
+sys.path.insert(0, _ROOT_IMPORT)
 DEFAULT_MODEL = (
     Path.home() / ".mtplx/models/Vontra--Qwen3.8-Flash-Next-MLX-oQ4-MTP"
 )
