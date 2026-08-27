@@ -2114,12 +2114,39 @@ class ServerState:
         self.rate_limiter = _RateLimiter(args.rate_limit)
         startup_backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
         minimum_resident_bytes = None
+        resident_floor_label = "The model"
         if startup_backend.backend_id == "laguna_ar":
             from mtplx.models.laguna_config import (
                 LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
             )
 
             minimum_resident_bytes = LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+            resident_floor_label = "Laguna-S-2.1"
+        elif _served_model_type_is_qwen4_exp(args):
+            # The default wired cap (60% of RAM) sits BELOW this family's
+            # working set once the n-gram table goes RAM-resident: on a 128G
+            # M5 Max the cap landed at ~82G against a ~99G resident set and
+            # Metal's forced eviction collapsed serve decode to 8.5 tok/s
+            # (2026-08-27 battery receipt). Floor = pack weight files
+            # (+ the table when the resident policy arms) + working margin.
+            try:
+                from mtplx.models.qwen4_exp import _ngram_resident_policy
+
+                model_dir = Path(str(getattr(args, "model", "") or ""))
+                floor = 0
+                for f in model_dir.glob("model*.safetensors"):
+                    floor += f.stat().st_size
+                mtp_f = model_dir / "mtp.safetensors"
+                if mtp_f.exists():
+                    floor += mtp_f.stat().st_size
+                table_f = model_dir / "ngram-table.safetensors"
+                if table_f.exists() and _ngram_resident_policy():
+                    floor += table_f.stat().st_size
+                if floor:
+                    minimum_resident_bytes = floor + 6 * 1024**3
+                    resident_floor_label = "Qwen3.8-Flash-Next"
+            except OSError:
+                minimum_resident_bytes = None
         self.metal_memory_caps = _apply_metal_memory_caps(
             minimum_resident_bytes=minimum_resident_bytes,
         )
@@ -2131,7 +2158,7 @@ class ServerState:
                 int(self.metal_memory_caps.get("minimum_resident_bytes") or 0) / 1024**3
             )
             raise RuntimeError(
-                "Laguna-S-2.1 cannot load inside the available Metal memory "
+                f"{resident_floor_label} cannot load inside the available Metal memory "
                 f"budget; at least {required_gib:.1f} GiB resident plus "
                 "16 GiB system headroom is required"
             )
