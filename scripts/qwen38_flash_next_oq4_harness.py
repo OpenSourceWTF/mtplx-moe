@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import MutableMapping
+import fcntl
 import hashlib
 import json
 import os
@@ -12,8 +13,10 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
+import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +35,7 @@ _CONTENT_SENTINEL = "MTPLX_QWEN38_RESIDENT_OQ4_CONTENT_17E3A1"
 _SMOKE_INSTRUCTION = "Write a Python function that adds two integers."
 _MAX_ATTESTATION_BYTES = 16 * 1024
 _GIB = 1024**3
+_SERVICE_HEALTH_URL = "http://127.0.0.1:8080/health"
 
 
 def _resident_load_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -196,6 +200,9 @@ def _static_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 def _run_guarded_child(args: argparse.Namespace) -> int:
     guard = _consume_guard_attestation(os.environ, expected_lock=args.lock)
+    if args.inner_started_marker is not None:
+        with args.inner_started_marker.open("x", encoding="utf-8") as handle:
+            handle.write(f"{os.getpid()}\n")
     model = args.model.expanduser().resolve(strict=True)
     if not args.prompt_file.is_file() or not args.context_file.is_file():
         raise RuntimeError("Python workload fixture or context file is missing")
@@ -322,7 +329,62 @@ def _outer_command(args: argparse.Namespace) -> list[str]:
         forwarded.append("--smoke")
     if args.output:
         forwarded.extend(("--output", str(args.output)))
+    if args.inner_started_marker is not None:
+        forwarded.extend(("--inner-started-marker", str(args.inner_started_marker)))
     return [sys.executable, *forwarded]
+
+
+def _canonical_lock_owned(path: Path) -> bool:
+    try:
+        with path.open("r+b") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def _wait_for_service_return(timeout_seconds: int) -> None:
+    deadline = time.monotonic() + int(timeout_seconds)
+    while True:
+        try:
+            with urllib.request.urlopen(_SERVICE_HEALTH_URL, timeout=3) as response:
+                if response.status == 200:
+                    return
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError("timed out waiting for canonical Qwen guard restore")
+        time.sleep(1.0)
+
+
+def _call_guard_with_race_retry(
+    args: argparse.Namespace,
+    *,
+    call: Any = subprocess.call,
+    lock_owned: Any = _canonical_lock_owned,
+    wait_for_service: Any = _wait_for_service_return,
+) -> int:
+    with tempfile.TemporaryDirectory(prefix="mtplx-qwen4-guard-") as directory:
+        for attempt in range(args.guard_race_retries + 1):
+            marker = Path(directory) / f"inner-started-{attempt}"
+            args.inner_started_marker = marker
+            result = int(call(_outer_command(args), cwd=ROOT))
+            if result == 0 or marker.exists():
+                return result
+            if attempt >= args.guard_race_retries or not lock_owned(args.lock):
+                return result
+            print(
+                "[qwen4-harness] canonical pre-lock health race; waiting for "
+                f"owner restore before retry {attempt + 1}/{args.guard_race_retries}",
+                file=sys.stderr,
+                flush=True,
+            )
+            wait_for_service(args.lock_timeout_seconds)
+    raise RuntimeError("canonical guard retry loop exited unexpectedly")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -346,7 +408,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     parser.add_argument("--lock-timeout-seconds", type=int, default=21_600)
     parser.add_argument("--child-timeout-seconds", type=int, default=7_200)
+    parser.add_argument("--guard-race-retries", type=int, default=16)
     parser.add_argument("--inner-guarded", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--inner-started-marker", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.smoke:
         if (args.prompt_tokens, args.max_tokens) == (16_384, 1_024):
@@ -361,6 +425,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("ngram cache payload must be in [1, 10] GiB")
     if not 1 <= args.runtime_target_gib <= 82:
         raise ValueError("runtime target must be in [1, 82] GiB")
+    if not 0 <= args.guard_race_retries <= 64:
+        raise ValueError("guard race retries must be in [0, 64]")
     return args
 
 
@@ -375,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(f"canonical guard wrapper is missing: {args.guard}")
     if not args.plist.is_file():
         raise RuntimeError(f"Qwen launchd plist is missing: {args.plist}")
-    return subprocess.call(_outer_command(args), cwd=ROOT)
+    return _call_guard_with_race_retry(args)
 
 
 if __name__ == "__main__":

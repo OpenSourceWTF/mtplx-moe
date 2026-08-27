@@ -88,3 +88,25 @@ def test_exact_prompt_keeps_constructed_ids_when_decode_is_not_canonical() -> No
     assert prompt == "decoded noncanonical prompt"
     assert len(tokens) == 16
     assert prompt not in tokenizer.encoded
+
+
+def test_outer_harness_retries_only_pre_child_canonical_lock_race() -> None:
+    harness = _harness()
+    args = harness._parse_args(["--smoke"])
+    calls = []
+    waits = []
+
+    def call(command, *, cwd):
+        calls.append((command, cwd))
+        return 1 if len(calls) == 1 else 0
+
+    result = harness._call_guard_with_race_retry(
+        args,
+        call=call,
+        lock_owned=lambda _path: True,
+        wait_for_service=lambda _timeout: waits.append(_timeout),
+    )
+
+    assert result == 0
+    assert len(calls) == 2
+    assert waits == [args.lock_timeout_seconds]
