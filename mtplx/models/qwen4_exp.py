@@ -106,6 +106,9 @@ class TextArgs(BaseModelArgs):
     make_ngram_vocab_size_divisible_by: int = 128
     seed: int = 1234
     eos_token_id: Union[int, List[int], None] = None
+    # True in MTPLX packs: the table ships as model-ngram.safetensors and is
+    # gathered lazily from SSD — no weight parameter is ever constructed.
+    ngram_sidecar: bool = False
 
     # Rope
     rope_parameters: Optional[Dict[str, Any]] = None
@@ -598,11 +601,13 @@ class NGramTable(nn.Module):
       registered, so the table never counts as loadable weight.
     """
 
-    def __init__(self, rows: int, dim: int):
+    def __init__(self, rows: int, dim: int, sidecar: bool = False):
         super().__init__()
         self.rows = rows
         self.dim = dim
-        self.weight = mx.zeros((max(rows, 1), dim))
+        self._sidecar_mode = sidecar
+        if not sidecar:
+            self.weight = mx.zeros((max(rows, 1), dim))
         self._sidecar = None
 
     def attach_sidecar(self, path: Path):
@@ -623,6 +628,11 @@ class NGramTable(nn.Module):
     def __call__(self, ids: mx.array) -> mx.array:
         if self._sidecar is not None:
             return self._sidecar(ids, self.dim)
+        if self._sidecar_mode:
+            raise RuntimeError(
+                "qwen4_exp n-gram table sidecar was never attached — "
+                "model-ngram.safetensors is missing from the model directory"
+            )
         return self.weight[ids]
 
 
@@ -689,7 +699,9 @@ class NGramEmbedding(nn.Module):
         )
         self.ngram_heads_vocab_sizes = mx.array(sizes, dtype=mx.int64)
         self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
-        self.ngram_embedding = NGramTable(padded, head_dim)
+        self.ngram_embedding = NGramTable(
+            padded, head_dim, sidecar=getattr(args, "ngram_sidecar", False)
+        )
 
     def _shift_ignore_eos(self, ids: mx.array, shift: int) -> mx.array:
         if shift == 0:
