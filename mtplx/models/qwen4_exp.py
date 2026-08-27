@@ -335,6 +335,110 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
     pass
 
 
+class _FusedGateUpSwitchGLU(nn.Module):
+    """SwitchGLU with gate_proj and up_proj concatenated into ONE
+    gather_qmm (N=2*moe_intermediate) for the small-M decode/verify regime.
+
+    Rationale (2026-08-26 attribution campaign): at qL=1 the MoE runs three
+    gather_qmm dispatches per layer at N=640 — grids too small to fill the
+    M5's 40 cores. Concatenating gate+up along the output-rows axis halves
+    the large dispatches and doubles rows in flight. Per-row dot products
+    are unchanged, so results match the split path up to within-row
+    accumulation order. Large-M (prefill) calls fall through to the original
+    SwitchGLU, keeping its expert-sorted access pattern."""
+
+    def __init__(self, sw):
+        super().__init__()
+        g, u = sw.gate_proj, sw.up_proj
+        self.gu_weight = mx.concatenate([g.weight, u.weight], axis=1)
+        self.gu_scales = mx.concatenate([g.scales, u.scales], axis=1)
+        gb = g.get("biases") if hasattr(g, "get") else getattr(g, "biases", None)
+        ub = u.get("biases") if hasattr(u, "get") else getattr(u, "biases", None)
+        self.gu_biases = (
+            mx.concatenate([gb, ub], axis=1) if gb is not None else None
+        )
+        self.group_size = g.group_size
+        self.bits = g.bits
+        self.mode = getattr(g, "mode", "affine")
+        self.down_proj = sw.down_proj
+        self._orig = sw
+
+    def __call__(self, x, indices) -> mx.array:
+        if indices.size >= 64:
+            return self._orig(x, indices)
+        x = mx.expand_dims(x, (-2, -3))
+        gu = mx.gather_qmm(
+            x,
+            self.gu_weight,
+            self.gu_scales,
+            self.gu_biases,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        gate, up = mx.split(gu, 2, axis=-1)
+        x = self.down_proj(nn.silu(gate) * up, indices)
+        return x.squeeze(-2)
+
+
+class _FusedGateUpMLP(nn.Module):
+    """Shared-expert MLP with gate_proj+up_proj as one quantized matmul
+    (same fusion rationale as _FusedGateUpSwitchGLU; N=640 -> 1280)."""
+
+    def __init__(self, mlp):
+        super().__init__()
+        g, u = mlp.gate_proj, mlp.up_proj
+        self.gu_weight = mx.concatenate([g.weight, u.weight], axis=0)
+        self.gu_scales = mx.concatenate([g.scales, u.scales], axis=0)
+        gb = getattr(g, "biases", None)
+        self.gu_biases = (
+            mx.concatenate([gb, u.biases], axis=0) if gb is not None else None
+        )
+        self.group_size = g.group_size
+        self.bits = g.bits
+        self.mode = getattr(g, "mode", "affine")
+        self.down_proj = mlp.down_proj
+
+    def __call__(self, x) -> mx.array:
+        gu = mx.quantized_matmul(
+            x,
+            self.gu_weight,
+            self.gu_scales,
+            self.gu_biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        gate, up = mx.split(gu, 2, axis=-1)
+        return self.down_proj(nn.silu(gate) * up)
+
+
+def _fused_gate_up_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GATE_UP") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fuse_moe_gate_up(layers) -> int:
+    """Swap quantized MoE gate/up pairs for fused modules. Returns the
+    number of fused projections. Quantized packs only — bf16 (tiny/test)
+    checkpoints keep the stock path."""
+    fused = 0
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        sw = getattr(mlp, "switch_mlp", None)
+        if sw is not None and hasattr(sw.gate_proj, "scales"):
+            mlp.switch_mlp = _FusedGateUpSwitchGLU(sw)
+            fused += 1
+        shared = getattr(mlp, "shared_expert", None)
+        if shared is not None and hasattr(shared.gate_proj, "scales"):
+            mlp.shared_expert = _FusedGateUpMLP(shared)
+            fused += 1
+    return fused
+
+
 class QSACache:
     """Cache for one QSA layer: the attention KV plus the indexer's raw key
     stream and the incrementally maintained pooled (mean->norm->rope) block
@@ -1152,7 +1256,12 @@ class Qwen4ExpTextModel(nn.Module):
             ple.ple_embedding.stage(inputs, cache[self._ple_stage_idx], ple.NGRAM_IDX)
         h = mx.tile(h, (1, 1, self.args.hc_count))
         if (
-            h.shape[1] == 1
+            # S<=4 covers AR decode (S=1) and MTP verify widths (S=2..4,
+            # depth ceiling 3): mx.compile keys its trace cache on input
+            # shapes, so each S gets one retrace then C++ replay, and the
+            # GDN states are S-invariant so the same run fns serve all
+            # widths. Prefill and masked/padded forwards stay eager.
+            1 <= h.shape[1] <= 4
             and ssm_mask is None
             and (self._gdn_compiled_env or self._gdn_compiled_lane)
             and cache[self.ssm_idx] is not None
@@ -1522,7 +1631,12 @@ class Model(nn.Module):
         return lm._head_logits(lm.mtp(widened, tok_emb, cache))
 
     def post_weight_load(self, model_path) -> None:
-        """Attach the SSD-resident n-gram sidecar after weights load."""
+        """Attach the SSD-resident n-gram sidecar after weights load, and
+        apply load-time projection fusions."""
+        if _fused_gate_up_enabled():
+            n = _fuse_moe_gate_up(self.layers)
+            if n:
+                print(f"[qwen4_exp] fused gate+up projections: {n} modules")
         path = Path(model_path) / "ngram-table.safetensors"
         if not path.exists():
             return
