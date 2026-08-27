@@ -471,6 +471,12 @@ class Attention(nn.Module):
     """Gated GQA (qwen3_5 style: double-width q_proj, sigmoid output gate,
     per-head q/k RMSNorm, partial rotary) masked by the QSA indexer."""
 
+    # The QSA indexer mask is part of this module's semantics (and __call__
+    # takes (x, cache)): any generic dense-SDPA rewrite that replaces
+    # __call__ would silently drop the sparse selection. attention_split
+    # honors this and never hooks the class.
+    _mtplx_generic_sdpa_rewrites_unsupported = True
+
     def __init__(self, args: TextArgs):
         super().__init__()
         self.n_heads = args.num_attention_heads
