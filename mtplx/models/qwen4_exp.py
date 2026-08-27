@@ -21,7 +21,7 @@
 #     320M rows x 160) injected on one early linear-attention layer through a
 #     per-stream sigmoid gate and a dilated depthwise convolution. The table
 #     is deliberately NEVER materialized: it stays an SSD-resident sidecar
-#     (model-ngram.safetensors) gathered row-wise through numpy memmaps, so
+#     (ngram-table.safetensors) gathered row-wise through numpy memmaps, so
 #     the OS page cache is the hot-row cache.
 #   * mrope carried by the family config; for text-only serving with equal
 #     t/h/w positions the interleaved mrope is numerically identical to the
@@ -106,7 +106,7 @@ class TextArgs(BaseModelArgs):
     make_ngram_vocab_size_divisible_by: int = 128
     seed: int = 1234
     eos_token_id: Union[int, List[int], None] = None
-    # True in MTPLX packs: the table ships as model-ngram.safetensors and is
+    # True in MTPLX packs: the table ships as ngram-table.safetensors and is
     # gathered lazily from SSD — no weight parameter is ever constructed.
     ngram_sidecar: bool = False
 
@@ -596,7 +596,7 @@ class NGramTable(nn.Module):
     * materialized (tiny/test configs): a QuantizedEmbedding-shaped or plain
       `weight` parameter, gathered with mx.take.
     * sidecar (the real 51B table): `attach_sidecar()` points row gathers at
-      numpy memmaps over model-ngram.safetensors. Rows are dequantized after
+      numpy memmaps over ngram-table.safetensors. Rows are dequantized after
       the gather; only touched pages ever become resident. No parameter is
       registered, so the table never counts as loadable weight.
     """
@@ -613,11 +613,12 @@ class NGramTable(nn.Module):
     def attach_sidecar(self, path: Path):
         self.pop("weight", None)
         header, data_start = _read_safetensors_header(path)
+        meta = header.get("__metadata__", {})
         entries = {}
-        for name in ("weight", "scales", "biases"):
+        names = ("weight",) if int(meta.get("ngram_bits", 4)) == 0 else ("weight", "scales", "biases")
+        for name in names:
             info = header[f"ngram.{name}"]
             entries[name] = (info, data_start)
-        meta = header.get("__metadata__", {})
         self._sidecar = _SidecarGather(
             path,
             entries,
@@ -631,7 +632,7 @@ class NGramTable(nn.Module):
         if self._sidecar_mode:
             raise RuntimeError(
                 "qwen4_exp n-gram table sidecar was never attached — "
-                "model-ngram.safetensors is missing from the model directory"
+                "ngram-table.safetensors is missing from the model directory"
             )
         return self.weight[ids]
 
@@ -656,6 +657,11 @@ class _SidecarGather:
         import numpy as np
 
         flat = np.asarray(ids.reshape(-1), dtype=np.int64)
+        if self.bits == 0:  # raw bf16 rows, no dequantize
+            mm, dt = self._maps["weight"]
+            rows = mx.array(np.ascontiguousarray(mm[flat]))
+            rows = rows.view(mx.bfloat16 if dt == "BF16" else mx.float16)
+            return rows.reshape(*ids.shape, dim)
         parts = []
         for name in ("weight", "scales", "biases"):
             mm, dt = self._maps[name]
@@ -937,7 +943,7 @@ class Model(nn.Module):
 
     def post_weight_load(self, model_path) -> None:
         """Attach the SSD-resident n-gram sidecar after weights load."""
-        path = Path(model_path) / "model-ngram.safetensors"
+        path = Path(model_path) / "ngram-table.safetensors"
         if not path.exists():
             return
         for layer in self.layers:

@@ -10,7 +10,7 @@ Outputs (house layout, mirrors the 27B Optimized Speed pack):
   model.safetensors.index.json       trunk index (sidecars NOT registered)
   model-vision.safetensors           bf16 vision tower, source names (preserved)
   mtp.safetensors                    quantized MTP head (attach lands later)
-  model-ngram.safetensors            the 51B table, 4-bit/g32, ONE contiguous
+  ngram-table.safetensors            the 51B table, 4-bit/g32, ONE contiguous
                                      tensor streamed shard-by-shard; gathered
                                      lazily at runtime (SSD-resident)
   config.json                        model_type qwen4_exp + quantization dict
@@ -222,46 +222,57 @@ class NgramStreamWriter:
     """Streams the 4-bit table into one safetensors file with three contiguous
     tensors (weight/scales/biases), written shard-by-shard."""
 
-    def __init__(self, path: Path, rows: int, dim: int):
+    def __init__(self, path: Path, rows: int, dim: int, bits: int = NGRAM_BITS, group: int = NGRAM_GROUP):
         self.path = path
         self.rows = rows
         self.dim = dim
-        packed_cols = dim * NGRAM_BITS // 32
-        groups = dim // NGRAM_GROUP
+        self.bits = bits
         header = {
             "__metadata__": {
-                "ngram_bits": str(NGRAM_BITS),
-                "ngram_group_size": str(NGRAM_GROUP),
+                "ngram_bits": str(bits),
+                "ngram_group_size": str(group),
                 "rows": str(rows),
                 "dim": str(dim),
             },
-            "ngram.weight": {
+        }
+        if bits == 0:  # raw bf16 rows (dim not divisible by any mlx group size)
+            header["ngram.weight"] = {
+                "dtype": "BF16",
+                "shape": [rows, dim],
+                "data_offsets": [0, rows * dim * 2],
+            }
+            off = rows * dim * 2
+            row_bytes = {"ngram.weight": dim * 2}
+        else:
+            packed_cols = dim * bits // 32
+            groups = dim // group
+            header["ngram.weight"] = {
                 "dtype": "U32",
                 "shape": [rows, packed_cols],
                 "data_offsets": [0, rows * packed_cols * 4],
-            },
-        }
-        off = rows * packed_cols * 4
-        for name in ("ngram.scales", "ngram.biases"):
-            header[name] = {
-                "dtype": "BF16",
-                "shape": [rows, groups],
-                "data_offsets": [off, off + rows * groups * 2],
             }
-            off += rows * groups * 2
+            off = rows * packed_cols * 4
+            for name in ("ngram.scales", "ngram.biases"):
+                header[name] = {
+                    "dtype": "BF16",
+                    "shape": [rows, groups],
+                    "data_offsets": [off, off + rows * groups * 2],
+                }
+                off += rows * groups * 2
+            row_bytes = {
+                "ngram.weight": packed_cols * 4,
+                "ngram.scales": groups * 2,
+                "ngram.biases": groups * 2,
+            }
         blob = json.dumps(header).encode()
         pad = (-(len(blob)) % 8)
         blob += b" " * pad
         self._offsets = {
-            "ngram.weight": 8 + len(blob) + header["ngram.weight"]["data_offsets"][0],
-            "ngram.scales": 8 + len(blob) + header["ngram.scales"]["data_offsets"][0],
-            "ngram.biases": 8 + len(blob) + header["ngram.biases"]["data_offsets"][0],
+            name: 8 + len(blob) + header[name]["data_offsets"][0]
+            for name in header
+            if name != "__metadata__"
         }
-        self._row_bytes = {
-            "ngram.weight": packed_cols * 4,
-            "ngram.scales": groups * 2,
-            "ngram.biases": groups * 2,
-        }
+        self._row_bytes = row_bytes
         with open(path, "wb") as f:
             f.write(struct.pack("<Q", len(blob)))
             f.write(blob)
@@ -269,14 +280,19 @@ class NgramStreamWriter:
         self._fh = open(path, "r+b")
         self.rows_written = 0
 
-    def append_rows(self, w: mx.array, s: mx.array, b: mx.array):
+    def append_rows(self, w: mx.array, s: mx.array = None, b: mx.array = None):
         n = w.shape[0]
         start = self.rows_written
-        for name, arr, np_dt in (
-            ("ngram.weight", w, np.uint32),
-            ("ngram.scales", s, np.uint16),
-            ("ngram.biases", b, np.uint16),
-        ):
+        triples = (
+            (("ngram.weight", w, np.uint16),)
+            if self.bits == 0
+            else (
+                ("ngram.weight", w, np.uint32),
+                ("ngram.scales", s, np.uint16),
+                ("ngram.biases", b, np.uint16),
+            )
+        )
+        for name, arr, np_dt in triples:
             if arr.dtype == mx.bfloat16:
                 arr = arr.view(mx.uint16)
             data = np.ascontiguousarray(np.array(arr, copy=False)).astype(np_dt, copy=False)
@@ -294,6 +310,8 @@ def rename_trunk(name: str) -> str:
         name = name.replace("model.language_model.", "language_model.model.", 1)
     elif name == "lm_head.weight":
         name = "language_model.lm_head.weight"
+    elif name.startswith("model."):  # flat text-only checkpoints (test harnesses)
+        name = "language_model." + name
     return name
 
 
@@ -319,15 +337,22 @@ def main():
     mtp_out: dict[str, mx.array] = {}
 
     def quantize_into(dest: str, w: mx.array, sink, recipe: dict | None):
+        """Quantize w into the sink; returns the EFFECTIVE recipe (group size
+        falls back to a divisor of the in-dim, or bf16 when none fits — only
+        reachable on tiny test configs; production dims are 32-multiples)."""
+        if recipe is not None and w.shape[-1] % recipe["group_size"]:
+            g = next((x for x in (128, 64, 32) if x < recipe["group_size"] and w.shape[-1] % x == 0), None)
+            recipe = {**recipe, "group_size": g} if g else None
         if recipe is None:
             sink(dest + "", w)
-            return
+            return None
         wq, s, b = mx.quantize(w, group_size=recipe["group_size"], bits=recipe["bits"])
         mx.eval(wq, s, b)
         base = dest.rsplit(".weight", 1)[0] if dest.endswith(".weight") else dest
         sink(base + ".weight", wq)
         sink(base + ".scales", s)
         sink(base + ".biases", b)
+        return recipe
 
     # ---- 1. n-gram table (streamed, shard order) ----------------------------
     shard_names = sorted(
@@ -335,6 +360,7 @@ def main():
         key=lambda n: int(n.rsplit("shard_", 1)[1].split(".")[0]),
     )
     ple_prefix = None
+    ng_bits, ng_group = NGRAM_BITS, NGRAM_GROUP
     if shard_names:
         ple_prefix = shard_names[0].split(".ple_embedding.")[0]
         info0, _, _ = reader.info(shard_names[0])
@@ -343,11 +369,28 @@ def main():
         for n in shard_names:
             info, _, _ = reader.info(n)
             total_rows += info["shape"][0]
-        print(f"[ngram] {len(shard_names)} shards, {total_rows} rows x {dim}", flush=True)
-        ng = NgramStreamWriter(out / "model-ngram.safetensors", total_rows, dim)
+        ng_group = next((g for g in (NGRAM_GROUP, 64, 128) if dim % g == 0), 0)
+        ng_bits = NGRAM_BITS if ng_group else 0
+        print(
+            f"[ngram] {len(shard_names)} shards, {total_rows} rows x {dim} "
+            f"({'raw bf16' if not ng_group else f'{ng_bits}-bit/g{ng_group}'})",
+            flush=True,
+        )
+        ng = NgramStreamWriter(out / "ngram-table.safetensors", total_rows, dim, bits=ng_bits, group=ng_group or NGRAM_GROUP)
         for i, n in enumerate(shard_names):
             w = reader.bf16(n)
-            wq, s, b = mx.quantize(w, group_size=NGRAM_GROUP, bits=NGRAM_BITS)
+            if ng_bits == 0:
+                ng.append_rows(w.astype(mx.bfloat16))
+                accounted[n] = "ngram"
+                scale_name = n.replace(".weight", ".weight_scale_inv")
+                if scale_name in reader.weight_map:
+                    accounted[scale_name] = "ngram-scale"
+                del w
+                mx.clear_cache()
+                if (i + 1) % 16 == 0:
+                    print(f"[ngram] {i + 1}/{len(shard_names)}", flush=True)
+                continue
+            wq, s, b = mx.quantize(w, group_size=ng_group, bits=ng_bits)
             mx.eval(wq, s, b)
             ng.append_rows(wq, s, b)
             accounted[n] = "ngram"
@@ -390,9 +433,9 @@ def main():
             "mode": "affine",
         }
         sink = (lambda k, v: mtp_out.__setitem__(k, v)) if is_mtp else writer.add
-        quantize_into(dest, stacked, sink, recipe)
+        eff = quantize_into(dest, stacked, sink, recipe)
         if not is_mtp:
-            quant_config[dest.rsplit(".weight", 1)[0]] = recipe
+            quant_config[dest.rsplit(".weight", 1)[0]] = eff if eff is not None else False
         del stacked
         mx.clear_cache()
         if (gi + 1) % 24 == 0:
@@ -440,9 +483,9 @@ def main():
             halves = (("down_proj", v),)
         for proj, w in halves:
             dest = f"{dest_prefix}.mlp.switch_mlp.{proj}.weight"
-            quantize_into(dest, w, sink, recipe)
+            eff = quantize_into(dest, w, sink, recipe)
             if not is_mtp:
-                quant_config[dest.rsplit(".weight", 1)[0]] = recipe
+                quant_config[dest.rsplit(".weight", 1)[0]] = eff if eff is not None else False
         del v, halves
         mx.clear_cache()
         if (gi + 1) % 24 == 0:
@@ -458,7 +501,7 @@ def main():
             vision[n] = reader.bf16(n)
             accounted[n] = "vision"
             continue
-        if ple_prefix and n.startswith("model.language_model.") and ".ple." in n and n.endswith("conv1d.weight"):
+        if ".ple." in n and n.endswith("conv1d.weight") and not n.startswith("mtp."):
             w = reader.bf16(n).moveaxis(2, 1)
             writer.add(rename_trunk(n).replace("ple.conv1d.weight", "ple.conv_weight"), w)
             accounted[n] = "trunk"
@@ -475,9 +518,9 @@ def main():
         if is_mtp:
             quantize_into(dest, w, lambda k, v: mtp_out.__setitem__(k, v), recipe)
         else:
-            quantize_into(dest, w, writer.add, recipe)
-            if recipe is not None:
-                quant_config[dest.rsplit(".weight", 1)[0]] = recipe
+            eff = quantize_into(dest, w, writer.add, recipe)
+            if eff is not None:
+                quant_config[dest.rsplit(".weight", 1)[0]] = eff
             elif dest.endswith(".weight") and w.ndim >= 2:
                 quant_config[dest.rsplit(".weight", 1)[0]] = False
         accounted[n] = "mtp" if is_mtp else "trunk"
@@ -509,20 +552,21 @@ def main():
     # ---- 5. config + sidecar files ------------------------------------------
     cfg = json.loads((src / "config.json").read_text())
     cfg.pop("quantization_config", None)  # the fp8 recipe does not describe this pack
-    cfg["text_config"]["ngram_sidecar"] = True
+    tcfg = cfg["text_config"] if "text_config" in cfg else cfg  # flat text-only test ckpts
+    tcfg["ngram_sidecar"] = True
     cfg["quantization"] = quant_config
     cfg["quantization_config"] = quant_config
     cfg["mlx_lm_extra_tensors"] = {
         "mtp_file": "mtp.safetensors",
-        "ngram_file": "model-ngram.safetensors",
+        "ngram_file": "ngram-table.safetensors",
         "vision_file": "model-vision.safetensors",
     }
-    cfg["mtplx_source_repo"] = "Qwen/Qwen3.8-Flash-Next-FP8"
+    cfg["mtplx_source_repo"] = f"Qwen/{src.name}" if src.name.startswith("Qwen") else src.name
     cfg["mtplx_recipe"] = {
         "base": {"bits": BASE_BITS, "group_size": BASE_GROUP},
         "eight_bit": list(EIGHT_SUFFIXES),
         "kept_bf16": list(KEEP_BF16_SUFFIXES),
-        "ngram": {"bits": NGRAM_BITS, "group_size": NGRAM_GROUP},
+        "ngram": {"bits": ng_bits, "group_size": ng_group},
     }
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
     for f in (
