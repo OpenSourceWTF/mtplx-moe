@@ -14,6 +14,7 @@ RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
 SUPPORTED_ARCH_IDS = {
     "laguna-s-2.1-ar",
     "deepseek-v4",
+    "qwen4-next",
     "qwen3-next-mtp",
     "deepseek-v3-mtp",
     "glm-moe-dsa-mtp",
@@ -224,10 +225,10 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         arch_id="qwen4-next",
         display_name="Qwen4 preview / Qwen3.8-Flash-Next",
         family="qwen",
-        backend="qwen3_next",
-        support_level="experimental-trunk-pending-kernels",
-        runtime_compatibility="native-ar-only",
-        can_run_verified=False,
+        backend="qwen4_exp",
+        support_level="experimental-native-contract-gated",
+        runtime_compatibility="native",
+        can_run_verified=True,
         # The real T-0 strings (config landed 2026-08-26 15:00 UTC):
         # model_type qwen4_exp / qwen4_exp_text, Qwen4ExpForConditionalGeneration.
         # The speculative pre-drop aliases (qwen4/qwen3_8/qwen3_9) are gone —
@@ -246,9 +247,11 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         notes=(
             "Qwen4-generation preview family (GDN hybrid MoE + Qwen Sparse "
             "Attention + n-gram embedding memory, ModelScope 2026-08-26). "
-            "The trunk serves autoregressive wherever this build ships an "
-            "MLX implementation for it; QSA/n-gram execution and MTP attach "
-            "land with the dedicated native backend."
+            "Native backend mtplx.models.qwen4_exp: transformers-parity "
+            "trunk (QSA indexer + SSD-streamed n-gram sidecar with QD16 "
+            "prefetch) and the native MTP draft head attached from the "
+            "pack's self-describing mtp.safetensors, driven through the "
+            "standard speculative lane."
         ),
     ),
     "deepseek-v3-mtp": ArchitectureSupport(

@@ -1309,6 +1309,16 @@ def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
 def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
     descriptor = descriptor_from_inspection(inspection)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if _inspection_backend_id(inspection) == "qwen4_exp":
+        # Flash-Next verify defaults: the capture-commit verifier walks the
+        # qwen3-next GDN internals, which this family's own GDN classes do
+        # not expose — batched verify snapshots/restores the recurrent caches
+        # generically. A family-native capture backend replaces this default
+        # when it lands. Depth 1 until tune publishes measured depths.
+        if "verify-strategy" not in cli_flags:
+            args.verify_strategy = "batched"
+        if "depth" not in cli_flags and int(getattr(args, "depth", 0) or 0) > 1:
+            args.depth = 1
     # Family-aware policy, not the raw lane descriptor: shared lanes (mlx_lm_ar)
     # pin parser=none while a family on that lane (lfm2) has a verified codec.
     # Stamping the lane's "none" here reads as an operator override downstream

@@ -1138,9 +1138,17 @@ class TextModel(nn.Module):
         concat_order: str | None = None,
         mtp_hidden_variant: str | None = None,
         position_offset: int | None = None,
+        input_embeddings=None,
     ):
-        """Append committed history to the head's cache (no lm_head cost)."""
-        emb = self.model.embed_tokens(next_token_ids)
+        """Append committed history to the head's cache (no lm_head cost).
+
+        ``input_embeddings`` (vision splice) supplies exact embedding rows in
+        place of ``embed_tokens(next_token_ids)`` when provided.
+        """
+        if input_embeddings is not None:
+            emb = input_embeddings
+        else:
+            emb = self.model.embed_tokens(next_token_ids)
         return self.mtp.fuse_and_run(hidden_states, emb, mtp_cache)
 
     def make_mtp_cache(self):
@@ -1234,8 +1242,24 @@ class Model(nn.Module):
         # eos flows from the top-level config when text_config omits it
         self.language_model = TextModel(TextArgs.from_dict(text_config))
 
-    def __call__(self, inputs, cache=None, input_embeddings=None):
-        return self.language_model(inputs, cache, input_embeddings)
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+    ):
+        # Explicit params only (no **kwargs): the runtime capability probe
+        # reads this signature and would treat a catch-all as emit_logits /
+        # logits_keep support this model does not implement.
+        return self.language_model(
+            inputs,
+            cache,
+            input_embeddings,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+        )
 
     @property
     def layers(self):
@@ -1305,6 +1329,15 @@ class Model(nn.Module):
     @property
     def mtp(self):
         return getattr(self.language_model, "mtp", None)
+
+    # The runtime drives the draft surface on the wrapper (self.model.*)
+    # while validate_mtp_support reads it off language_model — both resolve
+    # to the same TextModel implementation.
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        return self.language_model.mtp_forward(hidden_states, next_token_ids, **kwargs)
+
+    def mtp_update_cache(self, hidden_states, next_token_ids, **kwargs):
+        return self.language_model.mtp_update_cache(hidden_states, next_token_ids, **kwargs)
 
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()
