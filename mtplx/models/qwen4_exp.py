@@ -368,7 +368,45 @@ class GatedResidual(nn.Module):
 
 
 class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
-    pass
+    def __call__(self, x: mx.array) -> mx.array:
+        # Fused decode path (MTPLX_FUSED_MOE_DECODE=1 + sanitize-fused gu
+        # weights): collapses gate_up -> GLU -> down -> weighted-sum into two
+        # dispatches. Requires the exact family shapes (4-bit/g32); anything
+        # else runs the stock chain.
+        sw = self.switch_mlp
+        if (
+            x.shape[-2] == 1
+            and x.size == x.shape[-1]  # B*S == 1
+            and _fused_moe_decode_enabled()
+            and isinstance(sw, _FusedGateUpSwitchGLU)
+            and sw.bits == 4
+            and sw.group_size == 32
+        ):
+            from mtplx.kernels.moe_glu_decode import moe_glu_decode
+
+            flat = x.reshape(-1)
+            # Routing math mirrors the parent exactly: softmax over ALL
+            # experts first, then top-k of the probabilities.
+            gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+            idx = mx.argpartition(gates, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+            w = mx.take_along_axis(gates, idx, axis=-1)
+            if self.norm_topk_prob:
+                w = w / w.sum(axis=-1, keepdims=True)
+            dn = sw.down_proj
+            y = moe_glu_decode(
+                flat,
+                sw.gu_weight,
+                sw.gu_scales,
+                sw.gu_biases,
+                dn.weight,
+                dn.scales,
+                dn.biases,
+                idx.reshape(-1).astype(mx.uint32),
+                w.reshape(-1).astype(mx.float32),
+            ).reshape(x.shape)
+            shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+            return (y + shared).astype(x.dtype)
+        return super().__call__(x)
 
 
 class _FusedGateUpSwitchGLU(nn.Module):
@@ -467,6 +505,11 @@ def _fused_gate_up_enabled() -> bool:
 
 def _fused_hc_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_HC") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_moe_decode_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_MOE_DECODE") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
