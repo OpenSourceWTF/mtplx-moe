@@ -318,8 +318,44 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
             cache[1] = state
             cache.advance(S)
 
+        if self._fused_out_applies(B, S):
+            from mtplx.kernels.gdn_out_fused import fused_gdn_out
+
+            proj = self.out_proj
+            y = fused_gdn_out(
+                out.reshape(-1),
+                z.reshape(-1),
+                self.norm.weight,
+                proj.weight,
+                proj.scales,
+                proj.biases,
+                group_size=int(proj.group_size),
+            )
+            return y.reshape(B, S, -1)
+
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
+
+    def _fused_out_applies(self, B: int, S: int) -> bool:
+        # Fused norm+gate+out_proj (MTPLX_FUSED_GDN_OUT): decode rows only,
+        # family geometry (48x128 values -> 2560), 4-bit affine out_proj at a
+        # shipped forge group size, sigmoid-gated norm. Anything else runs
+        # the stock chain. The capture-commit stash is upstream of this
+        # boundary (it retains the gated_delta_update INPUTS), so the fused
+        # output path is invisible to replay.
+        if B * S != 1 or not _fused_gdn_out_enabled():
+            return False
+        if self.num_v_heads != 48 or self.head_v_dim != 128:
+            return False
+        if not isinstance(self.norm, SigmoidRMSNormGated):
+            return False
+        proj = self.out_proj
+        return (
+            getattr(proj, "bits", None) == 4
+            and getattr(proj, "group_size", None) in (32, 64)
+            and getattr(proj, "weight", None) is not None
+            and proj.weight.dtype == mx.uint32
+        )
 
 
 class GatedResidual(nn.Module):
@@ -666,6 +702,11 @@ def _fused_gate_up_enabled() -> bool:
 
 def _fused_gdn_in_proj_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_GDN_INPROJ") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_gdn_out_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GDN_OUT") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 

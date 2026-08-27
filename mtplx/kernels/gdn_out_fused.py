@@ -16,8 +16,8 @@ heads); v = bf16(sigmoid(z) * normed); y[d] = sum_k deq(W[d,k]) * v[k].
 The bf16 cast of v BEFORE the dot matches the module boundary (the norm
 returns hidden dtype; the projection consumes it).
 
-INTEGRATION DEFERRED: kernel + parity only in this change; the module wiring
-(env MTPLX_FUSED_GDN_OUT, capture-trace compatibility) is next-window work.
+Wired into GatedDeltaNet via MTPLX_FUSED_GDN_OUT (decode rows only; the
+capture-commit stash is upstream of this boundary, so replay never sees it).
 """
 
 from functools import lru_cache
@@ -79,8 +79,11 @@ _SRC = """
     const uint row = threadgroup_position_in_grid.x * 32 + sg;
     if (row >= (uint)DMODEL) return;
     const device uint32_t* wrow = qw + (size_t)row * (K / 8);
-    const device T* srow = qs + (size_t)row * NGROUPS;
-    const device T* brow = qb + (size_t)row * NGROUPS;
+    // scale/bias buffers keep their own dtype (bf16 in shipped packs) —
+    // never retype them through T (T follows x, which is fp32 when the
+    // delta kernel hands over float state rows)
+    const device auto* srow = qs + (size_t)row * NGROUPS;
+    const device auto* brow = qb + (size_t)row * NGROUPS;
     float acc = 0.0f;
     for (int g = lane; g < NGROUPS; g += 32) {
         const float s = (float)srow[g];

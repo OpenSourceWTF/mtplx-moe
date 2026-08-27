@@ -54,3 +54,35 @@ def test_rejects_bad_group_size(setup):
     gs, x, z, norm, pack = setup
     with pytest.raises(ValueError):
         fused_gdn_out(x, z, norm.weight.astype(mx.float32), *pack, group_size=80)
+
+
+def test_gdn_module_fused_out_matches_stock(monkeypatch):
+    if mx.default_device().type != mx.DeviceType.gpu:
+        pytest.skip("Metal kernel needs the GPU")
+    from mtplx.models.qwen4_exp import GatedDeltaNet, TextArgs
+
+    mx.random.seed(31)
+    gdn = GatedDeltaNet(TextArgs())  # family geometry: 48x128 -> 2560
+    lin = gdn.out_proj
+    lin.weight = (mx.random.normal(lin.weight.shape) * 0.03).astype(mx.bfloat16)
+    gdn.out_proj = nn.QuantizedLinear.from_linear(lin, group_size=64, bits=4)
+    gdn.norm.weight = 1.0 + mx.random.normal(gdn.norm.weight.shape) * 0.05
+    mx.eval(gdn.parameters())
+
+    x = (mx.random.normal((1, 1, 2560)) * 0.5).astype(mx.bfloat16)
+    monkeypatch.setenv("MTPLX_FUSED_GDN_OUT", "0")
+    ref = gdn(x)
+    monkeypatch.setenv("MTPLX_FUSED_GDN_OUT", "1")
+    fused = gdn(x)
+    mx.eval(ref, fused)
+    scale = mx.abs(ref.astype(mx.float32)).max().item() + 1e-6
+    err = (
+        mx.abs(fused.astype(mx.float32) - ref.astype(mx.float32)) / scale
+    ).max().item()
+    assert err < 2e-2, f"module fused-out rel err {err}"
+
+    # multi-row inputs must never take the fused path
+    multi = (mx.random.normal((1, 3, 2560)) * 0.5).astype(mx.bfloat16)
+    assert not gdn._fused_out_applies(1, 3)
+    out_multi = gdn(multi)
+    assert out_multi.shape == (1, 3, 2560)
