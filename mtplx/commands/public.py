@@ -1314,11 +1314,11 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
         # qwen3-next GDN internals, which this family's own GDN classes do
         # not expose — batched verify snapshots/restores the recurrent caches
         # generically. A family-native capture backend replaces this default
-        # when it lands. Depth 1 until tune publishes measured depths.
+        # when it lands. Depth follows the family DraftSemantics ceiling (3)
+        # with the adaptive expected_value policy owning per-step depth —
+        # the 27B contract (founder, 2026-08-26); no static clamp here.
         if "verify-strategy" not in cli_flags:
             args.verify_strategy = "batched"
-        if "depth" not in cli_flags and int(getattr(args, "depth", 0) or 0) > 1:
-            args.depth = 1
         # Target + draft sampler flow from the qwen4_exp family policy
         # (QWEN4_EXP_SAMPLER_DEFAULTS: the model-card thinking-mode set) via
         # the standard sampler block below. The 08-27 draft-temp 0.1 receipt

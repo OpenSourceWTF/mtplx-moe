@@ -432,9 +432,16 @@ QWEN4_EXP_SAMPLER_DEFAULTS = SamplerDefaults(temperature=1.0, top_p=0.95, top_k=
 QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
     request_field="depth",
     display_label="Draft depth",
-    # Live D1 vs D2 probe 2026-08-27 (Bare pack, flight recorder): D1 56.9,
-    # D2 52.0 — depth stays 1 until the tune sweep publishes a measured table.
-    default=1,
+    # Family law (founder, 2026-08-26): Flash-Next follows the 27B contract —
+    # ceiling 3 with the adaptive expected_value depth policy owning the
+    # effective per-step depth (the serving descriptor declares
+    # native_adaptive_depth_policy, so the CLI keeps adaptive_policy
+    # "expected_value"; depth here is the ceiling, not a static pin).
+    # Static-depth reference receipts (Bare pack, flight recorder, target
+    # 1.0): fixed D1 56.9 vs fixed D2 52.0 tok/s — those measured FIXED
+    # depth, not the adaptive policy. Adaptive-vs-static receipt owed in
+    # the serve battery before any further tune.
+    default=3,
     minimum=1,
     maximum=3,
     unit="depth",

@@ -795,9 +795,15 @@ def _read_safetensors_header(path: Path):
 def _ngram_resident_policy() -> bool:
     """Should the n-gram table go RAM-resident (arming the pipelined AR
     lane)? MTPLX_NGRAM_RESIDENT=1/0 pins it; default is auto by machine
-    memory — the resident table costs ~32G on top of the pack, which the
-    128G class affords with headroom and smaller machines must not pay
-    (they keep the SSD sidecar + staged classic loop)."""
+    memory. Auto arms only above the 128G class: with the table resident
+    the serve process wires ~99G (pack weights + 30G table), and on a
+    128G Mac that left no headroom over the user's own apps — measured
+    2026-08-26 on an M5 Max 128G: two Jetsam events then a watchdogd-
+    starved kernel panic while a serve A/B cycled resident loads. The
+    128G default is the SSD sidecar + staged classic loop (~69G resident,
+    real headroom — the founder-specified table-on-SSD design);
+    MTPLX_NGRAM_RESIDENT=1 pins resident for quiet-machine benchmarking
+    or dedicated boxes."""
     raw = (os.environ.get("MTPLX_NGRAM_RESIDENT") or "auto").strip().lower()
     if raw in {"1", "true", "yes", "on"}:
         return True
@@ -807,7 +813,7 @@ def _ngram_resident_policy() -> bool:
         total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (ValueError, OSError):
         return False
-    return total >= 112 * 2**30
+    return total >= 160 * 2**30
 
 
 class NGramEmbedding(nn.Module):
