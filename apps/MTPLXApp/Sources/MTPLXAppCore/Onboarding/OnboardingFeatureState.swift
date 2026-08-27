@@ -141,24 +141,19 @@ public struct OnboardingFeatureState: Equatable, Sendable {
     public var pick: ModelPickChoice
     public var otherProbe: OtherModelProbe?
     public var localProbe: LocalModelProbe?
-    /// User explicitly opted to continue past a `.noMTP` warning.
-    /// Resets to false whenever `pick` changes.
-    public var hasAcknowledgedOtherWarning: Bool
 
     public init(
         step: OnboardingStep = .welcome,
         hardware: DetectedHardware? = nil,
         pick: ModelPickChoice = .none,
         otherProbe: OtherModelProbe? = nil,
-        localProbe: LocalModelProbe? = nil,
-        hasAcknowledgedOtherWarning: Bool = false
+        localProbe: LocalModelProbe? = nil
     ) {
         self.step = step
         self.hardware = hardware
         self.pick = pick
         self.otherProbe = otherProbe
         self.localProbe = localProbe
-        self.hasAcknowledgedOtherWarning = hasAcknowledgedOtherWarning
     }
 
     // MARK: Derived
@@ -285,14 +280,10 @@ public struct OnboardingFeatureState: Equatable, Sendable {
         pick = choice
         otherProbe = nil
         localProbe = nil
-        hasAcknowledgedOtherWarning = false
     }
 
     public mutating func record(_ probe: OtherModelProbe) {
         otherProbe = probe
-        // A fresh probe always invalidates a previous acknowledgement
-        // so the user has to consciously re-confirm the warning.
-        hasAcknowledgedOtherWarning = false
     }
 
     public mutating func record(_ probe: LocalModelProbe) {
@@ -329,10 +320,12 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             case .other:
                 guard let probe = otherProbe else { return false }
                 switch probe.verdict {
-                case .ready, .missingSidecar:
+                case .ready, .missingSidecar, .noMTP:
+                    // MTP unavailable is informational, never a gate
+                    // (founder directive 2026-08-26): the engine serves
+                    // MTP-less checkpoints autoregressive, so the app
+                    // advances the same way the CLI does.
                     return true
-                case .noMTP:
-                    return hasAcknowledgedOtherWarning
                 case .probeFailed:
                     return false
                 }

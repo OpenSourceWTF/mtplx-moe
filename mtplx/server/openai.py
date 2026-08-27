@@ -37,7 +37,7 @@ import urllib.parse
 import uuid
 import weakref
 import webbrowser
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, is_dataclass, replace
@@ -365,6 +365,17 @@ CHAT_TEMPLATE_SENTINEL_RE = re.compile(
 STREAM_HEARTBEAT_INTERVAL_S = 10.0
 STREAM_SILENCE_WARN_S = 30.0
 STREAM_SILENCE_WARN_INTERVAL_S = 60.0
+# Pre-first-token SSE comment heartbeats (#358). A long prefill (minutes at
+# >32k-token prompts) used to put zero bytes on the wire before the first
+# token payload, so strict client/proxy read-timeouts (Claude Code, Cursor,
+# Open WebUI, nginx, cloudflared) killed the connection while the engine was
+# still computing. Any SSE line starting with ":" is a spec-level comment
+# that compliant parsers (official OpenAI SDKs included) ignore, yet it still
+# resets those read-timeouts. Once real payload chunks flow, token cadence is
+# the liveness signal and the comments stop.
+SSE_KEEPALIVE_COMMENT = ": keep-alive\n\n"
+SSE_KEEPALIVE_DEFAULT_INTERVAL_S = 5.0
+SSE_KEEPALIVE_MIN_INTERVAL_S = 1.0
 # Stall containment (#86): a stream that receives nothing while the model
 # owner's progress heartbeat is frozen for this long is failed with a
 # structured error instead of hanging forever. Healthy work ticks the
@@ -693,7 +704,41 @@ def _server_runtime_env_overrides(
         and verify_strategy not in VERIFY_SNAPSHOT_OPTIONAL_STRATEGIES
     ):
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if generation_mode == "mtp" and _served_model_type_is_qwen4_exp(args):
+        # Flash-Next rejection rollback REQUIRES the recurrent-state snapshot
+        # until its native GDN capture backend lands: QSA KV trims, but the
+        # family's GDN/conv ArraysCache state cannot be trimmed or re-captured
+        # by the qwen3-next capture walker, so a rejected draft without
+        # before_verify is unrecoverable ("capture commit failed after
+        # MTPLX_SKIP_VERIFY_SNAPSHOT=1" fires for ANY strategy). The
+        # snapshot-optional strategy set is a cross-family assumption this
+        # architecture does not satisfy. Keyed on the served config's
+        # model_type: the family rides the generic native_mtp descriptor, so
+        # args.backend_id cannot identify it.
+        overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if _served_model_type_is_qwen4_exp(args):
+        # Pipelined AR decode + compiled GDN runs (2026-08-27 receipts:
+        # 42.6 -> 51.9 t/s AR, GPU 57% -> 96.6% busy). The lane arms itself
+        # only when the n-gram table went resident (RAM-plan gated via
+        # MTPLX_NGRAM_RESIDENT=auto in the model loader); smaller machines
+        # keep the staged classic loop. An explicit operator export wins:
+        # profile-env application would otherwise overwrite it, so only
+        # default these when the launcher environment left them unset.
+        for key in ("MTPLX_AR_PIPELINE", "MTPLX_COMPILED_GDN"):
+            if os.environ.get(key) is None:
+                overrides.setdefault(key, "1")
     return overrides
+
+
+def _served_model_type_is_qwen4_exp(args: argparse.Namespace) -> bool:
+    try:
+        with open(Path(str(args.model)) / "config.json", "rb") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return False
+    mt = str(cfg.get("model_type") or "").lower()
+    tmt = str((cfg.get("text_config") or {}).get("model_type") or "").lower()
+    return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
 
 
 def _assert_fast_path_env() -> dict[str, dict[str, Any]]:
@@ -767,14 +812,24 @@ def _parse_byte_limit(value: str | int | None) -> int | None:
     text = str(value).strip().lower().replace("_", "")
     if not text:
         return None
+    # Single-letter spellings included: "48G" is the form every MTPLX
+    # budget message advertises ("sizes like 4G"), yet this parser only
+    # took "48GB"/"48GiB" — `--memory-budget 48G` crashed serve startup
+    # with a raw ValueError (found by the memory-governor tests, 2026-08-26).
     multipliers = {
         "b": 1,
+        "k": 1024,
         "kb": 1024,
         "kib": 1024,
+        "m": 1024**2,
         "mb": 1024**2,
         "mib": 1024**2,
+        "g": 1024**3,
         "gb": 1024**3,
         "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
     }
     for suffix, multiplier in sorted(
         multipliers.items(), key=lambda item: -len(item[0])
@@ -1861,13 +1916,26 @@ def _select_backend_context_window(
     *,
     model_max: int,
     requested: int | None,
+    machine_fit: int | None = None,
 ) -> int:
+    """Serving window: explicit request > machine fit > model max.
+
+    ``machine_fit`` is the memory plan's largest window whose full-window
+    KV actually fits this machine's engine envelope (issue #305: the flat
+    model-max default admitted 262k-token prompts on 48 GB Macs, whose KV
+    alone exceeds the Metal budget — swap-death, not an error message).
+    It shapes only the DEFAULT: an explicit --context-window always wins,
+    with the plan warning loudly instead of refusing.
+    """
     requested_value = int(requested or 0)
     default_value = (
         backend.context_window_policy.default
         if backend.backend_id == "laguna_ar"
         else int(model_max)
     )
+    fit = int(machine_fit or 0)
+    if requested_value <= 0 and fit > 0:
+        default_value = min(int(default_value), fit)
     return max(
         4_096,
         min(
@@ -2046,12 +2114,39 @@ class ServerState:
         self.rate_limiter = _RateLimiter(args.rate_limit)
         startup_backend = descriptor_for_backend_id(getattr(args, "backend_id", None))
         minimum_resident_bytes = None
+        resident_floor_label = "The model"
         if startup_backend.backend_id == "laguna_ar":
             from mtplx.models.laguna_config import (
                 LAGUNA_S_2_1_MIN_RESIDENT_BYTES,
             )
 
             minimum_resident_bytes = LAGUNA_S_2_1_MIN_RESIDENT_BYTES
+            resident_floor_label = "Laguna-S-2.1"
+        elif _served_model_type_is_qwen4_exp(args):
+            # The default wired cap (60% of RAM) sits BELOW this family's
+            # working set once the n-gram table goes RAM-resident: on a 128G
+            # M5 Max the cap landed at ~82G against a ~99G resident set and
+            # Metal's forced eviction collapsed serve decode to 8.5 tok/s
+            # (2026-08-27 battery receipt). Floor = pack weight files
+            # (+ the table when the resident policy arms) + working margin.
+            try:
+                from mtplx.models.qwen4_exp import _ngram_resident_policy
+
+                model_dir = Path(str(getattr(args, "model", "") or ""))
+                floor = 0
+                for f in model_dir.glob("model*.safetensors"):
+                    floor += f.stat().st_size
+                mtp_f = model_dir / "mtp.safetensors"
+                if mtp_f.exists():
+                    floor += mtp_f.stat().st_size
+                table_f = model_dir / "ngram-table.safetensors"
+                if table_f.exists() and _ngram_resident_policy():
+                    floor += table_f.stat().st_size
+                if floor:
+                    minimum_resident_bytes = floor + 6 * 1024**3
+                    resident_floor_label = "Qwen3.8-Flash-Next"
+            except OSError:
+                minimum_resident_bytes = None
         self.metal_memory_caps = _apply_metal_memory_caps(
             minimum_resident_bytes=minimum_resident_bytes,
         )
@@ -2063,7 +2158,7 @@ class ServerState:
                 int(self.metal_memory_caps.get("minimum_resident_bytes") or 0) / 1024**3
             )
             raise RuntimeError(
-                "Laguna-S-2.1 cannot load inside the available Metal memory "
+                f"{resident_floor_label} cannot load inside the available Metal memory "
                 f"budget; at least {required_gib:.1f} GiB resident plus "
                 "16 GiB system headroom is required"
             )
@@ -2330,10 +2425,74 @@ class ServerState:
             args.model,
         )
         requested_context_window = int(getattr(args, "context_window", None) or 0)
+        # Machine memory plan (issue #305): weights are a disk scan, RAM a
+        # sysctl, so the machine's largest safe window is knowable BEFORE
+        # any request — and it shapes the default window below. Five
+        # subsystems budgeting independently with a machine-blind 262k
+        # default is how a 48 GB Mac reached 61.8 GB resident and 3 tok/s.
+        from mtplx.engine_session import (
+            model_weights_bytes as _model_weights_bytes,
+        )
+        from mtplx.memory_plan import (
+            describe_plan as _describe_memory_plan,
+            detect_total_ram_bytes as _plan_detect_total_ram,
+            plan_memory as _plan_memory,
+        )
+
+        _plan_weights_bytes = _model_weights_bytes(
+            getattr(self.runtime, "model_path", None)
+        )
+        # env override > model-config-derived geometry > flagship default
+        _plan_kv_bytes_per_token = 0
+        try:
+            _plan_kv_bytes_per_token = int(
+                os.environ.get("MTPLX_DENSE_KV_BYTES_PER_TOKEN") or 0
+            )
+        except (TypeError, ValueError):
+            _plan_kv_bytes_per_token = 0
+        if _plan_kv_bytes_per_token <= 0:
+            from mtplx.memory_plan import (
+                dense_kv_bytes_per_token_from_config as _plan_kv_from_config,
+            )
+
+            _plan_model_path = getattr(self.runtime, "model_path", None)
+            _plan_model_config: dict[str, Any] | None = None
+            if _plan_model_path is not None:
+                try:
+                    _plan_model_config = json.loads(
+                        (Path(_plan_model_path) / "config.json").read_text()
+                    )
+                except (OSError, ValueError):
+                    _plan_model_config = None
+            _plan_kv_bytes_per_token = (
+                _plan_kv_from_config(_plan_model_config) or 65536
+            )
+        _plan_metal_limit: int | None = None
+        _caps = getattr(self, "metal_memory_caps", None)
+        if isinstance(_caps, dict):
+            _cap_value = _caps.get("memory_limit_bytes")
+            if isinstance(_cap_value, int) and _cap_value > 0:
+                _plan_metal_limit = _cap_value
+        _plan_inputs: dict[str, Any] = {
+            "total_ram_bytes": _plan_detect_total_ram(),
+            "model_weights_bytes": _plan_weights_bytes,
+            "kv_bytes_per_token": _plan_kv_bytes_per_token,
+            "kv_quantization": _effective_paged_kv_quantization(),
+            "model_max_context": int(self.model_context_window_max),
+            "memory_budget_bytes": self.memory_budget_bytes,
+            "usable_bytes_override": _plan_metal_limit,
+        }
+        _fit_plan = _plan_memory(**_plan_inputs)
+        _machine_fit = (
+            int(_fit_plan.context_window_fit)
+            if _fit_plan.available and _fit_plan.model_fits
+            else 0
+        )
         self.context_window = _select_backend_context_window(
             self.backend_descriptor,
             model_max=int(self.model_context_window_max),
             requested=requested_context_window,
+            machine_fit=_machine_fit,
         )
         if (
             scheduler_config.mode == SchedulerMode.MTP_BATCH
@@ -2349,14 +2508,37 @@ class ServerState:
         # The paged KV pool clamps geometric growth to this window (#150);
         # env is the plumbing because cache_state has no server handle.
         os.environ["MTPLX_CONTEXT_WINDOW_TOKENS"] = str(int(self.context_window))
-        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
-        from mtplx.engine_session import model_weights_bytes as _model_weights_bytes
+        # Final plan against the RESOLVED window (the fit plan above only
+        # shaped the default): overcommit and machine-bound verdicts ride
+        # the banner, the health payload, and the app's dashboard stream.
+        from mtplx.generation import (
+            _dense_decode_max_context as _dense_decode_ceiling,
+        )
 
+        _plan_inputs["requested_context"] = (
+            int(self.context_window) if requested_context_window > 0 else None
+        )
+        _plan_inputs["dense_decode_ceiling"] = int(_dense_decode_ceiling())
+        self.memory_plan = _plan_memory(**_plan_inputs)
+        if self.memory_plan.available:
+            _startup_line(
+                f"[5/6] Memory plan: {_describe_memory_plan(self.memory_plan)}"
+            )
+            for _plan_note in self.memory_plan.notes:
+                _startup_line(f"[5/6] Memory plan: {_plan_note}")
+        else:
+            # A detector whose failure path is "quietly use the default"
+            # is how the app-daemon PATH bug shipped (mistakes ledger);
+            # the fallback names its reason in one log read.
+            _startup_line(
+                "[5/6] Memory plan unavailable "
+                f"({self.memory_plan.unavailable_reason}); legacy budgets apply"
+            )
+        self.session_bank_cold_tier = _session_bank_cold_tier_from_args(args)
         self.sessions = EngineSessionManager(
             cold_tier=self.session_bank_cold_tier,
-            model_weights_bytes=_model_weights_bytes(
-                getattr(self.runtime, "model_path", None)
-            ),
+            model_weights_bytes=_plan_weights_bytes,
+            memory_plan=self.memory_plan,
         )
         # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
         # it runs at enqueue, never on the writer thread) off request and
@@ -4385,6 +4567,12 @@ async def _iter_sse_data(body_iterator: Any):
             ]
             if data_lines:
                 yield "\n".join(data_lines)
+            elif frame.startswith(":"):
+                # SSE comment-only frame — the pre-first-token keep-alive
+                # (#358). Yield it verbatim so the Anthropic translator can
+                # forward the liveness bytes; the leading ":" is unambiguous
+                # because data payloads here are JSON or "[DONE]".
+                yield frame
     if buffer.strip():
         data_lines = [
             line.removeprefix("data:").strip()
@@ -4441,6 +4629,14 @@ async def _anthropic_stream_from_openai_sse(body_iterator: Any, *, model: str):
 
     try:
         async for data in _iter_sse_data(body_iterator):
+            if data.startswith(":"):
+                # Keep-alive comment from the inner OpenAI stream (#358):
+                # forward it untranslated. SSE comments are protocol-neutral,
+                # and every other inner frame the translator drops (e.g.
+                # progress chunks) leaves the Anthropic wire silent through
+                # the whole prefill.
+                yield f"{data}\n\n"
+                continue
             if data == "[DONE]":
                 break
             try:
@@ -4814,6 +5010,93 @@ def _sanitize_orphan_span_interior(text: str) -> str:
         if s == previous:
             break
     return re.sub(r"\n{3,}", "\n\n", s)
+
+
+# --- Unexecuted-tool-call truthfulness (#349) -------------------------------
+#
+# #160 taught the server to hide dead tool-call markup from no-tools chats,
+# and the malformed-parse fallback hides markup for undeclared names. Both
+# fixes deleted the markup SILENTLY: the model saw its call vanish with no
+# output and no error ("tool calls going out into the void" — issue #349's
+# transcript), the user saw a blank reply, and nothing in the conversation
+# said the call never ran. A swallowed call is a masked bug: whenever tool
+# markup is suppressed without execution, the turn now carries a short,
+# truthful, visible notice so the model can self-correct on its next turn
+# and the user learns why nothing happened.
+
+_TOOL_MARKUP_NAME_FUNCTION_RE = re.compile(
+    r"<function=([A-Za-z_][\w.-]*)", re.IGNORECASE
+)
+_TOOL_MARKUP_NAME_INVOKE_RE = re.compile(
+    r'<invoke\s+name="([A-Za-z_][\w.-]*)"', re.IGNORECASE
+)
+_TOOL_MARKUP_NAME_JSON_RE = re.compile(r'"name"\s*:\s*"([A-Za-z_][\w.-]*)"')
+_UNKNOWN_TOOL_REASON_RE = re.compile(r"unknown tool '([^']*)'", re.IGNORECASE)
+
+
+def _tool_markup_call_names(text: str, *, limit: int = 5) -> list[str]:
+    """Best-effort tool names from unexecuted tool-call markup (#349).
+
+    Scans only inside orphan tool-markup spans so a JSON object the model
+    wrote as prose cannot be misread as a call. Order-preserving, deduped.
+    """
+    names: list[str] = []
+    if not text or "<" not in text:
+        return names
+    for span_match in _ORPHAN_TOOL_MARKUP_RE.finditer(text):
+        span = span_match.group(0)
+        for pattern in (
+            _TOOL_MARKUP_NAME_FUNCTION_RE,
+            _TOOL_MARKUP_NAME_INVOKE_RE,
+            _TOOL_MARKUP_NAME_JSON_RE,
+        ):
+            for match in pattern.finditer(span):
+                name = match.group(1)
+                if name and name not in names:
+                    names.append(name)
+                if len(names) >= limit:
+                    return names
+    return names
+
+
+def _unknown_tool_name_from_reason(reason: str) -> str:
+    match = _UNKNOWN_TOOL_REASON_RE.search(reason or "")
+    return match.group(1).strip() if match else ""
+
+
+def _no_tools_unexecuted_call_notice(names: list[str]) -> str:
+    """Visible truth for a no-tools turn whose tool markup was suppressed."""
+    called = ", ".join(f'"{name}"' for name in names) if names else "a tool"
+    return (
+        f"[MTPLX: this reply tried to call {called}, but no tools are active "
+        "on this request, so nothing was executed — there was no output and "
+        "no error. This chat cannot read files or run terminal commands. For "
+        "file and terminal access, connect a coding agent (Claude Code, "
+        "OpenCode, or the Hermes agent in the MTPLX app) to MTPLX.]"
+    )
+
+
+def _unknown_tool_unexecuted_call_notice(
+    name: str,
+    declared: list[str],
+) -> str:
+    """Visible truth for a suppressed call to a tool this request never had."""
+    available = ", ".join(declared) if declared else "none"
+    label = f' "{name}"' if name else ""
+    return (
+        f"[MTPLX: the tool call{label} was not executed — it is not one of "
+        f"this request's available tools (available: {available}). Nothing "
+        "ran and there is no output. Use only the available tools, or answer "
+        "directly.]"
+    )
+
+
+def _append_unexecuted_tool_notice(text: str, notice: str) -> str:
+    """Append the notice as a trailing paragraph; idempotent per turn."""
+    base = (text or "").rstrip()
+    if notice in base:
+        return base
+    return f"{base}\n\n{notice}" if base else notice
 
 
 _TOOL_CALL_BLOCK_RE = re.compile(
@@ -15134,7 +15417,9 @@ def _env_bool_setting(name: str, *, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _effective_ram_session_cache_settings() -> dict[str, Any]:
+def _effective_ram_session_cache_settings(
+    state: "ServerState | None" = None,
+) -> dict[str, Any]:
     entries_raw = os.environ.get("MTPLX_SESSION_BANK_MAX_ENTRIES")
     max_bytes = os.environ.get("MTPLX_SESSION_BANK_MAX_BYTES") or "8G"
     per_session_bytes = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_BYTES") or "4G"
@@ -15157,6 +15442,16 @@ def _effective_ram_session_cache_settings() -> dict[str, Any]:
         policy = "minimal"
     else:
         policy = "bounded"
+    # Report the budgets the bank is actually RUNNING, not the env echo:
+    # with nothing configured the engine auto-sizes from the machine plan
+    # (or the half-surplus formula), and this surface used to invent
+    # "8G/4G" — the dashboard disagreeing with the daemon's own budget
+    # line is exactly how config bugs hide.
+    bank = getattr(getattr(state, "sessions", None), "bank", None)
+    if bank is not None:
+        entries = int(getattr(bank, "max_entries", entries))
+        max_bytes = f"{int(bank.max_bytes) / 2**30:.1f}G"
+        per_session_bytes = f"{int(bank.per_session_max_bytes) / 2**30:.1f}G"
     return {
         "ram_session_cache_policy": policy,
         "ram_session_block_prefix_restore": block_prefix_restore,
@@ -15313,7 +15608,7 @@ def _mtplx_current_settings(state: "ServerState") -> dict[str, Any]:
             "paged_kv_quantization",
             "ssd_session_cache",
         ],
-        **_effective_ram_session_cache_settings(),
+        **_effective_ram_session_cache_settings(state),
     }
 
 
@@ -15570,6 +15865,14 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "memory_pressure_level": int(
             getattr(dashboard, "last_memory_pressure_level", 0) or 0
         ),
+        "memory_plan": (
+            state.memory_plan.to_dict()
+            if getattr(state, "memory_plan", None) is not None
+            else None
+        ),
+        "memory_guard_events": list(
+            getattr(dashboard, "memory_guard_events", ()) or ()
+        )[-8:],
         "settings": _mtplx_current_settings(state),
         "scheduler": _mtplx_scheduler_state(state),
         "machine": _machine_info(),
@@ -15606,6 +15909,130 @@ def _memory_pressure_guard_enabled() -> bool:
         "false",
         "no",
     }
+
+
+# Allocation failures the daemon must survive as per-request errors. MLX's
+# Metal allocator raises plain RuntimeErrors ("[metal::malloc] ... maximum
+# allowed buffer size", "Insufficient Memory",
+# kIOGPUCommandBufferCallbackErrorOutOfMemory); before 2.9.4 these reached
+# clients as anonymous internal_error 500s with no cache shed, so the very
+# next request hit the same wall (#348).
+_ALLOCATION_FAILURE_MARKERS = (
+    "insufficient memory",
+    "out of memory",
+    "failed to allocate",
+    "kiogpucommandbuffercallbackerroroutofmemory",
+    "metal::malloc",
+    "maximum allowed buffer size",
+)
+
+
+def _is_allocation_failure(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    if not isinstance(exc, (RuntimeError, OSError)):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _ALLOCATION_FAILURE_MARKERS)
+
+
+def _record_guard_event(state: "ServerState", payload: dict[str, Any]) -> None:
+    """Ring buffer of guard actions for the dashboard/app (never raises)."""
+    try:
+        dashboard = state.dashboard
+        events = getattr(dashboard, "memory_guard_events", None)
+        if events is None:
+            events = deque(maxlen=16)
+            dashboard.memory_guard_events = events
+        events.append({"ts": time.time(), **payload})
+    except Exception:
+        pass
+
+
+def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
+    """Give memory back after an allocation failure; never raises.
+
+    Bank to half its current budget + allocator cache clear: the next
+    request should find room instead of hitting the identical wall.
+    """
+    receipt: dict[str, Any] = {"action": "allocation_failure_shed"}
+    try:
+        bank = getattr(getattr(state, "sessions", None), "bank", None)
+        if bank is not None:
+            receipt["bank_entries_evicted"] = bank.shrink_to_bytes(
+                int(bank.effective_max_bytes()) // 2,
+                reason="allocation_failure",
+            )
+            receipt["bank_bytes_after"] = int(bank.total_nbytes)
+    except Exception as exc:
+        receipt["bank_error"] = repr(exc)
+    try:
+        import mlx.core as _mx
+
+        _mx.clear_cache()
+        receipt["cache_cleared"] = True
+    except Exception:
+        receipt["cache_cleared"] = False
+    _record_guard_event(state, receipt)
+    try:
+        print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
+    except Exception:
+        pass
+    return receipt
+
+
+def _allocation_failure_http_exception(
+    state: "ServerState", exc: BaseException
+) -> HTTPException:
+    """Shed caches, then turn the raw allocator error into an honest 507."""
+    _shed_after_allocation_failure(state)
+    plan = getattr(state, "memory_plan", None)
+    advice = "Reduce --context-window, close other apps, or try q8 KV quantization."
+    if plan is not None and getattr(plan, "context_overcommitted", False):
+        advice = (
+            f"--context-window {plan.context_window_resolved} exceeds this "
+            f"machine's fit of {plan.context_window_fit} tokens; serve at or "
+            "below the fit (or use q8 KV quantization)."
+        )
+    return HTTPException(
+        status_code=507,
+        detail=(
+            "insufficient memory: the request exceeded available GPU memory "
+            f"({exc}). The engine shed its caches and stays up; this request "
+            f"failed. {advice}"
+        ),
+    )
+
+
+def _allocator_pressure_level(state: "ServerState") -> tuple[int, float]:
+    """Engine-relative pressure: allocator footprint vs the Metal limit.
+
+    macOS's kern.memorystatus level fires only once the system is already
+    compressing/swapping — on a 48 GB Mac that is minutes into the death
+    spiral (#305: 61.8/48.0 GB before the first signal). The allocator
+    knows earlier: active+cache at >=97% of the configured Metal memory
+    limit means the next growth step swaps, so treat it as WARNING (2);
+    past the limit is CRITICAL-equivalent (4). Returns (level, fraction).
+    """
+    caps = getattr(state, "metal_memory_caps", None)
+    limit = 0
+    if isinstance(caps, dict):
+        value = caps.get("memory_limit_bytes")
+        if isinstance(value, int):
+            limit = value
+    if limit <= 0:
+        return 1, 0.0
+    stats = _mlx_memory_stats_live()
+    active = stats.get("active_memory_bytes") or 0
+    cache = stats.get("cache_memory_bytes") or 0
+    if not active:
+        return 1, 0.0
+    fraction = float(int(active) + int(cache)) / float(limit)
+    if fraction >= 1.02:
+        return 4, fraction
+    if fraction >= 0.97:
+        return 2, fraction
+    return 1, fraction
 
 
 def _engine_busy_signal(state: "ServerState") -> bool:
@@ -15752,7 +16179,41 @@ async def _memory_pressure_loop(
     while True:
         try:
             level = await asyncio.to_thread(_memory_pressure_level)
+            level_source = "macos"
+            allocator_level, allocator_fraction = _allocator_pressure_level(state)
+            if allocator_level > level:
+                # The allocator sees the wall minutes before macOS does
+                # (see _allocator_pressure_level); the guard acts on
+                # whichever signal is worse.
+                level = allocator_level
+                level_source = "allocator"
             state.dashboard.last_memory_pressure_level = level
+            # Dynamic bank ceiling (memory plan): during a long-context
+            # prefill no put() runs for minutes while KV grows, so the
+            # put-time budget check alone reacts too late. Enforce here
+            # every tick. Deliberately NO mx.clear_cache() while busy —
+            # freed bank buffers return to the allocator pool and get
+            # reused by the growing KV, which is exactly the point.
+            bank = getattr(getattr(state, "sessions", None), "bank", None)
+            if bank is not None and getattr(bank, "dynamic_ceiling_fn", None):
+                try:
+                    ceiling = int(bank.effective_max_bytes())
+                    if int(bank.total_nbytes) > ceiling + 256 * 1024**2:
+                        dyn_evicted = bank.shrink_to_bytes(
+                            ceiling, reason="dynamic_ceiling"
+                        )
+                        if dyn_evicted:
+                            _record_guard_event(
+                                state,
+                                {
+                                    "action": "dynamic_ceiling",
+                                    "ceiling_bytes": ceiling,
+                                    "bank_entries_evicted": int(dyn_evicted),
+                                    "bank_bytes_after": int(bank.total_nbytes),
+                                },
+                            )
+                except Exception:
+                    pass
             busy = False
             if 2 <= level < 4:
                 busy = await asyncio.to_thread(_engine_busy_signal, state)
@@ -15795,18 +16256,20 @@ async def _memory_pressure_loop(
                         _mx.clear_cache()
                     except Exception:
                         pass
-                print(
-                    "[mtplx] memory pressure guard "
-                    + json.dumps(
-                        {
-                            "level": level,
-                            "bank_entries_evicted": evicted,
-                            "bank_bytes_after": int(
-                                getattr(bank, "total_nbytes", 0) or 0
-                            ),
-                            "deferred_s": deferred_s,
-                        }
+                action_receipt = {
+                    "action": "pressure_trim",
+                    "level": level,
+                    "level_source": level_source,
+                    "allocator_fraction": round(allocator_fraction, 3),
+                    "bank_entries_evicted": evicted,
+                    "bank_bytes_after": int(
+                        getattr(bank, "total_nbytes", 0) or 0
                     ),
+                    "deferred_s": deferred_s,
+                }
+                _record_guard_event(state, action_receipt)
+                print(
+                    "[mtplx] memory pressure guard " + json.dumps(action_receipt),
                     flush=True,
                 )
         except asyncio.CancelledError:
@@ -15817,6 +16280,212 @@ async def _memory_pressure_loop(
             await asyncio.sleep(interval_s)
         except asyncio.CancelledError:
             raise
+
+
+def _idle_pump_enabled() -> bool:
+    raw = str(os.environ.get("MTPLX_SSD_IDLE_PUMP", "1")).strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+# The pump arms only after this much request-level quiet. Well above any
+# foreground->tail-postcommit gap (milliseconds) and above the scheduler's
+# own idle+quiet graces (~0.55 s), so an armed pump can never race a
+# latency-critical tail; well below the ~90 s background-warmup re-fire,
+# so durability lands before the warm ladder re-occupies the idle band.
+_IDLE_PUMP_AFTER_S = 5.0
+_IDLE_PUMP_INTERVAL_S = 2.0
+
+
+def _server_request_idle_s(state: "ServerState") -> float:
+    """Seconds since the last HTTP request activity; 0.0 while any is live.
+
+    Fresh boot (no request ever) counts as infinitely idle: pending
+    durability work (e.g. a re-dispatched encode) may drain freely."""
+    try:
+        if state.has_foreground():
+            return 0.0
+    except BaseException:
+        return 0.0
+    last = max(
+        float(getattr(state, "last_request_started_at", 0.0) or 0.0),
+        float(getattr(state, "last_request_at", 0.0) or 0.0),
+    )
+    if last <= 0.0:
+        return float("inf")
+    return max(0.0, time.time() - last)
+
+
+async def _idle_persistence_pump_loop(
+    state: "ServerState", *, interval_s: float = _IDLE_PUMP_INTERVAL_S
+) -> None:
+    """Guarantee the durability lane forward progress on an idle server.
+
+    Issue #290: the scheduler's persistence band is reachable only while
+    the idle_postcommit deque is COMPLETELY empty, so any self-chaining
+    idle occupant (the 2.8.2 background warm ladder ran rungs back-to-back
+    for minutes after the last request; 2.8.3's 90 s grace narrowed but
+    did not close the window) starves SSD session-cache writes forever —
+    entries sat in the RAM bank with every cold-tier counter at zero and
+    were lost on restart. An idle server is the BEST time to write: once
+    the server has seen several seconds of request-level quiet, arm one
+    pump slot per tick so the persistence head can bridge the chain's
+    not-yet-ready gaps. All existing protections stand: foreground always
+    wins, a foreground submission disarms the pump before admission, a
+    ready idle item still runs first, and the per-tensor encode abort +
+    writer pause keep yielding to real traffic.
+    """
+    scheduler = getattr(state, "model_scheduler", None)
+    if (
+        scheduler is None
+        or not hasattr(scheduler, "pump_persistence")
+        or not hasattr(scheduler, "persistence_pending")
+    ):
+        return
+    while True:
+        try:
+            if (
+                scheduler.persistence_pending() > 0
+                and _server_request_idle_s(state) >= _IDLE_PUMP_AFTER_S
+                and not scheduler.foreground_pending_or_active()
+            ):
+                scheduler.pump_persistence(budget=1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            raise
+
+
+def _shutdown_flush_timeout_s() -> float:
+    """Bounded best-effort window for the shutdown cold-write flush.
+
+    Matches EngineSessionManager.flush_cold_tier's historical 10 s bound.
+    MTPLX_SHUTDOWN_SSD_FLUSH_S overrides; 0 disables the flush entirely.
+    """
+    raw = str(os.environ.get("MTPLX_SHUTDOWN_SSD_FLUSH_S", "")).strip()
+    if not raw:
+        return 10.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    if value != value or value < 0.0:
+        return 10.0
+    return min(value, 60.0)
+
+
+def _shutdown_flush_cold_writes(state: "ServerState") -> dict[str, Any]:
+    """Best-effort, bounded flush of pending SSD session-cache writes.
+
+    Issue #290 (secondary): lifespan shutdown used to go straight to
+    ``scheduler.shutdown(cancel_futures=True)`` — queued persistence
+    encodes were CANCELLED and the writer queue was never drained, so a
+    plain SIGTERM/Ctrl-C silently lost every entry still in flight and the
+    next boot paid a full re-prefill. This runs BEFORE the scheduler
+    shutdown: pump the persistence lane (the owner thread is still alive
+    and no foreground exists during shutdown), then wait out the writer
+    queue's task accounting. Bounded and honest — one console line says
+    how many writes flushed and how many remained.
+    """
+    outcome = {"pending_before": 0, "flushed": 0, "remained": 0, "elapsed_s": 0.0}
+    budget_s = _shutdown_flush_timeout_s()
+    scheduler = getattr(state, "model_scheduler", None)
+    cold_tier = getattr(state, "session_bank_cold_tier", None)
+    sessions = getattr(state, "sessions", None)
+    if budget_s <= 0.0 or cold_tier is None:
+        return outcome
+
+    def _writer_outstanding() -> int:
+        """Staged writes not yet durable — INCLUDING the in-flight one.
+
+        ``writer_queue_depth`` alone misses the write the writer thread
+        has already popped and is moving to disk (measured live: a 619 MB
+        entry showed depth 0 / enqueued 1 / completed 0 while its file was
+        mid-write; an early exit on depth alone let the daemon writer die
+        mid-file). This mirrors the tier's ``flush()`` task accounting.
+        """
+        try:
+            stats = cold_tier.stats()
+            outstanding = (
+                int(stats.get("writes_enqueued") or 0)
+                - int(stats.get("writes_completed") or 0)
+                - int(stats.get("write_failures") or 0)
+                - int(stats.get("writes_cancelled") or 0)
+            )
+            return max(0, outstanding)
+        except BaseException:
+            return 0
+
+    def _persistence_pending() -> int:
+        if scheduler is None or not hasattr(scheduler, "persistence_pending"):
+            return 0
+        try:
+            return int(scheduler.persistence_pending())
+        except BaseException:
+            return 0
+
+    def _persistence_active() -> bool:
+        # A popped encode no longer counts as pending but is still moving
+        # bytes (spill_entry writes blobs directly on the owner thread);
+        # the flush must outwait it or report it as remained.
+        if scheduler is None or not hasattr(scheduler, "stats"):
+            return False
+        try:
+            return scheduler.stats().get("active_kind") == "idle_persistence"
+        except BaseException:
+            return False
+
+    started = time.monotonic()
+    deadline = started + budget_s
+    pending = _persistence_pending() + _writer_outstanding()
+    if pending <= 0 and not _persistence_active():
+        return outcome
+    if _persistence_active():
+        # The running encode is real outstanding work too.
+        pending += 1
+    outcome["pending_before"] = pending
+    print(
+        f"[mtplx] shutdown: flushing {pending} pending SSD session-cache "
+        f"write(s) (bounded {budget_s:.0f}s)...",
+        flush=True,
+    )
+    # Drain the un-run encodes first: each needs an owner-thread slot, and
+    # during shutdown the only possible idle-band occupants are background
+    # chains — exactly what the pump bridges.
+    while (
+        _persistence_pending() > 0 or _persistence_active()
+    ) and time.monotonic() < deadline:
+        try:
+            if scheduler is not None and hasattr(scheduler, "pump_persistence"):
+                scheduler.pump_persistence(budget=4)
+        except BaseException:
+            break
+        time.sleep(0.05)
+    # Then the staged writer queue (file IO on the writer thread).
+    remaining_s = max(0.1, deadline - time.monotonic())
+    flush = getattr(sessions, "flush_cold_tier", None) if sessions is not None else None
+    try:
+        if callable(flush):
+            flush(timeout_s=remaining_s)
+        elif hasattr(cold_tier, "flush"):
+            cold_tier.flush(timeout_s=remaining_s)
+    except BaseException:
+        pass
+    remained = _persistence_pending() + _writer_outstanding()
+    outcome["remained"] = remained
+    outcome["flushed"] = max(0, pending - remained)
+    outcome["elapsed_s"] = round(time.monotonic() - started, 2)
+    print(
+        "[mtplx] shutdown: SSD session cache flushed "
+        f"{outcome['flushed']}/{pending} pending write(s) in "
+        f"{outcome['elapsed_s']}s"
+        + (f"; {remained} remained (bound hit)" if remained else ""),
+        flush=True,
+    )
+    return outcome
 
 
 async def _thermal_poll_loop(state: "ServerState", *, interval_s: float = 1.0) -> None:
@@ -15955,6 +16624,26 @@ def _stream_heartbeat_payload(
         "elapsed_s": max(0.0, float(now_s) - float(stream_started_s)),
         "seconds_since_last_token": max(0.0, float(now_s) - float(last_activity_s)),
     }
+
+
+def _sse_keepalive_interval_s() -> float | None:
+    """Interval for pre-first-token SSE comment heartbeats (#358); None = off.
+
+    MTPLX_SSE_HEARTBEAT=0 disables the comments; MTPLX_SSE_HEARTBEAT_INTERVAL_S
+    overrides the cadence (clamped to >= 1s; unparseable values fall back to
+    the default). Read at stream start — cheap, and tunable without a daemon
+    restart.
+    """
+    if not _env_bool_setting("MTPLX_SSE_HEARTBEAT", default=True):
+        return None
+    raw = os.environ.get("MTPLX_SSE_HEARTBEAT_INTERVAL_S")
+    if raw is None:
+        return SSE_KEEPALIVE_DEFAULT_INTERVAL_S
+    try:
+        interval_s = float(raw)
+    except ValueError:
+        return SSE_KEEPALIVE_DEFAULT_INTERVAL_S
+    return max(SSE_KEEPALIVE_MIN_INTERVAL_S, interval_s)
 
 
 @contextmanager
@@ -16723,6 +17412,9 @@ PUBLIC_MTPLX_STATS_KEYS = (
     # quiet envelopes stay byte-stable.
     "tool_calls_truncated_by_length",
     "raw_tool_markup_suppressed",
+    # Stamped only when a suppressed (unexecuted) tool call got its visible
+    # truth notice (#349), so quiet envelopes stay byte-stable.
+    "unexecuted_tool_call_notice",
     "legacy_bridge_used",
     "hidden_generation_repair_used",
     "early_tool_cancel_used",
@@ -25218,6 +25910,14 @@ def create_app(state: ServerState) -> FastAPI:
             bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
         if _memory_pressure_guard_enabled():
             bg_tasks.append(asyncio.create_task(_memory_pressure_loop(state)))
+        if (
+            _idle_pump_enabled()
+            and getattr(state, "session_bank_cold_tier", None) is not None
+        ):
+            # Issue #290: guarantee SSD session-cache writes forward
+            # progress once the server goes request-idle (the persistence
+            # band otherwise starves behind any chaining idle occupant).
+            bg_tasks.append(asyncio.create_task(_idle_persistence_pump_loop(state)))
         retrieval = getattr(state, "retrieval", None)
         if retrieval is not None and retrieval.idle_timeout_s > 0:
             bg_tasks.append(asyncio.create_task(_retrieval_idle_loop(state)))
@@ -25234,6 +25934,15 @@ def create_app(state: ServerState) -> FastAPI:
                 pass
             for task in bg_tasks:
                 task.cancel()
+            # Issue #290: BEFORE the scheduler shutdown cancels queued
+            # futures, give pending SSD session-cache writes a bounded
+            # best-effort flush — a plain SIGTERM/Ctrl-C used to silently
+            # lose every entry still in flight, and the next boot paid a
+            # full re-prefill. Off-loop so a second Ctrl-C stays live.
+            try:
+                await asyncio.to_thread(_shutdown_flush_cold_writes, state)
+            except Exception:
+                pass
             mtp_batch_service = getattr(state, "mtp_batch_service", None)
             if mtp_batch_service is not None:
                 mtp_batch_service.shutdown()
@@ -25659,6 +26368,11 @@ def create_app(state: ServerState) -> FastAPI:
                 state,
                 "metal_memory_caps",
                 {"applied": False, "reason": "unavailable"},
+            ),
+            "memory_plan": (
+                state.memory_plan.to_dict()
+                if getattr(state, "memory_plan", None) is not None
+                else None
             ),
             "mlx_cache_limit": state.mlx_cache_limit_status,
             "mlx_runtime": state.mlx_runtime_status,
@@ -27812,6 +28526,7 @@ def create_app(state: ServerState) -> FastAPI:
                 latest_token_enqueue_s: float | None = None
                 next_silence_warn_s = stream_started_s + STREAM_SILENCE_WARN_S
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
+                sse_keepalive_interval_s = _sse_keepalive_interval_s()
 
                 def mark_sse_sent(chunk: str) -> str:
                     nonlocal last_sse_sent_s
@@ -29071,12 +29786,22 @@ def create_app(state: ServerState) -> FastAPI:
                     return f"data: {json.dumps(payload)}\n\n"
 
                 def error_chunk(exc: BaseException) -> str:
+                    if _is_allocation_failure(exc):
+                        # Shed caches + honest 507 instead of an anonymous
+                        # RuntimeError 500; the daemon stays up (#348).
+                        exc = _allocation_failure_http_exception(state, exc)
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
+                        error_code = (
+                            "insufficient_memory"
+                            if status_code == 507
+                            else type(exc).__name__
+                        )
                     else:
                         message = str(exc)
                         status_code = 500
+                        error_code = type(exc).__name__
                     payload = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
@@ -29088,7 +29813,7 @@ def create_app(state: ServerState) -> FastAPI:
                         **_openai_error_content(
                             message,
                             status_code=status_code,
-                            code=type(exc).__name__,
+                            code=error_code,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -29661,6 +30386,23 @@ def create_app(state: ServerState) -> FastAPI:
                                 yield mark_sse_sent("data: [DONE]\n\n")
                                 return
                             if (
+                                sse_keepalive_interval_s is not None
+                                and streamed_decode_started_s is None
+                                and not generation_future.done()
+                                and now_s - last_sse_sent_s
+                                >= sse_keepalive_interval_s
+                            ):
+                                # Pre-first-token liveness (#358): during long
+                                # prefills the only bytes so far are the role
+                                # delta, so strict client/proxy read-timeouts
+                                # see a dead wire. SSE comments are invisible
+                                # to parsers and cannot disturb chunk layout;
+                                # once decode starts, token cadence takes
+                                # over. At the default cadence (5s < 10s)
+                                # this also keeps the progress-chunk check
+                                # below idle until decode starts.
+                                yield mark_sse_sent(SSE_KEEPALIVE_COMMENT)
+                            if (
                                 not generation_future.done()
                                 and now_s - last_sse_sent_s
                                 >= STREAM_HEARTBEAT_INTERVAL_S
@@ -30073,6 +30815,68 @@ def create_app(state: ServerState) -> FastAPI:
                                     delta = {"content": fallback_visible_text}
                                     remember_stream_delta(delta)
                                     yield mark_sse_sent(delta_payload_chunk(delta))
+                                if (
+                                    extraction.status == "malformed_as_content"
+                                    and not assistant_tool_calls
+                                    and _tool_parse_counter_key(
+                                        extraction.malformed_reason
+                                        or "malformed_tool_call"
+                                    )
+                                    == "unknown_tool_name"
+                                ):
+                                    # #349 (stream twin of the non-stream
+                                    # fallback): a call to an undeclared tool
+                                    # was suppressed without executing — and a
+                                    # turn that was ONLY that call streamed no
+                                    # content at all. State the truth so the
+                                    # model self-corrects instead of believing
+                                    # the tool ran and returned nothing.
+                                    unknown_tool_notice = (
+                                        _unknown_tool_unexecuted_call_notice(
+                                            _unknown_tool_name_from_reason(
+                                                extraction.malformed_reason or ""
+                                            ),
+                                            _tool_names(tool_specs),
+                                        )
+                                    )
+                                    if unknown_tool_notice not in "".join(
+                                        history_content_chunks
+                                    ):
+                                        delta = {"content": unknown_tool_notice}
+                                        remember_stream_delta(delta)
+                                        yield mark_sse_sent(
+                                            delta_payload_chunk(delta)
+                                        )
+                                        stats["unexecuted_tool_call_notice"] = True
+                            elif (
+                                not tools_active
+                                and not read_only_force_answer_contract_active
+                                and not assistant_tool_calls
+                                and splitter.suppressed_tool_markup_chars > 0
+                            ):
+                                # #349 (stream twin of the non-stream #160
+                                # strip): the splitter suppressed no-tools
+                                # tool-call markup mid-stream, so the model's
+                                # call vanished with no output and no error.
+                                # Emit the truthful notice as the turn's last
+                                # content delta; remember_stream_delta puts it
+                                # in the committed history too, keeping the
+                                # session bank byte-identical with what the
+                                # client replays next turn.
+                                no_tools_notice = _no_tools_unexecuted_call_notice(
+                                    _tool_markup_call_names(raw_generated_text)
+                                )
+                                if no_tools_notice not in "".join(
+                                    history_content_chunks
+                                ):
+                                    delta = {"content": no_tools_notice}
+                                    remember_stream_delta(delta)
+                                    yield mark_sse_sent(delta_payload_chunk(delta))
+                                    stats["unexecuted_tool_call_notice"] = True
+                                    # Parity with the non-stream #160 strip,
+                                    # which stamps this on every no-tools
+                                    # suppression.
+                                    stats["raw_tool_markup_suppressed"] = True
                             if assistant_tool_calls:
                                 recovered_tool_preamble = getattr(
                                     splitter,
@@ -30910,6 +31714,19 @@ def create_app(state: ServerState) -> FastAPI:
                 display_text = _strip_mtplx_internal_continuation_markers(display_text)
                 fallback_reason = extraction.malformed_reason or "malformed_tool_call"
                 fallback_kind = _tool_parse_counter_key(fallback_reason)
+                if fallback_kind == "unknown_tool_name":
+                    # #349: a call to an undeclared tool was stripped from the
+                    # visible text without executing — a turn that was ONLY
+                    # that call came back as literal empty content. Replace
+                    # silence with the truth so the model self-corrects.
+                    display_text = _append_unexecuted_tool_notice(
+                        display_text,
+                        _unknown_tool_unexecuted_call_notice(
+                            _unknown_tool_name_from_reason(fallback_reason),
+                            _tool_names(tool_specs),
+                        ),
+                    )
+                    generated["stats"]["unexecuted_tool_call_notice"] = True
                 generated["stats"]["tool_parse_fallback"] = True
                 generated["stats"]["tool_parse_fallback_reason"] = fallback_reason
                 generated["stats"]["tool_parse_fallback_kind"] = fallback_kind
@@ -30946,6 +31763,7 @@ def create_app(state: ServerState) -> FastAPI:
                     # client cannot execute or parse (#160: small models
                     # answer "look it up" prompts with raw
                     # <tool_call><function=web_search> XML in the app chat).
+                    pre_strip_text = display_text
                     display_text, orphan_blocks = _strip_orphan_tool_markup(
                         display_text
                     )
@@ -30954,6 +31772,16 @@ def create_app(state: ServerState) -> FastAPI:
                         generated["stats"]["orphan_tool_markup_blocks"] = int(
                             orphan_blocks
                         )
+                        # #349: deleting the markup silently left the model
+                        # believing it ran a tool and got nothing back, and
+                        # left the user a blank reply. Say what happened.
+                        display_text = _append_unexecuted_tool_notice(
+                            display_text,
+                            _no_tools_unexecuted_call_notice(
+                                _tool_markup_call_names(pre_strip_text)
+                            ),
+                        )
+                        generated["stats"]["unexecuted_tool_call_notice"] = True
             if stop_sequences:
                 # Post-trim safety net for matches the incremental monitor
                 # cannot see (e.g. a stop string completed only by the
@@ -31176,6 +32004,12 @@ def create_app(state: ServerState) -> FastAPI:
                 generated: dict[str, Any] | None = None
                 stop_hit = False
                 owner_stall_probe = _OwnerStallProbe(deadline_s=STREAM_STALL_DEADLINE_S)
+                sse_keepalive_interval_s = _sse_keepalive_interval_s()
+                # This stream sends no bytes at all before the first text
+                # chunk, so "last byte sent" starts at the stream start and
+                # only the keep-alive comments below can advance it in the
+                # pre-first-token window (#358).
+                last_sse_sent_s = time.perf_counter()
 
                 def on_tokens(new_tokens: list[int]) -> None:
                     _raise_if_stream_cancelled(cancel_event)
@@ -31251,12 +32085,22 @@ def create_app(state: ServerState) -> FastAPI:
                     )
 
                 def error_chunk(exc: BaseException) -> str:
+                    if _is_allocation_failure(exc):
+                        # Shed caches + honest 507 instead of an anonymous
+                        # RuntimeError 500; the daemon stays up (#348).
+                        exc = _allocation_failure_http_exception(state, exc)
                     if isinstance(exc, HTTPException):
                         message = str(exc.detail)
                         status_code = exc.status_code
+                        error_code = (
+                            "insufficient_memory"
+                            if status_code == 507
+                            else type(exc).__name__
+                        )
                     else:
                         message = str(exc)
                         status_code = 500
+                        error_code = type(exc).__name__
                     payload = {
                         "id": response_id,
                         "object": "text_completion",
@@ -31266,7 +32110,7 @@ def create_app(state: ServerState) -> FastAPI:
                         **_openai_error_content(
                             message,
                             status_code=status_code,
-                            code=type(exc).__name__,
+                            code=error_code,
                         ),
                     }
                     return f"data: {json.dumps(payload)}\n\n"
@@ -31341,6 +32185,19 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                                 yield "data: [DONE]\n\n"
                                 return
+                            now_s = time.perf_counter()
+                            if (
+                                sse_keepalive_interval_s is not None
+                                and streamed_completion_tokens == 0
+                                and not generation_future.done()
+                                and now_s - last_sse_sent_s
+                                >= sse_keepalive_interval_s
+                            ):
+                                # Pre-first-token liveness (#358): see the
+                                # chat stream loop. Comments stop as soon as
+                                # the first token batch arrives.
+                                last_sse_sent_s = now_s
+                                yield SSE_KEEPALIVE_COMMENT
                             continue
                         if kind == "tokens":
                             streamed_completion_tokens += len(item)
@@ -31648,6 +32505,24 @@ def create_app(state: ServerState) -> FastAPI:
     @app.exception_handler(Exception)
     async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
         _record_tool_parse_event(state, event="openai_error_response")
+        if _is_allocation_failure(exc):
+            # Non-streaming lanes land here on a Metal allocation failure.
+            # Shed caches and answer with the honest 507 (same contract as
+            # the streaming error frame) instead of a redacted 500 — the
+            # user can act on "insufficient memory"; they cannot act on
+            # "internal server error" (#348).
+            http_exc = _allocation_failure_http_exception(state, exc)
+            logging.getLogger("mtplx.server").warning(
+                "allocation failure served as 507: %s", exc
+            )
+            return JSONResponse(
+                status_code=http_exc.status_code,
+                content=_openai_error_content(
+                    str(http_exc.detail),
+                    status_code=http_exc.status_code,
+                    code="insufficient_memory",
+                ),
+            )
         request_id = uuid.uuid4().hex[:12]
         # Full detail belongs in the server log, not the wire: exception
         # class + repr in client bodies got quoted verbatim by external

@@ -630,7 +630,10 @@ def _print_command_error(
     if detail:
         print(f"detail: {detail}")
     if error == "model is not available locally":
-        print(f"try: mtplx {command} --download --model {model}")
+        # `--download` only exists on `mtplx start`; every other command's
+        # download path is `mtplx pull` first (the old hint suggested a flag
+        # the parser rejects).
+        print(f"try: mtplx pull {model}")
         print("try: mtplx models")
 
 
@@ -742,6 +745,21 @@ def _apply_runtime_compatibility_mode(
                 "mtp_heads not found -> mtp_off: serving autoregressive "
                 "(no speculative decode acceleration; build an MTP artifact "
                 "with Forge for full speed)."
+            )
+            _set_generation_mode_on_args(args, GENERATION_MODE_AR)
+            setattr(args, "depth", 0)
+        setattr(args, "load_mtp", False)
+        return None
+    if runtime_compatibility == "native-ar-only-mtp-unsupported":
+        # Same directive, generalized 2026-08-26: an MTP head this build
+        # cannot attach (unsupported family, failed tensor gate, pending
+        # backend) is unavailable, never a blocker. The head is left
+        # untouched on disk; the trunk serves autoregressive.
+        if _generation_mode_from_args(args) != GENERATION_MODE_AR:
+            printer(
+                "MTP unavailable in this MTPLX build -> mtp_off: serving "
+                "autoregressive (trunk loads natively; speculative "
+                "acceleration for this model lands with a runtime update)."
             )
             _set_generation_mode_on_args(args, GENERATION_MODE_AR)
             setattr(args, "depth", 0)
@@ -1291,6 +1309,22 @@ def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
 def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
     descriptor = descriptor_from_inspection(inspection)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if _inspection_backend_id(inspection) == "qwen4_exp":
+        # Flash-Next verify defaults: the capture-commit verifier walks the
+        # qwen3-next GDN internals, which this family's own GDN classes do
+        # not expose — batched verify snapshots/restores the recurrent caches
+        # generically. A family-native capture backend replaces this default
+        # when it lands. Depth follows the family DraftSemantics ceiling (3)
+        # with the adaptive expected_value policy owning per-step depth —
+        # the 27B contract (founder, 2026-08-26); no static clamp here.
+        if "verify-strategy" not in cli_flags:
+            args.verify_strategy = "batched"
+        # Target + draft sampler flow from the qwen4_exp family policy
+        # (QWEN4_EXP_SAMPLER_DEFAULTS: the model-card thinking-mode set) via
+        # the standard sampler block below. The 08-27 draft-temp 0.1 receipt
+        # was measured at target 0.6 and is superseded by the advised
+        # target-1.0 contract; re-calibrate draft temp under target 1.0
+        # before pinning any non-identity value.
     # Family-aware policy, not the raw lane descriptor: shared lanes (mlx_lm_ar)
     # pin parser=none while a family on that lane (lfm2) has a verified codec.
     # Stamping the lane's "none" here reads as an operator override downstream

@@ -58,6 +58,29 @@ def test_version_token_refs_keep_the_family(ref: str) -> None:
 @pytest.mark.parametrize(
     "ref",
     [
+        "Qwen/Qwen3.8-Flash-Next",
+        "Qwen/Qwen3.8-Flash-Next-FP8",
+        "qwen3.8-flash-next",
+        "Qwen4-Preview",
+        "qwen4-moe",
+    ],
+)
+def test_next_generation_preview_refs_do_not_claim_the_version_family(ref: str) -> None:
+    # The Qwen4-generation previews carry "3.8" in their public names but
+    # are a different architecture generation with their own contract; the
+    # dense-27B qwen3_8 behavior contract must never claim them by name
+    # (the F21 collision class, pre-armed for the Flash-Next release).
+    assert (
+        model_family_from_inspection(
+            model_ref=ref, descriptor=QWEN3_NEXT_DESCRIPTOR
+        )
+        != "qwen3_8"
+    )
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
         "Qwen/Qwen3-8B",
         "qwen3-8b",
         "Qwen3-80B",

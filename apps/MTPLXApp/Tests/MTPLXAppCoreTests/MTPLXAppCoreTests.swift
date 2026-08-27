@@ -1685,6 +1685,9 @@ final class MTPLXAppCoreTests: XCTestCase {
     }
 
     func testCommandBuilderHermesPresetUsesFastSingleAgentLane() throws {
+        // Auto scheduling ("target-default") keeps Hermes on the measured
+        // single-agent latency lane. An explicit Settings Performance mode
+        // now overrides it (#325) — that case is pinned separately below.
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: [
             "PATH": fake.deletingLastPathComponent().path,
@@ -1694,13 +1697,7 @@ final class MTPLXAppCoreTests: XCTestCase {
             configuration: MTPLXAppConfiguration(
                 executablePath: fake.path,
                 model: "/models/qwen",
-                profile: "sustained",
-                schedulerMode: "ar_batch",
-                batchingPreset: "agent",
-                schedulingPreset: "agent",
-                maxActiveRequests: 4,
-                decodeBatchMax: 4,
-                batchWaitMs: 50
+                profile: "sustained"
             ),
             target: .hermes,
             launchID: "hermes-launch"
@@ -1733,6 +1730,125 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(command.environment["MTPLX_CLIENT"], "hermes")
         XCTAssertEqual(command.environment["MTPLX_VLLM_METAL_PAGED_GQA_SDPA_ROUTE"], "async_per_head")
         XCTAssertEqual(command.environment["MTPLX_SESSION_BANK_MAX_ENTRIES"], "32")
+    }
+
+    func testCommandBuilderHermesHonorsExplicitSchedulingPreset() throws {
+        // #325 contract: an explicit Settings Performance mode wins over
+        // the Hermes target preset; only Auto keeps the latency lane.
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: [
+            "PATH": fake.deletingLastPathComponent().path,
+            "MTPLX_APP_TEST_PHYSICAL_MEMORY_BYTES": "137438953472",
+        ])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained",
+                schedulerMode: "ar_batch",
+                batchingPreset: "agent",
+                schedulingPreset: "agent",
+                maxActiveRequests: 4,
+                decodeBatchMax: 4,
+                batchWaitMs: 50
+            ),
+            target: .hermes,
+            launchID: "hermes-agent-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "agent"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "50.0"]))
+        // The rest of the Hermes lane identity is untouched by the
+        // scheduling override.
+        XCTAssertTrue(command.arguments.containsInOrder(["--ssd-session-cache", "on"]))
+        XCTAssertEqual(command.environment["MTPLX_CLIENT"], "hermes")
+    }
+
+    // Issue #325: Settings -> Performance mode "Handle multiple at once"
+    // (scheduling_preset "throughput", max_active_requests 2 in
+    // settings.json) was silently discarded by the native Chat launch
+    // target — /health reported serial/solo/1 while the same saved
+    // settings launched ar_batch/throughput/2 under the "Other" target.
+    // An explicit Settings mode now wins on every serving target; the
+    // chat preset only fills the Auto case.
+    func testCommandBuilderChatHonorsExplicitThroughputSchedulingPreset() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained",
+                schedulerMode: "ar_batch",
+                batchingPreset: "throughput",
+                schedulingPreset: "throughput",
+                maxActiveRequests: 2
+            ),
+            target: .chat,
+            launchID: "chat-throughput-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "throughput"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "2"]))
+        // Knobs the user left unset fall to the throughput preset's own
+        // daemon defaults, exactly as they do for the "Other" target.
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "8"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "20.0"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--prefill-chunk-tokens", "2048"]))
+    }
+
+    func testCommandBuilderChatAutoKeepsSingleStreamSerialLane() throws {
+        // Auto ("target-default", no numeric overrides) keeps the chat
+        // preset byte-identical to the pre-#325 launch: solo serial MTP
+        // with no batching knobs on the argv.
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained"
+            ),
+            target: .chat,
+            launchID: "chat-auto-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "solo"]))
+        XCTAssertFalse(command.arguments.contains("--max-active-requests"))
+        XCTAssertFalse(command.arguments.contains("--decode-batch-max"))
+        XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
+        XCTAssertFalse(command.arguments.contains("--prefill-chunk-tokens"))
+    }
+
+    func testCommandBuilderOpenWebUIHonorsExplicitSchedulingPreset() throws {
+        // Web UI is chat's sibling single-stream surface and shared the
+        // same silent discard (#325); explicit Settings modes win there
+        // too, with unset knobs on the preset's daemon defaults.
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        let command = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained",
+                schedulerMode: "ar_batch",
+                batchingPreset: "agent",
+                schedulingPreset: "agent"
+            ),
+            target: .openWebUI,
+            launchID: "webui-agent-launch"
+        )
+
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "agent"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "50.0"]))
     }
 
     func testCommandBuilderBenchmarkPresetStartsSoloBenchmarkDaemon() throws {
@@ -2502,7 +2618,13 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
     }
 
-    func testCommandBuilderChatIgnoresExplicitBatchingOverrides() throws {
+    func testCommandBuilderChatHonorsExplicitAgentSchedulingOverrides() throws {
+        // Until #325 this pinned the opposite: chat silently discarded an
+        // explicit Settings scheduling preset and its numeric overrides.
+        // The Settings picker must never lie — explicit wins; only the
+        // legacy scheduler_mode pair without a scheduling_preset key (see
+        // testCommandBuilderChatPresetMigratesLegacyAgentPairToSolo)
+        // still resolves to the Auto lane.
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
         let command = try builder.buildServeCommand(
@@ -2520,14 +2642,18 @@ final class MTPLXAppCoreTests: XCTestCase {
             target: .chat
         )
 
-        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "solo"]))
-        XCTAssertFalse(command.arguments.contains("--max-active-requests"))
-        XCTAssertFalse(command.arguments.contains("--decode-batch-max"))
-        XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "agent"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "4"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "50.0"]))
     }
 
-    func testCommandBuilderOpenWebUIUsesAppOwnedSamplerButKeepsSoloScheduling() throws {
+    func testCommandBuilderOpenWebUIUsesAppOwnedSamplerAndHonorsExplicitScheduling() throws {
+        // Sampler and reasoning stay app-owned exactly as before; the
+        // scheduling half flipped with #325 — an explicit Settings
+        // throughput preset (plus explicit numeric overrides) now reaches
+        // the Web UI daemon instead of being silently reset to solo.
         let fake = try makeExecutable(named: "mtplx")
         let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
         let command = try builder.buildServeCommand(
@@ -2549,11 +2675,11 @@ final class MTPLXAppCoreTests: XCTestCase {
             target: .openWebUI
         )
 
-        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "serial"]))
-        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "solo"]))
-        XCTAssertFalse(command.arguments.contains("--max-active-requests"))
-        XCTAssertFalse(command.arguments.contains("--decode-batch-max"))
-        XCTAssertFalse(command.arguments.contains("--batch-wait-ms"))
+        XCTAssertTrue(command.arguments.containsInOrder(["--scheduler-mode", "ar_batch"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batching-preset", "throughput"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--max-active-requests", "8"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--decode-batch-max", "8"]))
+        XCTAssertTrue(command.arguments.containsInOrder(["--batch-wait-ms", "20.0"]))
         XCTAssertFalse(command.arguments.contains("--tool-prompt-mode"))
         XCTAssertTrue(command.arguments.containsInOrder(["--temperature", "1.0"]))
         XCTAssertTrue(command.arguments.containsInOrder(["--top-p", "1.0"]))
@@ -3746,6 +3872,44 @@ final class MTPLXAppCoreTests: XCTestCase {
         try Data([0]).write(to: model.appendingPathComponent("model.safetensors"))
         try Data([0]).write(to: mtp.appendingPathComponent("weights.safetensors"))
 
+        XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
+    }
+
+    func testModelInstallDetectionAcceptsThirdPartyRepoWithoutMTPLXBranding() throws {
+        // Issue #359: mtplx_runtime.json and the MTP sidecar are MTPLX
+        // branding, not load requirements — a byte-complete third-party
+        // repo (which never ships them) is a complete install and the
+        // engine serves it (AR when no MTP head can attach).
+        let root = temporaryDirectory()
+        let model = root.appendingPathComponent("Tiel-Coder-35B-A3B-MLX-oQ4e-MTP", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try "{}".write(to: model.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: model.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: model.appendingPathComponent("model.safetensors"))
+        try """
+        {"repo_id": "peculiar-ragdoll/Tiel-Coder-35B-A3B-MLX-oQ4e-MTP", "files": {"config.json": {}, "tokenizer.json": {}, "model.safetensors": {}}}
+        """.write(to: model.appendingPathComponent(".mtplx-source.json"), atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
+    }
+
+    func testModelInstallDetectionStillRequiresMarkerListedFiles() throws {
+        // True download completeness: a curated repo's source marker lists
+        // mtplx_runtime.json because the repo actually ships it — its
+        // absence is a genuinely incomplete download, not optional branding.
+        let root = temporaryDirectory()
+        let model = root.appendingPathComponent("Qwen3.8-27B-MTPLX-Optimized-Speed", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try "{}".write(to: model.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        try "{}".write(to: model.appendingPathComponent("tokenizer.json"), atomically: true, encoding: .utf8)
+        try Data([0]).write(to: model.appendingPathComponent("model.safetensors"))
+        try """
+        {"repo_id": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed", "files": {"config.json": {}, "tokenizer.json": {}, "model.safetensors": {}, "mtplx_runtime.json": {}}}
+        """.write(to: model.appendingPathComponent(".mtplx-source.json"), atomically: true, encoding: .utf8)
+
+        XCTAssertFalse(MTPLXModelOption.hasCompleteInstall(at: model.path))
+
+        try "{}".write(to: model.appendingPathComponent("mtplx_runtime.json"), atomically: true, encoding: .utf8)
         XCTAssertTrue(MTPLXModelOption.hasCompleteInstall(at: model.path))
     }
 
@@ -6926,6 +7090,160 @@ final class MTPLXAppCoreTests: XCTestCase {
         let toolMessage = try XCTUnwrap(chatMessages(in: secondRequest).first { $0["role"] as? String == "tool" })
         XCTAssertTrue((toolMessage["content"] as? String ?? "").contains("MTPLX_WEB_SINGLE_ROUND_0606"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: thirdRequestURL.path))
+    }
+
+    // Issue #349: a "tool_calls" finish that arrives past the round budget
+    // (here: the server ignores tool_choice "none" and emits another call)
+    // used to persist the calls with NO results — the replayed transcript
+    // then showed the model unanswered tool calls forever, which the model
+    // reports as "I invoke the tool, but I do not receive any result or
+    // output back". Every undispatched call must get a truthful, non-empty
+    // tool result in the persisted conversation.
+    @MainActor
+    func testUndispatchedToolCallsBeyondRoundBudgetGetNonEmptyResults() async throws {
+        let port = try freeTCPPort()
+        let root = temporaryDirectory()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = try makeExecutable(
+            named: "fake-dangling-tool-loop-stream",
+            body: """
+            #!/bin/sh
+            exec python3 -u - <<'PY'
+            import json
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            PORT = \(port)
+
+            def sse(payload):
+                return ("data: " + json.dumps(payload) + "\\n\\n").encode("utf-8")
+
+            class Handler(BaseHTTPRequestHandler):
+                count = 0
+
+                def log_message(self, *_args):
+                    return
+
+                def do_GET(self):
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+
+                def do_POST(self):
+                    if self.path != "/v1/chat/completions":
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                    self.rfile.read(length) if length else b"{}"
+                    Handler.count += 1
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+
+                    call_id = "call_fetch" if Handler.count == 1 else "call_term"
+                    name = "fetch_url" if Handler.count == 1 else "terminal"
+                    args = (
+                        "{\\"url\\":\\"https://example.com/release\\"}"
+                        if Handler.count == 1
+                        else "{\\"command\\":\\"ls ~/Dev\\"}"
+                    )
+                    self.wfile.write(sse({
+                        "id": "chatcmpl-dangling",
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+                    }))
+                    self.wfile.write(sse({
+                        "id": "chatcmpl-dangling",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": args},
+                                }],
+                            },
+                        }],
+                    }))
+                    self.wfile.write(sse({
+                        "id": "chatcmpl-dangling",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    }))
+                    self.wfile.write(b"data: [DONE]\\n\\n")
+                    self.wfile.flush()
+
+            ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+            PY
+            """
+        )
+        let process = Process()
+        process.executableURL = script
+        try process.run()
+        defer { process.terminate() }
+
+        let baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        let startupDeadline = Date().addingTimeInterval(5)
+        while Date() < startupDeadline {
+            if (try? await URLSession.shared.data(from: baseURL)) != nil {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        let container = try ChatStore.makeInMemoryContainer()
+        let chatClient = MTPLXChatClient(apiClient: MTPLXAPIClient(baseURL: baseURL))
+        let toolFactory = MTPLXChatToolFactory(
+            urlFetcher: URLFetcher(
+                transport: FixtureWebTransport(
+                    body: "<html><title>Release</title><body>MTPLX_DANGLING_349</body></html>"
+                ),
+                cache: URLFetchCache()
+            )
+        )
+        let viewModel = ChatViewModel(
+            container: container,
+            chatClientProvider: { chatClient },
+            toolFactory: toolFactory,
+            modelName: { "mtplx-test-model" }
+        )
+        _ = viewModel.createNewConversation()
+        viewModel.webSearchEnabled = true
+
+        viewModel.send("look at ~/Dev")
+
+        let finishedDeadline = Date().addingTimeInterval(5)
+        while Date() < finishedDeadline {
+            if !viewModel.isStreaming { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertFalse(viewModel.isStreaming)
+
+        // The round-2 "terminal" call was never dispatched (budget spent).
+        // It must still have a persisted, NON-EMPTY tool result.
+        let repaired = try XCTUnwrap(
+            viewModel.visibleMessages.first {
+                $0.role == .tool && $0.toolCallId == "call_term"
+            },
+            "no tool-result message persisted for the undispatched call"
+        )
+        XCTAssertFalse(
+            repaired.visibleContent
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+        XCTAssertTrue(repaired.visibleContent.contains("tool_not_executed"))
+
+        // And the NEXT request's payload replays that non-empty result for
+        // the call id — the exact surface the model reads.
+        let payload = ChatViewModel.buildRequestMessages(
+            from: viewModel.visibleMessages,
+            overrideLastUserContent: nil
+        )
+        let toolEntry = try XCTUnwrap(
+            payload.first { $0.role == "tool" && $0.toolCallId == "call_term" }
+        )
+        XCTAssertFalse((toolEntry.content ?? "").isEmpty)
     }
 
     @MainActor

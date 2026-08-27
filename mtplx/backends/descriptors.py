@@ -425,6 +425,27 @@ def draft_temperature_curve_for_model(
         descriptor=descriptor,
     )
     return DRAFT_TEMPERATURE_CURVES.get(family)
+# Qwen3.8-Flash-Next model-card best practices (thinking mode): temp 1.0,
+# top_p 0.95, top_k 20, min_p 0, presence/repetition neutral. Own constant so
+# later Flash-Next calibration never drifts the dense-27B contract.
+QWEN4_EXP_SAMPLER_DEFAULTS = SamplerDefaults(temperature=1.0, top_p=0.95, top_k=20)
+QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
+    request_field="depth",
+    display_label="Draft depth",
+    # Family law (founder, 2026-08-26): Flash-Next follows the 27B contract —
+    # ceiling 3 with the adaptive expected_value depth policy owning the
+    # effective per-step depth (the serving descriptor declares
+    # native_adaptive_depth_policy, so the CLI keeps adaptive_policy
+    # "expected_value"; depth here is the ceiling, not a static pin).
+    # Static-depth reference receipts (Bare pack, flight recorder, target
+    # 1.0): fixed D1 56.9 vs fixed D2 52.0 tok/s — those measured FIXED
+    # depth, not the adaptive policy. Adaptive-vs-static receipt owed in
+    # the serve battery before any further tune.
+    default=3,
+    minimum=1,
+    maximum=3,
+    unit="depth",
+)
 QWEN3_8_REASONING_CODEC = ReasoningCodec(
     parser="qwen3",
     display_name="Qwen think tags",
@@ -468,6 +489,8 @@ def sampler_defaults_for_model(
     )
     if family == "qwen3_8":
         return QWEN3_8_SAMPLER_DEFAULTS
+    if family == "qwen4_exp":
+        return QWEN4_EXP_SAMPLER_DEFAULTS
     return resolved.sampler_defaults
 
 
@@ -484,6 +507,8 @@ def draft_semantics_for_model(
     )
     if family == "qwen3_8":
         return QWEN3_8_DRAFT_SEMANTICS
+    if family == "qwen4_exp":
+        return QWEN4_EXP_DRAFT_SEMANTICS
     return resolved.draft_semantics
 
 
@@ -652,6 +677,28 @@ NATIVE_CONTRACT_DESCRIPTOR = BackendDescriptor(
     ),
     kv_quant_policy=KVQuantPolicy(supported=False),
     status="experimental_contract_gated",
+)
+
+
+# Nemotron-H and MiMo run the one-step MTP contract: their mtp_forward
+# rejects mtp_depth > 1 outright (mtplx/nemotron_h_mtp_patch.py,
+# mtplx/mimo_mtp_patch.py). The depth control every surface renders from
+# draft_semantics must not offer D2/D3 the backend will refuse, and the
+# server default must not resolve to a depth that raises (issue #341).
+# Distinct backend_id: serve startup rewrites args.backend_id to the
+# resolved descriptor's id, and that id must round-trip through
+# descriptor_for_backend_id without laundering the cap away.
+NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR = replace(
+    NATIVE_CONTRACT_DESCRIPTOR,
+    backend_id="native_mtp_single_step",
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=1,
+        minimum=1,
+        maximum=1,
+        unit="depth",
+    ),
 )
 
 
@@ -922,8 +969,11 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     DEEPSEEK_MTP_DESCRIPTOR.backend_id: DEEPSEEK_MTP_DESCRIPTOR,
     GLM_MTP_DESCRIPTOR.backend_id: GLM_MTP_DESCRIPTOR,
     HY_V3_MTP_DESCRIPTOR.backend_id: HY_V3_MTP_DESCRIPTOR,
-    "mimo_mtp": NATIVE_CONTRACT_DESCRIPTOR,
-    "nemotron_h_mtp": NATIVE_CONTRACT_DESCRIPTOR,
+    NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR.backend_id: (
+        NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR
+    ),
+    "mimo_mtp": NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR,
+    "nemotron_h_mtp": NATIVE_CONTRACT_SINGLE_STEP_DESCRIPTOR,
 }
 
 
@@ -984,8 +1034,17 @@ def _text_markers(model_ref: str | None, inspection: dict[str, Any] | None) -> s
 # parameter count, not a version, and must not claim the qwen3_8 family.
 _QWEN3_8_MARKER = re.compile(r"qwen3[._-]?8(?!\d*b)")
 
+# Qwen4-generation previews carry "3.8" in their public names
+# (Qwen3.8-Flash-Next) but are a different architecture generation with
+# their own sampler/reasoning contract; the dense-27B qwen3_8 behavior
+# contract must not claim them by name. They resolve to the generic default
+# descriptor until a dedicated qwen4 contract exists.
+_QWEN4_PREVIEW_MARKER = re.compile(r"flash[._-]?next|qwen[._-]?4")
+
 
 def _explicit_qwen_family_marker(text: str) -> str | None:
+    if _QWEN4_PREVIEW_MARKER.search(text):
+        return None
     if _QWEN3_8_MARKER.search(text):
         return "qwen3_8"
     if "qwen3.6" in text or "qwen3_6" in text or "qwen36" in text or "qwen3-6" in text:
@@ -1067,6 +1126,12 @@ def model_family_from_inspection(
         if descriptor is not None
         else backend_id_from_inspection(inspection)
     )
+    if backend_id == "qwen4_exp" or _QWEN4_PREVIEW_MARKER.search(text):
+        # Qwen4-generation preview (Qwen3.8-Flash-Next). Own family key so
+        # sampler/draft/reasoning policy never rides the dense-27B qwen3_8
+        # contract (#268 kept them apart by exclusion; this is the positive
+        # identity).
+        return "qwen4_exp"
     if backend_id == GEMMA4_ASSISTANT_DESCRIPTOR.backend_id or "gemma4" in text or "gemma-4" in text:
         return "gemma4"
     if backend_id == STEP3P5_MTP_DESCRIPTOR.backend_id or "step3p5" in text or "step3p7" in text or "step-3.7" in text:

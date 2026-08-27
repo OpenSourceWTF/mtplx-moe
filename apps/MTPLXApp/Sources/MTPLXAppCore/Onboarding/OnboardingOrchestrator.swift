@@ -120,10 +120,6 @@ public final class OnboardingOrchestrator: ObservableObject {
         tuneCandidatesLanded = [:]
     }
 
-    public func acknowledgeOtherWarning() {
-        state.hasAcknowledgedOtherWarning = true
-    }
-
     // MARK: - Hardware detection
 
     public func detectHardware() {
@@ -463,7 +459,7 @@ public final class OnboardingOrchestrator: ObservableObject {
                     isComplete: false,
                     statusMessage: "Incomplete"
                 )
-                downloadFailure = "Download finished, but the model folder is missing required MTPLX files. Press Retry to resume the Hugging Face download."
+                downloadFailure = "Download finished, but files the source repo ships are still missing from the model folder. Press Retry to resume the Hugging Face download."
                 isDownloading = false
                 return
             }

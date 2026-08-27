@@ -2121,6 +2121,30 @@ def test_step_descriptor_is_experimental_and_not_qwen_tune():
     )
 
 
+def test_single_step_mtp_backends_offer_depth_one_only():
+    """Nemotron-H and MiMo mtp_forward reject mtp_depth > 1, so the depth
+    control must not offer D2/D3 and the default must not resolve to a
+    depth the backend refuses (issue #341)."""
+
+    for backend_id in ("nemotron_h_mtp", "mimo_mtp"):
+        descriptor = openai.descriptor_for_backend_id(backend_id)
+        controls = openai.model_controls_for_descriptor(descriptor)
+
+        assert controls["draft_control"]["default"] == 1
+        assert controls["draft_control"]["minimum"] == 1
+        assert controls["draft_control"]["maximum"] == 1
+        assert controls["draft_control"]["value_labels"] == ["D1"]
+        # Serve startup rewrites args.backend_id to the resolved
+        # descriptor's id; the cap must survive that round-trip.
+        round_trip = openai.descriptor_for_backend_id(descriptor.backend_id)
+        assert round_trip.draft_semantics.maximum == 1
+        assert round_trip.draft_semantics.default == 1
+
+    # The generic native-contract lane keeps its multi-step range.
+    generic = openai.descriptor_for_backend_id("native_mtp")
+    assert generic.draft_semantics.maximum == 3
+
+
 def test_step_backend_chat_policy_injects_language_anchor():
     state = _fake_state()
     state.backend_descriptor = openai.descriptor_for_backend_id("step3p5_mtp")
@@ -4242,6 +4266,11 @@ def _stream_payloads(response_text: str) -> list[dict]:
         for line in response_text.splitlines()
         if line.startswith("data: {")
     ]
+
+
+def _sse_frames(response_text: str) -> list[str]:
+    """Non-empty SSE frames in wire order; comment frames start with ':'."""
+    return [frame for frame in response_text.split("\n\n") if frame.strip()]
 
 
 def _anthropic_events(response_text: str) -> list[tuple[str, dict]]:
@@ -11466,6 +11495,291 @@ def test_chat_stream_emits_heartbeat_during_alive_silence(monkeypatch):
     assert "data: [DONE]" in response.text
 
 
+def _slow_start_generation(text: str, *, delay_s: float):
+    """Streaming generation stub whose first token arrives after delay_s.
+
+    Stands in for a long silent prefill (#358): the stream loop polls an
+    empty token queue for the whole delay.
+    """
+    tokens = [ord(char) for char in text]
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        time.sleep(delay_s)
+        kwargs["token_callback"](tokens)
+        return {
+            "text": text,
+            "tokens": tokens,
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": len(tokens),
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(tokens),
+            "finish_reason": "stop",
+        }
+
+    return fake_run_generation
+
+
+def test_sse_keepalive_interval_env_parsing(monkeypatch):
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT", raising=False)
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", raising=False)
+    assert openai._sse_keepalive_interval_s() == 5.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "2.5")
+    assert openai._sse_keepalive_interval_s() == 2.5
+    # Clamp: sub-second intervals would spam the wire.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "0.2")
+    assert openai._sse_keepalive_interval_s() == 1.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "-3")
+    assert openai._sse_keepalive_interval_s() == 1.0
+    # Garbage falls back to the default instead of crashing the stream.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "garbage")
+    assert openai._sse_keepalive_interval_s() == 5.0
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "0")
+    assert openai._sse_keepalive_interval_s() is None
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "false")
+    assert openai._sse_keepalive_interval_s() is None
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "1")
+    monkeypatch.delenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", raising=False)
+    assert openai._sse_keepalive_interval_s() == 5.0
+
+
+def test_chat_stream_emits_sse_keepalive_before_first_token(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        # ~2.5s of pre-first-token silence spans at least two 1s keep-alive
+        # windows even on slow CI runners.
+        _slow_start_generation("ok\n", delay_s=2.5),
+    )
+
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "stream": True,
+                "max_tokens": 16,
+                "enable_thinking": False,
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    comment_indices = [
+        idx for idx, frame in enumerate(frames) if frame.startswith(":")
+    ]
+    content_indices = [
+        idx
+        for idx, frame in enumerate(frames)
+        if frame.startswith("data: {")
+        and json.loads(frame.removeprefix("data: "))["choices"][0]
+        .get("delta", {})
+        .get("content")
+    ]
+    assert comment_indices, response.text
+    assert frames[comment_indices[0]] == ": keep-alive"
+    assert content_indices, response.text
+    # Scope (#358): comments live only in the silent pre-first-token window.
+    assert comment_indices[-1] < content_indices[0]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "ok"
+    assert any(
+        payload["choices"][0].get("finish_reason") == "stop" for payload in payloads
+    )
+    assert "data: [DONE]" in response.text
+
+
+def test_chat_stream_sse_keepalive_kill_switch(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    # Same silent window that provably emits comments above, but disabled.
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT", "0")
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("ok\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "stream": True,
+                "max_tokens": 16,
+                "enable_thinking": False,
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    assert not [frame for frame in _sse_frames(response.text) if frame.startswith(":")]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "ok"
+    assert "data: [DONE]" in response.text
+
+
+def test_chat_stream_fast_start_emits_no_sse_keepalive(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation("OK"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "messages": [{"role": "user", "content": "Reply OK only."}],
+            "stream": True,
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+    assert not [frame for frame in _sse_frames(response.text) if frame.startswith(":")]
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        payload["choices"][0].get("delta", {}).get("content", "")
+        for payload in payloads
+    )
+    assert content == "OK"
+    assert "data: [DONE]" in response.text
+
+
+def test_completions_stream_emits_sse_keepalive_before_first_token(monkeypatch):
+    state = _fake_streaming_session_state()
+    client = TestClient(create_app(state))
+
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("alpha\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/completions",
+            json={"prompt": "count", "max_tokens": 8, "stream": True},
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    comment_indices = [
+        idx for idx, frame in enumerate(frames) if frame.startswith(":")
+    ]
+    text_indices = [
+        idx
+        for idx, frame in enumerate(frames)
+        if frame.startswith("data: {")
+        and json.loads(frame.removeprefix("data: "))["choices"][0].get("text")
+    ]
+    # The completions stream has no role-delta preamble at all, so without
+    # the comments the wire is byte-silent for the whole prefill (#358).
+    assert comment_indices, response.text
+    assert frames[comment_indices[0]] == ": keep-alive"
+    assert text_indices, response.text
+    assert comment_indices[-1] < text_indices[0]
+    texts = [
+        payload["choices"][0]["text"]
+        for payload in _stream_payloads(response.text)
+        if payload["choices"][0].get("text")
+    ]
+    assert texts == ["alpha\n"]
+    assert "data: [DONE]" in response.text
+
+
+def test_anthropic_messages_stream_forwards_sse_keepalive(monkeypatch):
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.generation_executor = ThreadPoolExecutor(max_workers=1)
+    client = TestClient(create_app(state))
+
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setenv("MTPLX_SSE_HEARTBEAT_INTERVAL_S", "1")
+    monkeypatch.setattr(
+        openai, "_run_generation", _slow_start_generation("ok\n", delay_s=2.5)
+    )
+
+    try:
+        response = client.post(
+            "/v1/messages",
+            headers={
+                "x-mtplx-cache-mode": "bypass",
+                "x-mtplx-allow-client-controls": "1",
+            },
+            json={
+                "model": "mtplx-test-model",
+                "max_tokens": 16,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Say ok."}],
+            },
+        )
+    finally:
+        state.generation_executor.shutdown(wait=True)
+
+    assert response.status_code == 200
+    frames = _sse_frames(response.text)
+    comment_indices = [
+        idx for idx, frame in enumerate(frames) if frame.startswith(":")
+    ]
+    delta_indices = [
+        idx
+        for idx, frame in enumerate(frames)
+        if frame.startswith("event: content_block_delta")
+    ]
+    # The Anthropic translation drops the inner progress frames, so the
+    # forwarded comments are the only pre-first-token bytes (#358).
+    assert comment_indices, response.text
+    assert frames[comment_indices[0]] == ": keep-alive"
+    assert delta_indices, response.text
+    assert comment_indices[-1] < delta_indices[0]
+    events = _anthropic_events(response.text)
+    event_names = [event for event, _payload in events]
+    assert event_names[0] == "message_start"
+    assert "content_block_delta" in event_names
+    assert "message_stop" in event_names
+    text = "".join(
+        payload.get("delta", {}).get("text", "")
+        for event, payload in events
+        if event == "content_block_delta"
+        and payload.get("delta", {}).get("type") == "text_delta"
+    )
+    assert "ok" in text
+
+
 def test_chat_tools_malformed_tool_call_falls_back_to_content(monkeypatch):
     state = _fake_state()
     state.args.stats_footer = False
@@ -13194,3 +13508,125 @@ def test_tool_prompt_mode_off_forces_native(monkeypatch):
     )
     assert mode == "hybrid"
     assert resolution["tool_prompt_mode_source"] == "backend:test"
+
+
+# ---------------------------------------------------------------------------
+# Memory governor (issue #305): the plan shapes the default window
+
+
+def _memory_plan_state_harness(monkeypatch):
+    """The standard fake-runtime ServerState harness, plus deterministic
+    plan inputs: flagship-sized weights and a monkeypatched machine RAM
+    (CI runners have 7-14 GB; the plan must not depend on the host)."""
+    monkeypatch.setattr(openai, "apply_profile_env", lambda _profile, **_kwargs: None)
+    monkeypatch.setattr(openai, "profile_env_status", lambda _profile, **_kwargs: {})
+    monkeypatch.setattr(openai, "_fast_path_env_status", lambda: {})
+    monkeypatch.setattr(openai, "_mlx_runtime_status", lambda: {"ok": True})
+    monkeypatch.setattr(
+        openai, "_configure_mlx_cache_limit", lambda _args: {"configured": False}
+    )
+    monkeypatch.setattr(
+        openai,
+        "load",
+        lambda model, mtp, contract, **_kwargs: SimpleNamespace(
+            model_path=Path(model),
+            mtp_enabled=mtp,
+            tokenizer=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(
+        openai, "_install_draft_lm_head", lambda *_args, **_kwargs: {"installed": True}
+    )
+    monkeypatch.setattr(openai, "_draft_head_identity", lambda _runtime: "draft-head")
+    monkeypatch.setattr(openai, "_template_hash", lambda _tokenizer: "template")
+    monkeypatch.setattr(
+        openai, "_resolve_context_window", lambda _tokenizer, _model: 262_144
+    )
+    monkeypatch.setattr(
+        openai, "EngineSessionManager", lambda **_kwargs: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        "mtplx.engine_session.model_weights_bytes", lambda _path: 21_313_949_792
+    )
+    monkeypatch.delenv("MTPLX_MEMORY_BUDGET", raising=False)
+    monkeypatch.delenv("MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT", raising=False)
+    monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
+    monkeypatch.delenv("MTPLX_PAGED_KV_QUANT", raising=False)
+
+
+def test_server_state_memory_plan_shapes_the_default_window(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 48 * 1024**3
+    )
+    args = parse_args(["--model", "models/example", "--warmup-tokens", "0"])
+    state = openai.ServerState(args)
+    # 36G engine budget - 19.85G weights - transients - bank floor:
+    # 196,608 tokens is what actually fits a 48G Mac at full-window KV.
+    assert state.context_window == 196_608
+    assert state.memory_plan.available
+    assert state.memory_plan.context_machine_bound
+    out = capsys.readouterr().out
+    assert "[5/6] Memory plan: 48G Mac" in out
+    assert "machine-bound" in out
+
+
+def test_server_state_explicit_window_wins_but_is_flagged(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 48 * 1024**3
+    )
+    args = parse_args(
+        [
+            "--model",
+            "models/example",
+            "--warmup-tokens",
+            "0",
+            "--context-window",
+            "262144",
+        ]
+    )
+    state = openai.ServerState(args)
+    # Explicit user choice is never refused (no strangling) ...
+    assert state.context_window == 262_144
+    # ... but the plan says exactly what it costs.
+    assert state.memory_plan.context_overcommitted
+    out = capsys.readouterr().out
+    assert "OVERCOMMITTED" in out
+    assert "exceeds the machine fit" in out
+
+
+def test_server_state_128g_machine_keeps_the_model_max_window(monkeypatch):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 128 * 1024**3
+    )
+    args = parse_args(["--model", "models/example", "--warmup-tokens", "0"])
+    state = openai.ServerState(args)
+    # The no-regression pin at the integration level: big machines see
+    # zero change from the governor.
+    assert state.context_window == 262_144
+    assert not state.memory_plan.context_machine_bound
+    assert state.memory_plan.bank_idle_max_bytes == 48 * 1024**3
+
+
+def test_server_state_memory_budget_simulates_the_small_seat(monkeypatch, capsys):
+    _memory_plan_state_harness(monkeypatch)
+    monkeypatch.setattr(
+        "mtplx.memory_plan.detect_total_ram_bytes", lambda: 128 * 1024**3
+    )
+    args = parse_args(
+        [
+            "--model",
+            "models/example",
+            "--warmup-tokens",
+            "0",
+            "--memory-budget",
+            "48G",
+        ]
+    )
+    state = openai.ServerState(args)
+    # A 128G dev box declaring --memory-budget 48G resolves the identical
+    # window a real 48G Mac gets — the whole 48G test story hangs on this.
+    assert state.context_window == 196_608
+    assert state.memory_plan.memory_budget_bytes == 48 * 1024**3

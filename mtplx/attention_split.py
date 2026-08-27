@@ -533,8 +533,15 @@ def _full_attention_layers(model: Any):
         if getattr(layer, "is_linear", False):
             continue
         attn = getattr(layer, "self_attn", None)
-        if attn is not None:
-            yield attn
+        if attn is None:
+            continue
+        # Modules whose attention semantics are not plain dense SDPA (e.g.
+        # the qwen4_exp QSA indexer mask) opt out class-side; hooking them
+        # would replace their __call__ with a rewrite that drops those
+        # semantics.
+        if getattr(attn, "_mtplx_generic_sdpa_rewrites_unsupported", False):
+            continue
+        yield attn
 
 
 def configure_split_full_attention(

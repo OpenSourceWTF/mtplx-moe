@@ -161,6 +161,23 @@ class ModelWorkScheduler:
         self._idle: deque[_WorkItem] = deque()
         self._persistence: deque[_WorkItem] = deque()
         self._persistence_coalesced = 0
+        # Idle-pump budget (issue #290): the persistence band is normally
+        # reachable only while the idle deque is COMPLETELY empty, so any
+        # self-chaining idle_postcommit occupant (each completion enqueues
+        # its successor 'idle_grace_s' in the future — the 2.8.2 background
+        # warm ladder ran exactly this shape for minutes after the last
+        # request) starves durability forever: at every decision point the
+        # idle deque is non-empty and every completion re-arms the quiet
+        # anchor. The server arms this budget only after it has observed
+        # REQUEST-level idleness for several seconds (no in-flight HTTP
+        # requests, none recently), which is a window where no foreground
+        # tail gap can exist — so an armed pump lets the persistence head
+        # bridge the not-yet-ready gaps of a background chain without
+        # reopening the 2026-08-06 tail-gap race. A ready idle item still
+        # wins, foreground always wins, and any foreground submission
+        # disarms the pump immediately.
+        self._persistence_pump_budget = 0
+        self._persistence_pumped = 0
         self._last_quiet_anchor_s = time.monotonic()
         self._sequence = 0
         self._shutdown = False
@@ -203,6 +220,34 @@ class ModelWorkScheduler:
         with self._condition:
             return len(self._foreground)
 
+    def persistence_pending(self) -> int:
+        """Queued (not running) durability items. Cheap: for the server's
+        idle pump tick, which must not build the full stats() dict."""
+        with self._condition:
+            return len(self._persistence)
+
+    def pump_persistence(self, *, budget: int = 1) -> bool:
+        """Open up to ``budget`` persistence slots through a busy idle band.
+
+        Issue #290 anti-starvation valve, deliberately NOT age-based (the
+        rejected max-defer valve raced the foreground tail gap): the CALLER
+        asserts server-level idleness — no in-flight requests and none for
+        several seconds — a state in which no latency-critical tail can be
+        pending. While armed, the persistence head may run in the gaps
+        where the idle deque holds only not-yet-ready items (a chaining
+        background occupant); a READY idle item still runs first, the
+        completion-anchored quiet grace still applies, and any foreground
+        submission disarms the remaining budget before it is admitted.
+        Returns True when at least one slot was armed."""
+        with self._condition:
+            if self._shutdown or not self._persistence:
+                return False
+            self._persistence_pump_budget = max(
+                self._persistence_pump_budget, min(int(budget), 8)
+            )
+            self._condition.notify_all()
+            return True
+
     def has_foreground_pending(self) -> bool:
         return self.foreground_pending() > 0
 
@@ -234,6 +279,8 @@ class ModelWorkScheduler:
                 "idle_pending": len(self._idle),
                 "persistence_pending": len(self._persistence),
                 "persistence_coalesced": self._persistence_coalesced,
+                "persistence_pump_budget": self._persistence_pump_budget,
+                "persistence_pumped": self._persistence_pumped,
                 "active_kind": self._active_kind,
                 "active_sequence": self._active_sequence,
                 "active_batch_key": self._active_batch_key,
@@ -430,6 +477,10 @@ class ModelWorkScheduler:
                 coalesce_key=coalesce_key,
             )
             if kind == "foreground":
+                # A request is arriving: its tail postcommit is imminent.
+                # Any armed idle-pump slot must not survive into that
+                # window (issue #290 valve; tail-gap fence intact).
+                self._persistence_pump_budget = 0
                 self._foreground.append(item)
             elif kind == "idle_persistence":
                 self._persistence.append(item)
@@ -537,13 +588,22 @@ class ModelWorkScheduler:
                     if self._idle[0].earliest_start_s - now <= 0:
                         return self._idle.popleft()
                     wait_until = self._idle[0].earliest_start_s
-                elif self._persistence:
-                    # Persistence runs only with NO queued postcommit, after
-                    # a quiet grace anchored to the last foreground/
-                    # postcommit COMPLETION. No age-based bypass: an item
-                    # queued during a foreground longer than any valve would
-                    # already be "overdue" at completion and would dequeue in
-                    # the few-ms gap before the tail postcommit arrives.
+                if self._persistence and (
+                    not self._idle or self._persistence_pump_budget > 0
+                ):
+                    # Persistence normally runs only with NO queued
+                    # postcommit, after a quiet grace anchored to the last
+                    # foreground/postcommit COMPLETION. No age-based bypass:
+                    # an item queued during a foreground longer than any
+                    # valve would already be "overdue" at completion and
+                    # would dequeue in the few-ms gap before the tail
+                    # postcommit arrives. The ONE exception is an armed
+                    # idle pump (issue #290): the server observed seconds
+                    # of request-level idleness — no tail gap can exist —
+                    # so the head may bridge the not-yet-ready gaps of a
+                    # self-chaining idle occupant (the 2.8.2 warm-ladder
+                    # starvation). A READY idle item was already taken
+                    # above; foreground submission zeroes the budget.
                     # Peek as a subexpression: binding the head to a local
                     # would keep a superseded item (and its snapshot
                     # closure) pinned by this parked frame until the next
@@ -553,8 +613,15 @@ class ModelWorkScheduler:
                         self._last_quiet_anchor_s + self.persistence_quiet_grace_s,
                     )
                     if now >= ready_at:
+                        if self._idle:
+                            # Pump-bridged pop: consume one armed slot.
+                            self._persistence_pump_budget -= 1
+                            self._persistence_pumped += 1
                         return self._persistence.popleft()
-                    wait_until = ready_at
+                    if wait_until is None:
+                        wait_until = ready_at
+                    else:
+                        wait_until = min(wait_until, ready_at)
                 if wait_until is not None:
                     self._condition.wait(timeout=max(0.0, wait_until - now))
                     continue

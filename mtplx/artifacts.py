@@ -900,6 +900,11 @@ def _mtp_pattern_from_config(config: dict[str, Any]) -> str | None:
     raw = (
         tcfg.get("mtp_hybrid_override_pattern")
         or config.get("mtp_hybrid_override_pattern")
+        # Official NVIDIA Nemotron-H configs describe the MTP stack as a
+        # block-type name list; it must outrank the backbone-wide fallback
+        # keys or the backbone pattern shadows the MTP stack (issue #341).
+        or tcfg.get("mtp_layers_block_type")
+        or config.get("mtp_layers_block_type")
         or tcfg.get("hybrid_override_pattern")
         or config.get("hybrid_override_pattern")
         or tcfg.get("layers_block_type")

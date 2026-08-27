@@ -4,6 +4,94 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Streaming endpoints (`/v1/chat/completions`, `/v1/completions`,
+  `/v1/messages`) emit a `: keep-alive` SSE comment every 5 seconds
+  while a stream is still silent before its first token (#358). Long
+  prefills — minutes at 32k+ prompts — previously put zero liveness
+  bytes on the wire, so strict client/proxy read-timeouts (Claude
+  Code, Cursor, Open WebUI, nginx, cloudflared) dropped the
+  connection mid-compute. SSE comments are ignored by every compliant
+  parser; once tokens flow the comments stop. Disable with
+  `MTPLX_SSE_HEARTBEAT=0`; tune the cadence with
+  `MTPLX_SSE_HEARTBEAT_INTERVAL_S` (minimum 1s).
+- **Machine memory governor** (issue #305). MTPLX now plans its memory
+  against the Mac it is actually on instead of assuming a 128 GB studio
+  machine. At startup the serve banner prints the machine plan (engine
+  budget, weights, resolved context window, session-bank budget); the
+  default context window is the largest one whose full-window KV really
+  fits (a 48 GB Mac serving the Speed model defaults to 196,608 tokens
+  instead of a physically impossible 262,144 — 128 GB machines are
+  unchanged), and an explicit `--context-window` above the fit still wins
+  but is flagged loudly. The session bank stays idle-aggressive and
+  yields dynamically as a long-context request's KV materializes, ahead
+  of any swap; macOS pressure and an earlier allocator-relative signal
+  drive the existing shedding guard. `/health`, the dashboard snapshot
+  and the app carry `memory_plan`, guard events, and a pressure banner.
+  `--memory-budget 48G` reproduces a real 48 GB seat exactly (test-pinned).
+- **Streaming SSD spill for large sessions** (issues #305, #323). Sessions
+  above the per-session RAM cap — exactly the 100k+-token coding-agent
+  sessions whose re-prefill costs minutes — now persist to the SSD tier
+  through a tensor-by-tensor streaming writer (bounded memory, same
+  on-disk format), instead of silently losing durability. Live-ref-only
+  sessions reach the SSD tier for the first time; every remaining skip is
+  recorded, never silent.
+
+### Fixed
+
+- **Unexecuted tool calls are no longer silently swallowed** (#349). A
+  fresh-install user asking the built-in chat about their files saw the
+  model "invoke" tools (`ls`, `find`, `search_files`, `read_file`) and
+  get nothing back — no output, no error — because the server deleted
+  dead tool-call markup from no-tools responses (#160) and from
+  undeclared-tool fallbacks without telling anyone. Suppressed calls
+  now leave a short, visible notice naming the tool and stating that
+  nothing ran, this chat has no file/terminal access, and a coding
+  agent (Claude Code, OpenCode, Hermes) connected to MTPLX provides
+  it. The model reads the same notice in its history and stops
+  claiming it ran tools; the reply is never blank. Code-fenced tool
+  syntax examples are untouched, and `mtplx_stats` gains
+  `unexecuted_tool_call_notice` for triage. The macOS app also
+  persists a truthful `tool_not_executed` result for any tool call
+  that finishes past the chat's tool-round budget, so replayed
+  transcripts never show the model an unanswered tool call.
+- **SSD session-cache writes no longer starve on an idle server, and
+  shutdown flushes them** (issue #290). The scheduler's durability lane
+  was only reachable while the idle band was completely empty, so any
+  self-chaining background occupant (the background warm ladder) could
+  hold SSD writes off forever — entries sat in RAM with every cold-tier
+  counter at zero and vanished on restart, costing a full re-prefill.
+  The server now pumps the durability lane within seconds of going
+  request-idle (foreground work still always wins, and the pump disarms
+  the moment a request arrives), and a plain SIGTERM/Ctrl-C gives
+  pending writes a bounded best-effort flush (default 10 s,
+  `MTPLX_SHUTDOWN_SSD_FLUSH_S` overrides, `0` disables) with one honest
+  console line — including the write the SSD writer thread already has
+  in flight, which the old shutdown killed mid-file.
+- Metal allocation failures are answered as structured
+  `insufficient_memory` (HTTP 507) errors with actionable advice, after
+  the engine sheds its caches — instead of anonymous `internal_error`
+  500s that left the next request to hit the same wall (issue #348 class).
+- `--memory-budget 48G` (the bare-suffix spelling MTPLX's own messages
+  advertise) crashed serve startup with a raw ValueError; single-letter
+  and terabyte size suffixes parse now.
+- The dashboard "RAM session cache" settings no longer invent `8G/4G`
+  when nothing is configured — they report the budgets the engine
+  actually resolved.
+- The update dialog's release notes are readable in dark mode (#367).
+  The generated notes page now declares `color-scheme: light dark` and
+  pairs each appearance with readable text colors instead of shipping a
+  light-only stylesheet that Sparkle's dark update window rendered as
+  near-black-on-dark. The release script and the Sparkle rehearsal kit
+  render through one shared template
+  (`scripts/render_release_notes.py`), so the rehearsal now shows the
+  exact page users get and the two can no longer drift apart.
+  Notes pages already published under mtplx.com/releases/notes/ need a
+  one-time re-render and re-upload to pick this up.
+
 ## [2.9.3] - 2026-08-26
 
 ### Fixed

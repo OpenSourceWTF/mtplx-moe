@@ -622,18 +622,6 @@ struct ModelPickStep: View {
                     .foregroundStyle(Brand.typeTertiary)
                     .padding(.leading, 20)
             }
-            if probe.verdict == .noMTP {
-                Toggle(isOn: Binding(
-                    get: { orchestrator.state.hasAcknowledgedOtherWarning },
-                    set: { newValue in if newValue { orchestrator.acknowledgeOtherWarning() } }
-                )) {
-                    Text("Continue anyway - I know it'll be slower")
-                        .font(.caption)
-                        .foregroundStyle(Brand.typeSecondary)
-                }
-                .toggleStyle(.checkbox)
-                .padding(.leading, 20)
-            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -684,7 +672,9 @@ struct ModelPickStep: View {
         switch verdict {
         case .ready: return ("checkmark.circle.fill", Brand.success)
         case .missingSidecar: return ("exclamationmark.triangle.fill", Brand.warning)
-        case .noMTP: return ("xmark.octagon.fill", Brand.danger)
+        // MTP unavailable is informational (the model still runs, AR),
+        // so it wears the warning treatment, never the blocked one.
+        case .noMTP: return ("info.circle.fill", Brand.warning)
         case .probeFailed: return ("wifi.exclamationmark", Brand.danger)
         }
     }

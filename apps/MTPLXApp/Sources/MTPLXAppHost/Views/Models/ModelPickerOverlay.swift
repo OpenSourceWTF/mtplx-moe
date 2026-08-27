@@ -60,7 +60,6 @@ struct ModelPickerOverlay: View, Equatable {
     @State private var addRowExpanded: Bool = false
     @State private var customRepoInput: String = ""
     @State private var customProbe: OtherModelProbe? = nil
-    @State private var customNoMTPAcknowledged: Bool = false
     @State private var checkingCustomRepo: Bool = false
     @State private var preparedRows: [ModelPickerPreparedOption] = []
     @State private var preparedRowsSignature: ModelPickerCatalogSignature?
@@ -322,7 +321,6 @@ struct ModelPickerOverlay: View, Equatable {
                 withAnimation(motionEnabled ? .spring(response: 0.30, dampingFraction: 0.86) : nil) {
                     addRowExpanded.toggle()
                     customProbe = nil
-                    customNoMTPAcknowledged = false
                     errorMessage = nil
                 }
                 if addRowExpanded {
@@ -428,7 +426,6 @@ struct ModelPickerOverlay: View, Equatable {
                     )
                     .onChange(of: customRepoInput) { _, _ in
                         customProbe = nil
-                        customNoMTPAcknowledged = false
                         errorMessage = nil
                     }
                     .onSubmit { checkAndAddCustomModel() }
@@ -465,11 +462,7 @@ struct ModelPickerOverlay: View, Equatable {
                 .animation(motionEnabled ? .smooth(duration: 0.16) : nil, value: canSubmit)
             }
             if let probe = customProbe {
-                CustomModelProbeRow(
-                    probe: probe,
-                    acknowledgedNoMTP: $customNoMTPAcknowledged,
-                    onAddAnyway: { addCustomModel(repoID: probe.hfRepo) }
-                )
+                CustomModelProbeRow(probe: probe)
             }
         }
         .padding(.horizontal, 14)
@@ -558,12 +551,12 @@ struct ModelPickerOverlay: View, Equatable {
                 checkingCustomRepo = false
                 customProbe = result
                 switch result.verdict {
-                case .ready, .missingSidecar:
+                case .ready, .missingSidecar, .noMTP:
+                    // MTP unavailable is informational, never a gate
+                    // (founder directive 2026-08-26): the engine serves
+                    // MTP-less checkpoints autoregressive, so the app adds
+                    // them exactly like the CLI runs them.
                     addCustomModel(repoID: result.hfRepo)
-                case .noMTP:
-                    if customNoMTPAcknowledged {
-                        addCustomModel(repoID: result.hfRepo)
-                    }
                 case .probeFailed:
                     break
                 }
@@ -590,7 +583,6 @@ struct ModelPickerOverlay: View, Equatable {
                     applyingModelID = nil
                     customRepoInput = ""
                     customProbe = nil
-                    customNoMTPAcknowledged = false
                     addRowExpanded = false
                     presented = false
                 }
@@ -732,7 +724,6 @@ struct ModelPickerOverlay: View, Equatable {
     private func runExitChoreography() {
         addRowExpanded = false
         customProbe = nil
-        customNoMTPAcknowledged = false
         checkingCustomRepo = false
         customRepoFocused = false
         OverlayChoreography.runExit(
@@ -941,8 +932,6 @@ private struct ModelRowView: View {
 
 private struct CustomModelProbeRow: View {
     let probe: OtherModelProbe
-    @Binding var acknowledgedNoMTP: Bool
-    let onAddAnyway: () -> Void
 
     var body: some View {
         let (symbol, color) = icon
@@ -963,25 +952,6 @@ private struct CustomModelProbeRow: View {
                     .foregroundStyle(Brand.typeTertiary)
                     .padding(.leading, 20)
             }
-            if probe.verdict == .noMTP {
-                HStack(alignment: .center, spacing: 10) {
-                    Toggle(isOn: $acknowledgedNoMTP) {
-                        Text("Add anyway without the speed boost")
-                            .font(.caption)
-                            .foregroundStyle(Brand.typeSecondary)
-                    }
-                    .toggleStyle(.checkbox)
-                    Spacer(minLength: 8)
-                    Button("Add") {
-                        onAddAnyway()
-                    }
-                    .font(.system(size: 11, weight: .semibold))
-                    .buttonStyle(.plain)
-                    .foregroundStyle(acknowledgedNoMTP ? Brand.typeBody : Brand.typeTertiary)
-                    .disabled(!acknowledgedNoMTP)
-                }
-                .padding(.leading, 20)
-            }
         }
         .padding(10)
         .background(
@@ -1000,8 +970,10 @@ private struct CustomModelProbeRow: View {
             return ("checkmark.circle.fill", Brand.success)
         case .missingSidecar:
             return ("exclamationmark.triangle.fill", Brand.warning)
+        // MTP unavailable is informational (the model still runs, AR),
+        // so it wears the warning treatment, never the blocked one.
         case .noMTP:
-            return ("xmark.octagon.fill", Brand.danger)
+            return ("info.circle.fill", Brand.warning)
         case .probeFailed:
             return ("wifi.exclamationmark", Brand.danger)
         }

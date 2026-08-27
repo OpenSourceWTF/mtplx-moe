@@ -151,7 +151,9 @@ struct MTPLXApp: App {
             if benchmarkOrchestrator.runID != nil || benchmarkOrchestrator.state.isLive {
                 await benchmarkOrchestrator.cancel(reason: "app_stop_all:\(reason)")
             }
-            await viewModel.cancel()
+            // Every conversation's in-flight turn, not just the visible
+            // one — chat turns are per-conversation since issue #324.
+            await viewModel.cancelAllTurns()
             await backend.stopDaemon()
             await hermesAgentStore.stop()
         }

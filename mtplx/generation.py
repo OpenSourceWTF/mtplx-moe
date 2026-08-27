@@ -886,6 +886,27 @@ def _sustained_prefill_layout() -> str:
 _DENSE_AUTO_ANNOUNCED = False
 
 
+def _memory_budget_env_bytes() -> int:
+    """MTPLX_MEMORY_BUDGET as plain bytes; 0 when unset/unparseable.
+
+    The server normalizes the flag to plain bytes before generation runs;
+    the suffix forms (48G / 48GiB) exist for direct env users.
+    """
+    raw = (os.environ.get("MTPLX_MEMORY_BUDGET") or "").strip()
+    if not raw:
+        return 0
+    text = raw.lower().removesuffix("ib").removesuffix("b")
+    scale = 1
+    if text and text[-1] in "kmgt":
+        scale = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[text[-1]]
+        text = text[:-1]
+    try:
+        value = int(float(text) * scale)
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
+
+
 def _dense_decode_max_context() -> int:
     """Context ceiling for the contiguous-dense-decode layout (tokens).
 
@@ -915,6 +936,13 @@ def _dense_decode_max_context() -> int:
             total_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         except (ValueError, OSError, AttributeError):
             return 131072
+        # --memory-budget scales the whole cache stack down with one knob
+        # (its documented contract); without this line a 48G seat simulated
+        # on a 128G box would keep the 128G dense ceiling and the
+        # simulation would not match a real 48G Mac.
+        budget = _memory_budget_env_bytes()
+        if budget > 0:
+            total_ram = min(total_ram, budget)
         budget_tokens = int(total_ram * ram_fraction / 100) // bytes_per_token
         window = _env_int("MTPLX_CONTEXT_WINDOW_TOKENS", 0)
         if window > 0:
@@ -4437,6 +4465,39 @@ def _sample_from_logits(
     return sample_from_distribution(probs, rng), probs
 
 
+def _mx_lazy_sample(row: mx.array, config: SamplerConfig, key: mx.array) -> mx.array:
+    """Device-side shaped sampling (temp -> top-k -> top-p -> categorical)
+    returning a LAZY scalar token array — the pipelined-AR lane's sampler.
+
+    Shaping is distribution-identical to the CPU sampler; the randomness
+    stream is mx.random keyed from the request seed instead of the numpy
+    generator, so runs stay deterministic per seed but the streams differ.
+    Callers gate on temperature > 0 and 1 < top_k < vocab.
+
+    The top-k selection runs on the model dtype (half the bytes over the
+    248k vocab); only the k survivors are cast to fp32 for temperature,
+    top-p and the draw — bf16 argpartition ranks by value exactly.
+    """
+    k = int(config.top_k or 0)
+    top_idx = mx.argpartition(-row, kth=k - 1)[:k]
+    logits = mx.take(row, top_idx).astype(mx.float32) * (
+        1.0 / max(float(config.temperature), 1e-6)
+    )
+    top_vals = logits
+    top_p = float(config.top_p or 1.0)
+    if 0.0 < top_p < 1.0:
+        order = mx.argsort(-top_vals)
+        sv = mx.take(top_vals, order)
+        sp = mx.softmax(sv)
+        # nucleus keep-rule incl. the first probability that crosses top_p
+        keep_n = mx.maximum(mx.sum((mx.cumsum(sp) - sp) < top_p), 1)
+        sv = mx.where(mx.arange(k) < keep_n, sv, mx.array(float("-inf")))
+        local = mx.random.categorical(sv[None], key=key)[0]
+        return mx.take(top_idx, mx.take(order, local))
+    local = mx.random.categorical(top_vals[None], key=key)[0]
+    return mx.take(top_idx, local)
+
+
 def _greedy_draft_token_and_top2(logits: mx.array) -> tuple[int, float, float]:
     """Materialize one greedy token and its FP32 top-two values together."""
 
@@ -5947,7 +6008,147 @@ def generate_ar(
                         token_callback(released)
         emit_trace()
 
-    for step in range(max_tokens):
+    # ---- Pipelined AR lane (MTPLX_AR_PIPELINE) ---------------------------
+    # Software pipeline over the decode stream: sampling runs INSIDE the lazy
+    # graph (_mx_lazy_sample), so step k+1's graph is built on step k's
+    # still-lazy sampled token while the GPU executes step k. A token's KV is
+    # only ever written by the forward that consumes it, and only committed
+    # tokens are consumed — the cache never runs ahead of the committed
+    # sequence, so there is no rollback machinery. Guards observe at commit
+    # (lag <= 1 step); when one arms, the lane drains into the classic loop
+    # with its exact entry invariant (logits row + cache both at the last
+    # committed token). Engages only on models that publish
+    # set_ar_pipeline_mode (qwen4_exp: staging off + in-graph mmap gathers).
+    _lane_committed = 0
+    _lane_finished = False
+    _lane_cache_has_final = False
+    _lane_final_row: mx.array | None = None
+    _lane_mode_off = None
+    if (
+        _env_truthy("MTPLX_AR_PIPELINE")
+        and constraint is None
+        and float(sampler.temperature) > 0
+        and 1 < int(sampler.top_k or 0) < 4096
+        and not sampler.presence_penalty
+        and not sampler.frequency_penalty
+        and max_tokens > 2
+    ):
+        _set_lane_mode = getattr(rt.model, "set_ar_pipeline_mode", None)
+        if callable(_set_lane_mode) and _set_lane_mode(True):
+            _lane_mode_off = _set_lane_mode
+    if _lane_mode_off is not None:
+        try:
+            events.append({"ar_pipeline": True})
+            _lane_key = mx.random.key(int(seed) & 0x7FFFFFFF)
+            token, _ = _sample_from_logits(logits[0], sampler, rng)
+            tokens.append(token)
+            emit_token(token)
+            events.append({"step": 0, "token": token})
+            _lane_committed = 1
+            if _is_stop(token, stop_token_ids) or max_tokens <= 1:
+                _lane_finished = True
+            else:
+
+                def _lane_step(tok_lazy: mx.array) -> tuple[mx.array, mx.array]:
+                    nonlocal _lane_key
+                    _lane_key, sub = mx.random.split(_lane_key)
+                    with attention_phase("ar_decode"):
+                        out = rt.forward_ar(tok_lazy.reshape(1, 1), cache=cache)
+                    row = out[:, -1, :]
+                    nxt = _mx_lazy_sample(row[0], sampler, sub)
+                    return row, nxt
+
+                started = time.perf_counter()
+                row_lazy, tok_lazy = _lane_step(mx.array([token]))
+                mx.async_eval(tok_lazy)
+                target_forward_graph_time += time.perf_counter() - started
+                while True:
+                    built = time.perf_counter()
+                    row_next, tok_next = _lane_step(tok_lazy)
+                    mx.async_eval(tok_next)
+                    build_elapsed = time.perf_counter() - built
+                    target_forward_graph_time += build_elapsed
+                    waited = time.perf_counter()
+                    v = int(tok_lazy.item())
+                    wait_elapsed = time.perf_counter() - waited
+                    target_eval_time += wait_elapsed
+                    target_decode_time += build_elapsed + wait_elapsed
+                    verify_calls += 1
+                    step = _lane_committed
+                    tokens.append(v)
+                    emit_token(v)
+                    events.append({"step": step, "token": v})
+                    _lane_committed += 1
+                    armed = False
+                    if _loop_guard is not None:
+                        _lg = _loop_guard.observe(tokens)
+                        if _lg is not None:
+                            events.append(
+                                {
+                                    "step": step,
+                                    "loop_guard": {
+                                        "transition": _lg,
+                                        "completion_tokens": len(tokens),
+                                        **_loop_guard.summary(),
+                                    },
+                                }
+                            )
+                        armed = armed or _loop_guard.armed
+                    if _thinking_guard is not None:
+                        _tg = _thinking_guard.observe(tokens)
+                        if _tg is not None:
+                            events.append(
+                                {
+                                    "step": step,
+                                    "thinking_guard": {
+                                        "transition": _tg,
+                                        "completion_tokens": len(tokens),
+                                        **_thinking_guard.summary(),
+                                    },
+                                }
+                            )
+                        armed = armed or _thinking_guard.steering_active
+                    repetition_result = _trim_repeated_suffix(tokens, repetition_config)
+                    if repetition_result is not None:
+                        events.append(
+                            {
+                                "step": step,
+                                "repetition_stop": {
+                                    "reason": "exact_repeated_token_suffix",
+                                    "block_tokens": repetition_result.block_tokens,
+                                    "repeats": repetition_result.repeats,
+                                    "trimmed_tokens": repetition_result.repeated_tokens,
+                                },
+                            }
+                        )
+                        _lane_finished = True
+                        break
+                    if _is_stop(v, stop_token_ids) or len(tokens) >= max_tokens:
+                        _lane_finished = True
+                        _lane_cache_has_final = True
+                        _lane_final_row = row_next
+                        break
+                    if armed:
+                        # Steering must shape the NEXT sample: hand the
+                        # classic loop its invariant (this row's graph also
+                        # committed v's cache entries).
+                        _eval(row_next)
+                        logits = row_next
+                        break
+                    row_lazy, tok_lazy = row_next, tok_next
+            if _env_truthy("MTPLX_AR_PIPELINE_DEBUG") and _lane_committed > 1:
+                n = max(_lane_committed - 1, 1)
+                print(
+                    f"[ar-lane] steps={n} build={target_forward_graph_time / n * 1e3:.2f}ms "
+                    f"wait={target_eval_time / n * 1e3:.2f}ms "
+                    f"per-step={target_decode_time / n * 1e3:.2f}ms",
+                    flush=True,
+                )
+        finally:
+            _lane_mode_off(False)
+
+    _classic_start = max_tokens if _lane_finished else _lane_committed
+    for step in range(_classic_start, max_tokens):
         if _loop_guard is not None:
             _guard_transition = _loop_guard.observe(tokens)
             if _guard_transition is not None:
@@ -6074,20 +6275,24 @@ def generate_ar(
     elapsed = time.perf_counter() - started_all
     final_state: GenerationFinalState | None = None
     if capture_final_state and tokens and repetition_result is None:
-        # The loop samples its final token and breaks before forwarding it,
-        # so the cache is one token short of the committed sequence. Extend
-        # it: the bank committer refuses final states whose token ids do not
-        # match the cache exactly.
+        # The classic loop samples its final token and breaks before
+        # forwarding it, so the cache is one token short of the committed
+        # sequence and must be extended here. The pipelined lane already
+        # consumed the final token (its logits row rode the in-flight graph),
+        # so extending again would double-append its KV — reuse the row.
         try:
-            with attention_phase("ar_decode"):
-                tail_result = rt.forward_ar(
-                    mx.array([[int(tokens[-1])]]),
-                    cache=cache,
-                    return_hidden=False,
+            if _lane_cache_has_final and _lane_final_row is not None:
+                tail_logits = _lane_final_row[:, None, :]
+            else:
+                with attention_phase("ar_decode"):
+                    tail_result = rt.forward_ar(
+                        mx.array([[int(tokens[-1])]]),
+                        cache=cache,
+                        return_hidden=False,
+                    )
+                tail_logits = (
+                    tail_result[0] if isinstance(tail_result, tuple) else tail_result
                 )
-            tail_logits = (
-                tail_result[0] if isinstance(tail_result, tuple) else tail_result
-            )
             _eval(tail_logits)
             final_state = GenerationFinalState(
                 final_trunk_cache=cache,

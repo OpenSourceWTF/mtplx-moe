@@ -15,7 +15,20 @@ BENCH_RE = re.compile(
     r"(python|mlx|mtplx|benchmark|mtp-depth|mtp1|verify-ratio|verify-profile|hf download)",
     re.IGNORECASE,
 )
-SELF_EXCLUDE_RE = re.compile(r"(rg -i|Codex|Electron|python -m server|bench-preflight|hermes_cli)")
+# /opt/sovereign/: the Pulse deep-tier operator prep keeps a long-lived
+# low-CPU python keeper (keep-amfi.py) resident; it is system prep, not a
+# benchmark, and flagging it deadlocks every deep-tier gated cell.
+SELF_EXCLUDE_RE = re.compile(
+    r"(rg -i|Codex|Electron|python -m server|bench-preflight|hermes_cli|/opt/sovereign/)"
+)
+# The Claude desktop app is the founder's permanent control plane on this
+# machine (founder ruling 2026-08-27): it is ALWAYS open, it renders the
+# very session that launches gated cells, and its UI spikes track the
+# controller's own output — so a heavy-CPU flag on it deadlocks every cell
+# forever (the app can never be quiet while the controller exists). It is
+# part of the baseline environment measurements ship into, not a rogue
+# hog. Physics gates (die temp, fans, power) still stand.
+CONTROL_PLANE_RE = re.compile(r"(Claude Helper|Claude\b|claude\b)")
 
 
 def _run(args: list[str]) -> tuple[int, str]:
@@ -93,7 +106,9 @@ def run_preflight(
     heavy = [
         row
         for row in top
-        if row["pid"] != current_pid and row["pcpu"] >= cpu_threshold
+        if row["pid"] != current_pid
+        and row["pcpu"] >= cpu_threshold
+        and not CONTROL_PLANE_RE.search(row["command"])
     ]
     active_bench = _active_bench_processes()
     power = _power_state()

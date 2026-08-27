@@ -13,7 +13,7 @@ import os
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable
 
@@ -472,6 +472,14 @@ class SessionBank:
         self.last_restore_source: str | None = None
         self.last_ssd_restore_s: float = 0.0
         self.last_prefix_diagnostic: dict[str, Any] | None = None
+        # Dynamic budget ceiling (memory_plan.bank_dynamic_ceiling): the
+        # bank takes all free memory while live KV is small and yields as a
+        # long-context request's KV actually materializes — the #305 fix's
+        # "guard that turns on". None (tests, CLI without a plan) keeps
+        # max_bytes as the only bound, byte-identical to legacy behavior.
+        self.dynamic_ceiling_fn: Callable[[], int] | None = None
+        self.last_dynamic_ceiling_bytes: int | None = None
+        self.dynamic_ceiling_errors: int = 0
 
     # Capability marker for generation: near_prefix_candidates accepts
     # min_restore_tokens so resident-duplicate eligibility mirrors the
@@ -484,6 +492,26 @@ class SessionBank:
     @property
     def total_nbytes(self) -> int:
         return sum(entry.nbytes for entry in self._entries.values())
+
+    def effective_max_bytes(self) -> int:
+        """The byte budget in force right now.
+
+        min(configured max, dynamic ceiling). A failing ceiling read must
+        never take a put or an eviction down with it — the budget falls
+        back to the static max and the failure is counted, not swallowed
+        invisibly (dynamic_ceiling_errors rides the health snapshot).
+        """
+        limit = int(self.max_bytes)
+        fn = self.dynamic_ceiling_fn
+        if fn is None:
+            return limit
+        try:
+            ceiling = int(fn())
+        except Exception:
+            self.dynamic_ceiling_errors += 1
+            return limit
+        self.last_dynamic_ceiling_bytes = ceiling
+        return max(1, min(limit, ceiling))
 
     def _touch_session(self, session_id: str | None) -> None:
         if not session_id or self.active_pin_ttl_s <= 0:
@@ -685,6 +713,7 @@ class SessionBank:
                 int(nbytes_override),
             )
             if live_entry is not None:
+                self._schedule_live_ref_spill(live_entry)
                 return live_entry
             self.eviction_log.append(
                 {
@@ -712,6 +741,7 @@ class SessionBank:
                 0,
             )
             if live_entry is not None:
+                self._schedule_live_ref_spill(live_entry)
                 return live_entry
             self.eviction_log.append(
                 {
@@ -747,6 +777,7 @@ class SessionBank:
                 int(entry_nbytes),
             )
             if live_entry is not None:
+                self._schedule_live_ref_spill(live_entry)
                 return live_entry
             self.eviction_log.append(
                 {
@@ -1594,6 +1625,9 @@ class SessionBank:
         return {
             "max_entries": self.max_entries,
             "max_bytes": self.max_bytes,
+            "effective_max_bytes": self.effective_max_bytes(),
+            "dynamic_ceiling_bytes": self.last_dynamic_ceiling_bytes,
+            "dynamic_ceiling_errors": self.dynamic_ceiling_errors,
             "per_session_max_bytes": self.per_session_max_bytes,
             "idle_ttl_s": self.idle_ttl_s,
             "entries": len(self._entries),
@@ -1656,6 +1690,10 @@ class SessionBank:
             if cold is not None:
                 cold["enabled"] = False
                 cold["skip_reason"] = "live_ref_only"
+            # #323: live-ref-only entries used to end here — the SSD tier
+            # never saw the exact sessions whose re-prefill costs minutes.
+            # The streaming spill re-derives a snapshot at idle time.
+            self._schedule_live_ref_spill(entry)
             return
         if self.cold_tier is None:
             if cold is not None:
@@ -1736,11 +1774,26 @@ class SessionBank:
         capabilities = ["ar_insert"]
         if entry.logits is not None and entry.hidden is not None:
             capabilities.append("mtp_full")
+        # Entries at/above the tier's staged-queue backlog budget could
+        # never persist through put_entry (the fully encoded payload would
+        # not fit the queue) — stream them instead. Same on-disk format.
+        spill = getattr(self.cold_tier, "spill_entry", None)
+        spill_threshold = getattr(self.cold_tier, "spill_threshold_bytes", None)
+        use_spill = (
+            callable(spill)
+            and isinstance(spill_threshold, int)
+            and int(entry.nbytes) >= int(spill_threshold)
+        )
         try:
             try:
-                stored = put_entry(
-                    entry, capabilities=capabilities, raise_on_yield=True
-                )
+                if use_spill:
+                    stored = spill(
+                        entry, capabilities=capabilities, raise_on_yield=True
+                    )
+                else:
+                    stored = put_entry(
+                        entry, capabilities=capabilities, raise_on_yield=True
+                    )
             except TypeError:
                 # Cold tiers predating the foreground-yield contract (or test
                 # doubles) take no raise_on_yield kwarg.
@@ -1779,6 +1832,145 @@ class SessionBank:
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
+
+    def _schedule_live_ref_spill(self, entry: SessionBankEntry) -> None:
+        """Queue an idle-lane streaming spill for a live-ref-only session.
+
+        Issue #323 + #305 durability: oversized sessions hold only a live
+        reference lease — displacement or restart used to cost a FULL
+        re-prefill (514 s at 134k tokens in the #305 traces) because
+        nothing durable ever existed. The job re-derives a lazy COW
+        snapshot from the live cache AT RUN TIME (epoch-guarded, so a
+        superseded commit is skipped) and streams it to the SSD tier
+        tensor-by-tensor. Without an idle dispatcher there is no safe
+        window for the encode, so the skip is recorded, not silent.
+        """
+        cold = self.cold_tier
+        if cold is None or not callable(getattr(cold, "spill_entry", None)):
+            return
+        dispatch = self.cold_enqueue_dispatch
+        coalesce_key = (
+            f"ssd_cold:{entry.session_id}"
+            if entry.session_id
+            else f"ssd_cold:hash:{entry.token_hash}"
+        )
+        if dispatch is None:
+            self.eviction_log.append(
+                {
+                    "reason": "ssd_spill_no_dispatch",
+                    "session_id": entry.session_id,
+                    "prefix_len": entry.prefix_len,
+                    "token_hash": entry.token_hash,
+                }
+            )
+            return
+        token_ids = tuple(entry.token_ids)
+        epoch = int(entry.snapshot_epoch)
+        job = lambda: self.run_live_ref_spill(token_ids, epoch)  # noqa: E731
+        job.coalesce_key = coalesce_key
+        try:
+            dispatch(job)
+        except BaseException as exc:
+            self.eviction_log.append(
+                {
+                    "reason": "ssd_spill_dispatch_error",
+                    "session_id": entry.session_id,
+                    "prefix_len": entry.prefix_len,
+                    "token_hash": entry.token_hash,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    def run_live_ref_spill(
+        self, token_ids: tuple[int, ...], snapshot_epoch: int
+    ) -> bool:
+        """Idle-lane body of the live-ref spill; safe to call directly.
+
+        Looks up the CURRENT entry (never a captured one — holding the
+        entry in the closure would pin a superseded session's whole KV in
+        RAM), verifies the commit epoch, snapshots lazily (zero-copy COW
+        views: later cache writes cannot mutate what gets encoded — the
+        lazy-snapshot COW pin covers this), and streams to disk.
+        """
+        entry = self._entries.get(tuple(int(token) for token in token_ids))
+        if entry is None or not entry.live_ref_only or entry.cache_ref is None:
+            return False
+        if int(entry.snapshot_epoch) != int(snapshot_epoch):
+            # Superseded: the newer commit scheduled its own (coalesced) job.
+            return False
+        cold = self.cold_tier
+        spill = getattr(cold, "spill_entry", None) if cold is not None else None
+        if not callable(spill):
+            return False
+        try:
+            snapshot = snapshot_cache_lazy_hybrid(entry.cache_ref)
+            mtp_snapshot = (
+                snapshot_cache_lazy_hybrid(entry.mtp_history_cache_ref)
+                if entry.mtp_history_cache_ref is not None
+                else None
+            )
+        except RuntimeError as exc:
+            # e.g. the paged long-context guard refuses to materialize
+            # active K/V arrays; recorded so trace can show why this
+            # session stays restart-volatile.
+            self.eviction_log.append(
+                {
+                    "reason": "ssd_spill_snapshot_unavailable",
+                    "session_id": entry.session_id,
+                    "prefix_len": entry.prefix_len,
+                    "token_hash": entry.token_hash,
+                    "error": str(exc),
+                }
+            )
+            return False
+        entry._ensure_boundaries_loaded()
+        view = replace(
+            entry,
+            cache_snapshot=snapshot,
+            mtp_history_snapshot=mtp_snapshot,
+            nbytes=int(entry.oversized_nbytes or 0),
+            live_ref_only=False,
+            cache_ref=None,
+            mtp_history_cache_ref=None,
+        )
+        capabilities = ["ar_insert"]
+        if view.logits is not None and view.hidden is not None:
+            capabilities.append("mtp_full")
+        try:
+            stored = spill(view, capabilities=capabilities, raise_on_yield=True)
+        except ColdEncodeInterrupted:
+            # A foreground request arrived mid-encode. Re-dispatch for the
+            # next quiet window; the coalesce key keeps at most one pending
+            # spill per session and newer commits supersede it.
+            dispatch = self.cold_enqueue_dispatch
+            if dispatch is not None:
+                job = lambda: self.run_live_ref_spill(  # noqa: E731
+                    token_ids, snapshot_epoch
+                )
+                job.coalesce_key = (
+                    f"ssd_cold:{entry.session_id}"
+                    if entry.session_id
+                    else f"ssd_cold:hash:{entry.token_hash}"
+                )
+                try:
+                    dispatch(job)
+                except Exception:
+                    pass
+            return False
+        except Exception as exc:
+            self.eviction_log.append(
+                {
+                    "reason": "ssd_spill_error",
+                    "session_id": entry.session_id,
+                    "prefix_len": entry.prefix_len,
+                    "token_hash": entry.token_hash,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            return False
+        if stored:
+            entry.cold_encode_completed_at = time.monotonic()
+        return bool(stored)
 
     def _restore_cold(
         self,
@@ -2025,7 +2217,7 @@ class SessionBank:
             candidates = list(self._entries.values())
             if len(self._entries) > self.max_entries:
                 reason = CacheMissReason.EVICTED.value
-            elif self.total_nbytes > self.max_bytes:
+            elif self.total_nbytes > self.effective_max_bytes():
                 reason = CacheMissReason.EVICTED.value
             elif session_over_budget:
                 reason = CacheMissReason.EVICTED.value
