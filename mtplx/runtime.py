@@ -1031,6 +1031,10 @@ def _qwen4_exp_model_classes() -> tuple[type, type]:
 _INTREE_MODEL_CLASS_LOADERS: dict[str, Callable[[], tuple[type, type]]] = {
     "deepseek_v4": _deepseek_v4_model_classes,
     "qwen4_exp": _qwen4_exp_model_classes,
+    # Text-config spelling of the same family: inspection prefers the nested
+    # text_config.model_type for multimodal checkpoints, and text-only
+    # re-exports carry it at top level. Same trunk, same classes.
+    "qwen4_exp_text": _qwen4_exp_model_classes,
 }
 
 
