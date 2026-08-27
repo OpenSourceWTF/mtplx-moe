@@ -281,6 +281,17 @@ def _env_falsey(name: str) -> bool:
     }
 
 
+def _defer_repair_eval() -> bool:
+    """Leave the post-rejection repair forward lazy (``MTPLX_DEFER_REPAIR_EVAL``).
+
+    The repair re-forward's blocking eval costs ~27ms per rejected round on
+    qwen4_exp (2026-08-27 decomposition); deferring it overlaps that GPU work
+    with the next round's host-side build. Safe because every cache write is
+    a lazy rebind: the next draft eval consumes ``repair_hidden`` and
+    materializes the repair graph before any forward builds on top."""
+    return env_bool("MTPLX_DEFER_REPAIR_EVAL", default=False)
+
+
 def _skip_verify_snapshot() -> bool:
     """The single parse of ``MTPLX_SKIP_VERIFY_SNAPSHOT`` (default OFF).
 
@@ -11289,7 +11300,14 @@ def generate_mtpk(
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
                     )
-            _eval(repair_logits, repair_hidden)
+            # Deferred mode leaves the repair forward un-evaluated: cache
+            # writes are lazy rebinds, so the graph stays coherent and the
+            # next round's draft eval (which consumes repair_hidden) pulls it
+            # before anything builds on the rebound cache arrays — the GPU
+            # work overlaps the host's next-round build instead of blocking
+            # here (~27ms per rejected round measured 2026-08-27).
+            if not _defer_repair_eval():
+                _eval(repair_logits, repair_hidden)
             elapsed_repair = time.perf_counter() - started
             target_time += elapsed_repair
             repair_time += elapsed_repair
