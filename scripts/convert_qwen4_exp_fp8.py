@@ -53,6 +53,17 @@ EIGHT_SUFFIXES = (
     "shared_expert.up_proj",
     "shared_expert.down_proj",
     "indexer.index_qk_proj",
+    # v1: QSA attention projections. Attribution receipt (2026-08-27,
+    # attrib-v0.json): full_attention layers carry 7.4x the per-layer output
+    # error of GDN at 4-bit (by-type rel_mse 8.7e-3 vs 1.2e-3; worst six
+    # layers all QSA, layer 31 at 4.4e-2) while lm_head+mixer contribute
+    # KLD 0.0003. These names exist only on full-attention layers (GDN
+    # layers use linear_attn.*), so the change is surgical: +299MB/token
+    # (~-5% AR) for the dominant share of the quality gap.
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
 )
 # Structural, stays bf16 (config carries explicit false entries).
 KEEP_BF16_SUFFIXES = (
