@@ -349,7 +349,40 @@ class GatedResidual(nn.Module):
             rows *= s
         return 1 <= rows <= 8
 
+    def _v3_read_applies(self, hyper_input: mx.array) -> bool:
+        # v3 (two-dispatch, kernel-private 8-bit pack): single-row decode
+        # reads on the combine variant with bf16 module weights. Verify
+        # widths (rows 2..8) and prefill stay on the eager chain.
+        if not _fused_hc_v3_enabled():
+            return False
+        if self.hc_count != 4 or self.hidden_size != 2560:
+            return False
+        if "block_inject_weight" not in self:
+            return False
+        if hasattr(self.input_mix_weight_down, "scales"):
+            return False
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        if rows != 1:
+            return False
+        if getattr(self, "_v3_pack", None) is None:
+            from mtplx.kernels.hyper_connection_v3 import prepare_v3_pack
+
+            self._v3_pack = prepare_v3_pack(self)
+        return True
+
     def __call__(self, hyper_input: mx.array):
+        if self._v3_read_applies(hyper_input):
+            from mtplx.kernels.hyper_connection_v3 import fused_hyper_read_v3
+
+            x2 = hyper_input.reshape(-1)
+            mixed, inject = fused_hyper_read_v3(
+                x2, self.hc_norm.weight, self._v3_pack
+            )
+            mixed = mixed.reshape(*hyper_input.shape[:-1], self.hidden_size)
+            inject = inject.reshape(*hyper_input.shape[:-1], self.hc_count)
+            return mixed, hyper_input, inject
         if self._fused_read_applies(hyper_input):
             from mtplx.kernels.hyper_connection import fused_hyper_read
 
@@ -517,6 +550,11 @@ def _fused_gate_up_enabled() -> bool:
 
 def _fused_hc_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_HC") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_hc_v3_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_HC_V3") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
