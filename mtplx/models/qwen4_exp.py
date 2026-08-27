@@ -240,10 +240,15 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
 
         B, S, _ = inputs.shape
 
-        qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
+        fused_in = getattr(self, "in_proj_fused", None)
+        if fused_in is not None:
+            qkv, z, b, a = fused_in(inputs)
+            z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
+        else:
+            qkv = self.in_proj_qkv(inputs)
+            z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
+            b = self.in_proj_b(inputs)
+            a = self.in_proj_a(inputs)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -548,8 +553,119 @@ class _FusedGateUpMLP(nn.Module):
         return self.down_proj(nn.silu(gate) * up)
 
 
+class _FusedGDNInProj(nn.Module):
+    """GDN qkv/z/b/a input projections as ONE quantized matmul.
+
+    All four share the layer input row; at qL=1 they are four separate GEMV
+    dispatches per GDN layer (35 layers = 140 dispatches/step). Row-axis
+    concat of quantized packs is bit-exact per output row — each row's dot
+    and its quant groups are unchanged — so the fused output just splits at
+    the recorded row offsets. Same placeholder-at-build/load-fills contract
+    as _FusedGateUpSwitchGLU."""
+
+    def __init__(self, weight, scales, biases, group_size, bits, mode, splits):
+        super().__init__()
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self._splits = list(splits)  # cumulative row offsets: qkv|z|b|a
+
+    def __call__(self, x):
+        y = mx.quantized_matmul(
+            x,
+            self.weight,
+            self.scales,
+            self.biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        return mx.split(y, self._splits, axis=-1)
+
+
+_LAYER_GDN_RE = re.compile(
+    r"^(.*\.layers\.(\d+)\.linear_attn)\.in_proj_qkv\.weight$"
+)
+_GDN_IN_PROJS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+
+
+def _fuse_gdn_in_proj_sanitize(model, out: dict) -> dict:
+    """Sanitize-time GDN input fusion (MTPLX_FUSED_GDN_INPROJ=1).
+
+    Concatenates the four quantized input projections of every GDN layer
+    along the output-rows axis on the LAZY weight dict (originals never
+    materialize) and swaps in a _FusedGDNInProj child. Fuses only when all
+    four are affine-quantized at one (group_size, bits); anything else keeps
+    the stock modules."""
+    if not _fused_gdn_in_proj_enabled():
+        return out
+    fused = 0
+    hits = [
+        (m.group(1), int(m.group(2)))
+        for m in (_LAYER_GDN_RE.match(k) for k in list(out))
+        if m is not None
+    ]
+    for prefix, idx in hits:
+        parts = []
+        for sub in _GDN_IN_PROJS:
+            w = out.get(f"{prefix}.{sub}.weight")
+            s = out.get(f"{prefix}.{sub}.scales")
+            b = out.get(f"{prefix}.{sub}.biases")
+            if w is None or s is None or b is None:
+                parts = None
+                break
+            parts.append((w, s, b))
+        if parts is None:
+            continue
+        k_words = parts[0][0].shape[-1]
+        n_groups = parts[0][1].shape[-1]
+        if any(w.shape[-1] != k_words or s.shape[-1] != n_groups for w, s, _ in parts):
+            continue  # mixed packing: stay stock
+        gdn = model.layers[idx].linear_attn
+        k_in = 2560  # in_proj input dim = hidden (same contract as gate_up)
+        group_size = k_in // n_groups
+        bits = (k_words * 32) // k_in
+        if bits not in (4, 8):
+            continue
+        rows = [w.shape[0] for w, _, _ in parts]
+        splits = [rows[0], rows[0] + rows[1], rows[0] + rows[1] + rows[2]]
+        f_w = mx.concatenate([w for w, _, _ in parts], axis=0)
+        f_s = mx.concatenate([s for _, s, _ in parts], axis=0)
+        f_b = mx.concatenate([b for _, _, b in parts], axis=0)
+        gdn.in_proj_fused = _FusedGDNInProj(
+            mx.zeros(f_w.shape, dtype=f_w.dtype),
+            mx.zeros(f_s.shape, dtype=f_s.dtype),
+            mx.zeros(f_b.shape, dtype=f_b.dtype),
+            group_size,
+            bits,
+            "affine",
+            splits,
+        )
+        for sub in _GDN_IN_PROJS:
+            gdn.pop(sub, None)
+        out[f"{prefix}.in_proj_fused.weight"] = f_w
+        out[f"{prefix}.in_proj_fused.scales"] = f_s
+        out[f"{prefix}.in_proj_fused.biases"] = f_b
+        for sub in _GDN_IN_PROJS:
+            for part in ("weight", "scales", "biases"):
+                out.pop(f"{prefix}.{sub}.{part}", None)
+        fused += 1
+    if fused:
+        print(f"[qwen4_exp] sanitize fused GDN in_proj: {fused} layers", flush=True)
+    return out
+
+
 def _fused_gate_up_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_GATE_UP") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_gdn_in_proj_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GDN_INPROJ") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -2216,6 +2332,7 @@ class Model(nn.Module):
             out[dest] = mx.stack([parts[i] for i in range(len(parts))])
 
         out = _fuse_gate_up_sanitize(self, out)
+        out = _fuse_gdn_in_proj_sanitize(self, out)
 
         # The 51B table never loads as a parameter; sidecar rows are gathered
         # lazily. Materialized shard concat is only accepted for tiny test

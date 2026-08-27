@@ -726,10 +726,17 @@ def _server_runtime_env_overrides(
         #   recorder 75.25 -> 85.9 t/s record) — repair-free speculative
         #   rollback; falls back to rollback+re-forward per round if a
         #   capture is ever missing.
+        # - Fused hyper-read v3 (2026-08-27 receipts: AR 51.2 -> 55.2,
+        #   +7.8% x3 consistent; kernel-private 8-bit pack, bf16 module
+        #   weights untouched for prefill/verify).
+        # - GDN in_proj fusion (2026-08-27 receipt: AR 55.0 -> 56.7; four
+        #   input GEMVs -> one, row-concat bit-exact, 36 layers).
         for key in (
             "MTPLX_AR_PIPELINE",
             "MTPLX_COMPILED_GDN",
             "MTPLX_FAMILY_CAPTURE_COMMIT",
+            "MTPLX_FUSED_HC_V3",
+            "MTPLX_FUSED_GDN_INPROJ",
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
