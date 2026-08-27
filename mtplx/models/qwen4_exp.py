@@ -698,17 +698,18 @@ class _SidecarGather:
         list(self._pool.map(touch, chunks))
         self.prefetch_batches += 1
 
-    def __call__(self, ids: mx.array, dim: int) -> mx.array:
+    def gather_np(self, flat) -> mx.array:
+        """Gather+dequantize rows for MATERIALIZED numpy int64 ids — the
+        staged fast path: no graph tensor is evaluated here, so calling
+        this before the step's graph is built costs no GPU sync."""
         import numpy as np
 
-        flat = np.asarray(ids.reshape(-1), dtype=np.int64)
         if self._pool is not None:
             self._warm(np.unique(flat))
         if self.bits == 0:  # raw bf16 rows, no dequantize
             mm, dt = self._maps["weight"]
             rows = mx.array(np.ascontiguousarray(mm[flat]))
-            rows = rows.view(mx.bfloat16 if dt == "BF16" else mx.float16)
-            return rows.reshape(*ids.shape, dim)
+            return rows.view(mx.bfloat16 if dt == "BF16" else mx.float16)
         parts = []
         for name in ("weight", "scales", "biases"):
             mm, dt = self._maps[name]
@@ -719,8 +720,13 @@ class _SidecarGather:
                 rows = rows.view(mx.float16)
             parts.append(rows)
         w, s, b = parts
-        out = mx.dequantize(w, s, b, group_size=self.group_size, bits=self.bits)
-        return out.reshape(*ids.shape, dim)
+        return mx.dequantize(w, s, b, group_size=self.group_size, bits=self.bits)
+
+    def __call__(self, ids: mx.array, dim: int) -> mx.array:
+        import numpy as np
+
+        flat = np.asarray(ids.reshape(-1), dtype=np.int64)
+        return self.gather_np(flat).reshape(*ids.shape, dim)
 
 
 def _read_safetensors_header(path: Path):
@@ -774,13 +780,120 @@ class NGramEmbedding(nn.Module):
         valid = (pos_in_seg >= shift) & (src >= 0)
         return mx.where(valid, shifted, mx.array(self.eos_id, dtype=mx.int64))
 
+    # ---- staged fast path -------------------------------------------------
+    # The row ids are a pure function of the token ids, so they can be
+    # computed in numpy BEFORE the step's graph exists. The in-graph path
+    # below forces a mid-forward GPU sync at layer 1 of every step
+    # (np.asarray on a graph tensor + CPU gather while the pipeline
+    # stalls); staging moves all of that to the top of Model.__call__,
+    # where the previous step is already evaluated and the sync is free.
+    # MTPLX_NGRAM_STAGE=0 disables; MTPLX_NGRAM_STAGE_VERIFY=1 also runs
+    # the graph path and asserts equality (QA mode).
+
+    def _np_consts(self):
+        import numpy as np
+
+        c = getattr(self, "_np_consts_cache", None)
+        if c is None:
+            c = (
+                np.array(self.layer_multipliers, dtype=np.int64),
+                np.array(self.ngram_heads_vocab_sizes, dtype=np.int64),
+                np.array(self.ngram_heads_offsets, dtype=np.int64),
+            )
+            self._np_consts_cache = c
+        return c
+
+    def _rows_np(self, ids_np, prev_np):
+        import numpy as np
+
+        mult, sizes, offs, eos = *self._np_consts(), self.eos_id
+        hist = np.concatenate([prev_np, ids_np], axis=1)
+
+        def shift(h, s):
+            if s == 0:
+                return h
+            b, ln = h.shape
+            pos = np.arange(ln, dtype=np.int64)[None, :]
+            eos_pos = np.where(h == eos, pos, np.int64(-1))
+            prev_incl = np.maximum.accumulate(eos_pos, axis=1)
+            prev = np.concatenate(
+                [np.full((b, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1
+            )
+            pos_in_seg = pos - (prev + 1)
+            src = np.maximum(pos - s, 0)
+            shifted = np.take_along_axis(h, src, axis=1)
+            valid = (pos_in_seg >= s) & (pos - s >= 0)
+            return np.where(valid, shifted, np.int64(eos))
+
+        shifted = [shift(hist, s) for s in range(self.ngram_size)]
+        blocks = []
+        for ngram in range(2, self.ngram_size + 1):
+            start = (ngram - 2) * self.heads_per_ngram
+            end = start + self.heads_per_ngram
+            mixed = shifted[0] * mult[0]
+            for p in range(1, ngram):
+                mixed = mixed ^ (shifted[p] * mult[p])
+            blocks.append(mixed[..., None] % sizes[start:end] + offs[start:end])
+        S = ids_np.shape[1]
+        rows = np.concatenate(blocks, axis=-1)[:, -S:]
+        return rows, hist[:, -self.context_len :]
+
+    def stage(self, input_ids: mx.array, cache: Optional[ArraysCache], state_idx: int):
+        """Precompute this step's rows before any graph is built."""
+        import numpy as np
+
+        sidecar = self.ngram_embedding._sidecar
+        if sidecar is None or os.environ.get("MTPLX_NGRAM_STAGE", "1") == "0":
+            return
+        try:
+            ids_np = np.asarray(input_ids, dtype=np.int64)
+            B, S = ids_np.shape
+            if cache is not None and cache[state_idx] is not None:
+                prev_np = np.asarray(cache[state_idx], dtype=np.int64)
+            else:
+                prev_np = np.full((B, self.context_len), self.eos_id, dtype=np.int64)
+            rows, new_hist = self._rows_np(ids_np, prev_np)
+            emb = sidecar.gather_np(rows.reshape(-1))
+            emb = emb.reshape(B, S, -1)
+            self._staged = (B, S, emb, mx.array(new_hist), mx.array(prev_np))
+        except Exception as exc:  # exact graph fallback stays available
+            if not getattr(self, "_stage_warned", False):
+                self._stage_warned = True
+                print(f"[qwen4_exp] ngram staging disabled after error: {exc!r}",
+                      flush=True)
+            self._staged = None
+
     def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache], state_idx: int):
+        staged = getattr(self, "_staged", None)
+        if staged is not None:
+            self._staged = None
+            sB, sS, emb, new_hist, prev = staged
+            B, S = input_ids.shape
+            if sB == B and sS == S:
+                if os.environ.get("MTPLX_NGRAM_STAGE_VERIFY", "0") == "1":
+                    ref = self._graph_path(input_ids, None, state_idx, prev=prev)
+                    ok = bool(
+                        mx.allclose(
+                            ref.astype(mx.float32), emb.astype(mx.float32)
+                        )
+                    )
+                    if not ok:
+                        raise RuntimeError(
+                            "ngram staged/graph mismatch — staging math broke"
+                        )
+                if cache is not None:
+                    cache[state_idx] = new_hist
+                return emb
+        return self._graph_path(input_ids, cache, state_idx)
+
+    def _graph_path(self, input_ids, cache, state_idx, prev=None):
         ids = input_ids.astype(mx.int64)
         B, S = ids.shape
-        if cache is not None and cache[state_idx] is not None:
-            prev = cache[state_idx]
-        else:
-            prev = mx.full((B, self.context_len), self.eos_id, dtype=mx.int64)
+        if prev is None:
+            if cache is not None and cache[state_idx] is not None:
+                prev = cache[state_idx]
+            else:
+                prev = mx.full((B, self.context_len), self.eos_id, dtype=mx.int64)
         history = mx.concatenate([prev, ids], axis=1)
         if cache is not None:
             cache[state_idx] = history[:, -self.context_len :]
@@ -910,6 +1023,10 @@ class Qwen4ExpTextModel(nn.Module):
             if "linear_attention" in args.layer_types
             else 0
         )
+        self._ple_stage_idx = next(
+            (i for i, l in enumerate(self.layers) if getattr(l, "ple", None) is not None),
+            None,
+        )
         self.fa_idx = next(
             (i for i, t in enumerate(args.layer_types) if t != "linear_attention"),
             self.ssm_idx,
@@ -920,6 +1037,9 @@ class Qwen4ExpTextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        if self._ple_stage_idx is not None:
+            ple = self.layers[self._ple_stage_idx].ple
+            ple.ple_embedding.stage(inputs, cache[self._ple_stage_idx], ple.NGRAM_IDX)
         h = mx.tile(h, (1, 1, self.args.hc_count))
         for layer, c in zip(self.layers, cache):
             h = layer(h, input_ids=inputs, ssm_mask=ssm_mask, cache=c)
