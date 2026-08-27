@@ -1076,11 +1076,75 @@ class TextModel(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs, cache=None, input_embeddings=None):
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+    ):
+        # hidden_variant is accepted for the runtime contract's sake but this
+        # family has exactly one draft input: the pre-mixer WIDENED stream.
+        # NOTE: keep this signature explicit — a **kwargs catch-all would make
+        # the runtime's capability probe claim emit_logits/logits_keep support
+        # that does not exist here.
         out = self.model(inputs, cache, input_embeddings)
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        if return_hidden:
+            return logits, self.model._last_widened
+        return logits
+
+    def _head_logits(self, h):
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(h)
+        return self.lm_head(h)
+
+    # ---- runtime draft surface (validate_mtp_support shape) ---------------
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache=None,
+        concat_order: str | None = None,
+        return_hidden: bool = False,
+        mtp_hidden_variant: str | None = None,
+        position_offset: int | None = None,
+    ):
+        """Draft logits from the trunk's widened stream + next token ids.
+
+        ``hidden_states`` is the pre-mixer widened stream [B,S,hc*d] on the
+        first depth and this head's own pre-mixer output on deeper recursion
+        steps (returned via ``return_hidden``). concat_order / hidden_variant
+        have no meaning here (no concat, single variant); positions come from
+        the QSA cache offset (contract mtp_position_mode="cache").
+        """
+        emb = self.model.embed_tokens(next_token_ids)
+        h = self.mtp.fuse_and_run(hidden_states, emb, mtp_cache)
+        logits = self._head_logits(self.mtp.hyper_connection_mixer(h))
+        if return_hidden:
+            return logits, h
+        return logits
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache=None,
+        concat_order: str | None = None,
+        mtp_hidden_variant: str | None = None,
+        position_offset: int | None = None,
+    ):
+        """Append committed history to the head's cache (no lm_head cost)."""
+        emb = self.model.embed_tokens(next_token_ids)
+        return self.mtp.fuse_and_run(hidden_states, emb, mtp_cache)
+
+    def make_mtp_cache(self):
+        return [QSACache()]
 
     def make_cache(self):
         caches = []
@@ -1127,7 +1191,9 @@ class Qwen4ExpMTP(nn.Module):
         self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
         self._hc = args.hc_count
 
-    def __call__(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
+    def fuse_and_run(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
+        """Fuse (widened, token embedding) and run the head's layer; returns
+        the PRE-mixer widened output — the recursion state for deeper drafts."""
         B, S, W = widened.shape
         hn = self.pre_fc_norm_hidden(widened).reshape(B, S, self._hc, -1)
         en = self.fc_embedding(self.pre_fc_norm_embedding(tok_emb))
@@ -1136,8 +1202,10 @@ class Qwen4ExpMTP(nn.Module):
         # cache is the make_mtp_cache() list (runtime convention); the single
         # layer consumes its own QSACache entry
         layer_cache = cache[0] if cache is not None else None
-        h = self.layers[0](h, input_ids=None, ssm_mask=None, cache=layer_cache)
-        return self.hyper_connection_mixer(h)
+        return self.layers[0](h, input_ids=None, ssm_mask=None, cache=layer_cache)
+
+    def __call__(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
+        return self.hyper_connection_mixer(self.fuse_and_run(widened, tok_emb, cache))
 
 
 @dataclass
@@ -1228,17 +1296,24 @@ class Model(nn.Module):
         nn.quantize(mtp, group_size=64, bits=8, class_predicate=predicate)
         mtp.load_weights(list(stripped.items()), strict=True)
         mtp.eval()
-        self.mtp = mtp
+        # publish on the text model — mtp_patch._text_model() resolves
+        # language_model, and registering the module on BOTH trees would
+        # double-count its parameters
+        self.language_model.mtp = mtp
         return True
 
+    @property
+    def mtp(self):
+        return getattr(self.language_model, "mtp", None)
+
     def make_mtp_cache(self):
-        return [QSACache()]
+        return self.language_model.make_mtp_cache()
 
     def mtp_draft_logits(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
         """Draft logits from the trunk's widened stream + the next token's
         embedding, through the shared trunk lm_head."""
-        h = self.mtp(widened, tok_emb, cache)
-        return self.language_model.lm_head(h)
+        lm = self.language_model
+        return lm._head_logits(lm.mtp(widened, tok_emb, cache))
 
     def post_weight_load(self, model_path) -> None:
         """Attach the SSD-resident n-gram sidecar after weights load."""
@@ -1422,3 +1497,43 @@ def _tree_get(module: nn.Module, dotted: str):
         if k == dotted:
             return v
     raise KeyError(dotted)
+
+
+def is_qwen4_exp_mtp_config(config: dict) -> bool:
+    """Does this artifact belong to the Flash-Next family?
+
+    The family always exports its draft head as an ``mtp.safetensors``
+    sidecar and the shipped configs carry no usable declaration field
+    (``mtp``/``mtp_num_hidden_layers`` arrive null), so weight presence is
+    decided by :meth:`Model.attach_mtp` at inject time — mirroring the
+    DeepSeek-V4 "weight presence is decided later" convention.
+    """
+    cfg = config or {}
+    mt = str(cfg.get("model_type") or "").lower()
+    tc = cfg.get("text_config") or {}
+    tmt = str(tc.get("model_type") or "").lower()
+    return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
+
+
+def inject_qwen4_exp_mtp_support(
+    model,
+    path=None,
+    config: dict | None = None,
+    contract=None,
+) -> bool:
+    """Enable the speculative lane on an already-loaded Flash-Next model.
+
+    Nothing to graft: :meth:`Model.attach_mtp` builds the head from the
+    pack's self-describing ``mtp.safetensors`` (per-module quant inferred
+    from packed shapes) and publishes it on ``language_model`` where
+    ``mtplx.mtp_patch.validate_mtp_support`` looks. Returns False for a
+    pack that ships no head — the degrade-to-autoregressive signal.
+    """
+    if not is_qwen4_exp_mtp_config(config or {}):
+        return False
+    if path is None:
+        return False
+    attach = getattr(model, "attach_mtp", None)
+    if not callable(attach):
+        return False
+    return bool(attach(path))

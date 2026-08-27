@@ -724,6 +724,10 @@ def load(
             inject_deepseek_v4_mtp_support,
             is_deepseek_v4_mtp_config,
         )
+        from .models.qwen4_exp import (
+            inject_qwen4_exp_mtp_support,
+            is_qwen4_exp_mtp_config,
+        )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
 
         if is_deepseek_v4_mtp_config(config):
@@ -744,6 +748,11 @@ def load(
             mtp_enabled = inject_step3p5_mtp_support(model, path, config, contract)
         elif is_hy_v3_mtp_config(config):
             mtp_enabled = inject_hy_v3_mtp_support(model, path, config, contract)
+        elif is_qwen4_exp_mtp_config(config):
+            # Flash-Next native draft head: attach_mtp builds it from the
+            # pack's self-describing mtp.safetensors sidecar and publishes
+            # the runtime surface on language_model.
+            mtp_enabled = inject_qwen4_exp_mtp_support(model, path, config, contract)
         elif is_qwen3_5_mtp_config(config):
             mtp_enabled = inject_qwen3_5_mtp_support(model, path, config, contract)
         elif is_deepseek_mtp_config(config):
