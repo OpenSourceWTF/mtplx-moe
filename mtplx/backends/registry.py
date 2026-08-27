@@ -235,9 +235,9 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
         # qwen3_8-shaped names must never be swallowed into this family (#268).
         aliases=(
             "qwen4_exp",
+            "qwen4_exp_text",
             "Qwen4ExpForConditionalGeneration",
             "Qwen4ExpForCausalLM",
-            "flash_next",
         ),
         config_markers=(),
         family_gate="mlx-lm-ar",
@@ -827,10 +827,20 @@ def _detect_arch_id(inspection: Any) -> str | None:
     if _support_alias_matches(qwen_support, combined):
         return "qwen3-next-mtp"
 
+    # qwen4-next's aliases are the exact T-0 strings (qwen4_exp family) and
+    # can't mean any other family, so recognition must not hinge on MTP
+    # markers — a trunk-only or partially-downloaded checkpoint still belongs
+    # to the family (recognition is not can_run). The marker requirement in
+    # the loop below exists for rows whose aliases double as plain trunk
+    # names (deepseek_v3, ...), which this family's do not.
+    qwen4_support = ARCHITECTURE_CATALOG["qwen4-next"]
+    if _support_alias_matches(qwen4_support, combined):
+        return "qwen4-next"
+
     supports = [
         support
         for support in ARCHITECTURE_CATALOG.values()
-        if support.arch_id not in {"qwen3-next-mtp", "generic-mtp"}
+        if support.arch_id not in {"qwen3-next-mtp", "qwen4-next", "generic-mtp"}
     ]
     supports.sort(
         key=lambda row: max(

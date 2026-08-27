@@ -444,12 +444,18 @@ def _probe_runtime_mtp_evidence(
     return False, str(compatibility.get("runtime_compatibility") or "missing-mtp-weights"), compatibility
 
 
-def _no_mtp_probe_message(diagnostic: str | None) -> str:
+def _no_mtp_probe_message(diagnostic: str | None, *, config_only: bool = False) -> str:
     if diagnostic == "incomplete-assistant-pair":
         return (
             "Gemma 4 assistant/target subfolder detected, but MTPLX Gemma "
             "requires the assistant-pair bundle root containing mtplx_pair.json, "
             "target/, and assistant/. Point Forge at the bundle root instead."
+        )
+    if config_only:
+        return (
+            "Source is config-only — no model weights (*.safetensors) are "
+            "present, so there is nothing to forge. Download or point Forge "
+            "at the full checkpoint."
         )
     return (
         "Source has no MTP head, and Forge currently builds speculative "
@@ -741,7 +747,12 @@ def probe_source(source: str) -> dict[str, Any]:
             "has_mtp_weights": False,
             "estimated_size_bytes": estimated_size,
             "estimated_peak_gib": _estimated_peak_gib(estimated_size),
-            "message": _no_mtp_probe_message(mtp_diagnostic),
+            "message": _no_mtp_probe_message(
+                mtp_diagnostic,
+                config_only=not any(
+                    str(name).endswith(".safetensors") for name in files
+                ),
+            ),
             "diagnostic": mtp_diagnostic or "no_mtp_heads",
             "source_sha": source_sha,
             **compatibility_fields,

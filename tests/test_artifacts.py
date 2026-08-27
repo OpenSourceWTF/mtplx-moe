@@ -2467,9 +2467,36 @@ def test_unknown_family_without_any_implementation_refuses_honestly(tmp_path):
 
 
 def test_qwen4_flash_next_family_is_recognized(tmp_path):
-    # Qwen3.8-Flash-Next / Qwen4-generation names resolve to the qwen4-next
-    # catalog row (never to generic-mtp or the qwen3_5 row), and until the
-    # in-tree backend lands the verdict is the honest capability gap.
+    # The real T-0 strings (config landed 2026-08-26 15:00 UTC) resolve to
+    # the qwen4-next catalog row even without MTP markers — recognition is
+    # not can_run, and a trunk-only checkpoint still belongs to the family.
+    # With the in-tree backend shipped, the trunk is constructable: AR-only.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen4ExpForConditionalGeneration"],
+                "model_type": "qwen4_exp",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "qwen4-next"
+    assert result.compatibility["recognized"] is True
+    assert result.compatibility["can_run"] is True
+    assert "autoregressive" in result.compatibility["message"]
+
+
+def test_qwen4_speculative_predrop_names_are_not_swallowed(tmp_path):
+    # #268 family-collision law: the speculative pre-drop names
+    # (qwen3_8_flash_next and friends) were purged from the catalog and must
+    # never be swallowed into the qwen4-next family — or any other.
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -2486,9 +2513,9 @@ def test_qwen4_flash_next_family_is_recognized(tmp_path):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["arch_id"] == "qwen4-next"
+    assert result.compatibility["arch_id"] is None
+    assert result.compatibility["tier"] == "incompatible-architecture"
     assert result.compatibility["can_run"] is False
-    assert "capability gap" in result.compatibility["message"]
 
 
 def test_auto_map_is_ignored_when_trunk_is_constructable(tmp_path):
