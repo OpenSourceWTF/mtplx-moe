@@ -2510,6 +2510,13 @@ def _run_verify(
     max_tokens: int = FORGE_VERIFY_DEFAULT_MAX_TOKENS,
     prompt_suite: str = FORGE_VERIFY_DEFAULT_PROMPT_SUITE,
 ) -> list[dict[str, Any]]:
+    if _verify_rows_lane(model_path) == "family-serve":
+        return _run_verify_family_serve(
+            model_path,
+            run,
+            max_fans=max_fans,
+            max_tokens=max_tokens,
+        )
     tune_root = run / "tune"
     tune_run_id = "forge-verify"
     output_root = tune_root / tune_run_id
@@ -2588,6 +2595,185 @@ def _run_verify(
                 output_root=output_root,
             )
         )
+    return rows
+
+
+def _verify_rows_lane(model_path: Path) -> str:
+    """'tune' for families the tune instrument supports, 'family-serve' for
+    family-gated native backends it does not (qwen4_exp today): those
+    measure their rows through the real serve path, which is the only lane
+    that applies their family contract (batched verify, adaptive depth,
+    family sampler)."""
+    try:
+        inspection = inspect_model(model_path)
+    except Exception:
+        return "tune"
+    compatibility = getattr(inspection, "compatibility", {}) or {}
+    if str(compatibility.get("recommended_backend") or "") == "qwen4_exp":
+        return "family-serve"
+    return "tune"
+
+
+def _run_verify_family_serve(
+    model_path: Path,
+    run: Path,
+    *,
+    max_fans: bool,
+    max_tokens: int,
+    reps: int = 2,
+) -> list[dict[str, Any]]:
+    """First-load smoke rows for family-gated native backends, measured
+    through a locally booted `mtplx serve` (the path that applies the
+    family contract). Produces the same row shape the tune lane emits:
+    depth 0 = AR, depth N = the family's speculative default."""
+    import socket
+    import urllib.error
+    import urllib.request
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    base = f"http://127.0.0.1:{port}"
+    serve_log = run / "family-serve.log"
+    tokens_per_row = max(128, min(int(max_tokens), 512))
+    smart_fans = None
+    smart_request_id = None
+    if max_fans:
+        try:
+            from mtplx.thermal import SmartFanController
+
+            smart_fans = SmartFanController(log=_err)
+            smart_request_id = f"forge-verify-{int(time.time() * 1000)}"
+            smart_fans.begin_request(smart_request_id)
+        except Exception as exc:
+            _err(f"[forge] smart fan engage unavailable: {exc}")
+    _err(
+        "[forge] family-serve verify: booting mtplx serve on "
+        f"port {port} (rows: AR + family speculative default, "
+        f"{tokens_per_row} tokens x{reps})"
+    )
+    proc = None
+    rows: list[dict[str, Any]] = []
+    try:
+        with serve_log.open("w", encoding="utf-8") as log_handle:
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-P",
+                    "-m",
+                    "mtplx.cli",
+                    "serve",
+                    "--model",
+                    str(model_path),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--yes",
+                ],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            deadline = time.monotonic() + 1800.0
+            while True:
+                if proc.poll() is not None:
+                    raise ForgeError(
+                        "family-serve verify: serve exited before /health "
+                        f"(see {serve_log})"
+                    )
+                try:
+                    with urllib.request.urlopen(f"{base}/health", timeout=5) as resp:
+                        if resp.status == 200:
+                            break
+                except (urllib.error.URLError, OSError):
+                    pass
+                if time.monotonic() > deadline:
+                    raise ForgeError(
+                        "family-serve verify: /health never came up "
+                        f"(see {serve_log})"
+                    )
+                time.sleep(2.0)
+
+            def _measure(mode: str, salt: str) -> dict[str, Any]:
+                body: dict[str, Any] = {
+                    "model": model_path.name,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Write a small Python function that merges "
+                                "overlapping intervals, then explain it. "
+                                f"(run {salt})"
+                            ),
+                        }
+                    ],
+                    "max_tokens": tokens_per_row,
+                    "stream": False,
+                }
+                headers = {"Content-Type": "application/json"}
+                if mode == "ar":
+                    body["generation_mode"] = "ar"
+                    headers["X-MTPLX-Allow-Client-Controls"] = "1"
+                request = urllib.request.Request(
+                    f"{base}/v1/chat/completions",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers=headers,
+                )
+                with urllib.request.urlopen(request, timeout=1200) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                stats = payload.get("mtplx_stats") or {}
+                if not stats:
+                    raise ForgeError(
+                        "family-serve verify: response carried no mtplx_stats "
+                        f"(mode={mode})"
+                    )
+                return stats
+
+            _measure("mtp", "warmup")  # first-load warm; discarded
+            for depth, mode in ((0, "ar"), (None, "mtp")):
+                samples = [_measure(mode, f"{mode}-{index}") for index in range(reps)]
+                tok_s = [float(s.get("decode_tok_s") or s.get("tok_s") or 0.0) for s in samples]
+                best = max(samples, key=lambda s: float(s.get("decode_tok_s") or 0.0))
+                row_depth = depth
+                if row_depth is None:
+                    row_depth = int(
+                        best.get("speculative_depth")
+                        or best.get("depth")
+                        or 3
+                    )
+                acceptance = best.get("acceptance_by_position") or []
+                rows.append(
+                    {
+                        "depth": int(row_depth),
+                        "tok_s": max(tok_s),
+                        "tok_s_samples": tok_s,
+                        "acceptance_by_position": [
+                            float(value) for value in acceptance
+                        ],
+                        "generated_tokens": int(best.get("generated_tokens") or 0),
+                        "lane": "family-serve",
+                        "generation_mode": str(best.get("generation_mode") or mode),
+                    }
+                )
+                _err(
+                    f"[forge] family-serve row depth={row_depth}: "
+                    f"{max(tok_s):.2f} tok/s (samples {['%.1f' % value for value in tok_s]})"
+                )
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if smart_fans is not None and smart_request_id is not None:
+            try:
+                smart_fans.end_request(smart_request_id, wait_for_restore=False)
+            except Exception:
+                pass
+    rows = _annotate_verify_rows(rows)
+    _write_verify(run, rows)
     return rows
 
 
