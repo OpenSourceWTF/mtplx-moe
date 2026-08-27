@@ -1319,6 +1319,13 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
             args.verify_strategy = "batched"
         if "depth" not in cli_flags and int(getattr(args, "depth", 0) or 0) > 1:
             args.depth = 1
+        if "draft-temperature" not in cli_flags:
+            # Measured 2026-08-27 (Bare pack, live serve, flight recorder):
+            # D1 draft-temp 0.1 = 56.9 t/s vs 54.0 at default; D2@0.1 = 52.0.
+            args.draft_temperature = 0.1
+            injected = set(getattr(args, "_injected_default_flags", set()) or set())
+            injected.add("draft-temperature")
+            args._injected_default_flags = injected
     # Family-aware policy, not the raw lane descriptor: shared lanes (mlx_lm_ar)
     # pin parser=none while a family on that lane (lfm2) has a verified codec.
     # Stamping the lane's "none" here reads as an operator override downstream
