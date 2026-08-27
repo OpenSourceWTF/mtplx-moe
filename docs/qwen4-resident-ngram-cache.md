@@ -17,7 +17,7 @@ mtplx pull OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP
 
 mtplx serve \
   --model OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP \
-  --ngram-cache-limit 4GiB \
+  --ngram-cache-limit 1GiB \
   --port 8000
 ```
 
@@ -40,7 +40,7 @@ startup.
 The environment equivalent is:
 
 ```bash
-export MTPLX_NGRAM_CACHE_LIMIT=4GiB
+export MTPLX_NGRAM_CACHE_LIMIT=1GiB
 mtplx serve \
   --model OpensourceWTF/Qwen3.8-Flash-Next-MTPLX-oQ4-MTP
 ```
