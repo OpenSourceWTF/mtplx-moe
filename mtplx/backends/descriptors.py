@@ -425,6 +425,20 @@ def draft_temperature_curve_for_model(
         descriptor=descriptor,
     )
     return DRAFT_TEMPERATURE_CURVES.get(family)
+# Qwen3.8-Flash-Next model-card best practices (thinking mode): temp 1.0,
+# top_p 0.95, top_k 20, min_p 0, presence/repetition neutral. Own constant so
+# later Flash-Next calibration never drifts the dense-27B contract.
+QWEN4_EXP_SAMPLER_DEFAULTS = SamplerDefaults(temperature=1.0, top_p=0.95, top_k=20)
+QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
+    request_field="depth",
+    display_label="Draft depth",
+    # Live D1 vs D2 probe 2026-08-27 (Bare pack, flight recorder): D1 56.9,
+    # D2 52.0 — depth stays 1 until the tune sweep publishes a measured table.
+    default=1,
+    minimum=1,
+    maximum=3,
+    unit="depth",
+)
 QWEN3_8_REASONING_CODEC = ReasoningCodec(
     parser="qwen3",
     display_name="Qwen think tags",
@@ -468,6 +482,8 @@ def sampler_defaults_for_model(
     )
     if family == "qwen3_8":
         return QWEN3_8_SAMPLER_DEFAULTS
+    if family == "qwen4_exp":
+        return QWEN4_EXP_SAMPLER_DEFAULTS
     return resolved.sampler_defaults
 
 
@@ -484,6 +500,8 @@ def draft_semantics_for_model(
     )
     if family == "qwen3_8":
         return QWEN3_8_DRAFT_SEMANTICS
+    if family == "qwen4_exp":
+        return QWEN4_EXP_DRAFT_SEMANTICS
     return resolved.draft_semantics
 
 
@@ -1101,6 +1119,12 @@ def model_family_from_inspection(
         if descriptor is not None
         else backend_id_from_inspection(inspection)
     )
+    if backend_id == "qwen4_exp" or _QWEN4_PREVIEW_MARKER.search(text):
+        # Qwen4-generation preview (Qwen3.8-Flash-Next). Own family key so
+        # sampler/draft/reasoning policy never rides the dense-27B qwen3_8
+        # contract (#268 kept them apart by exclusion; this is the positive
+        # identity).
+        return "qwen4_exp"
     if backend_id == GEMMA4_ASSISTANT_DESCRIPTOR.backend_id or "gemma4" in text or "gemma-4" in text:
         return "gemma4"
     if backend_id == STEP3P5_MTP_DESCRIPTOR.backend_id or "step3p5" in text or "step3p7" in text or "step-3.7" in text:

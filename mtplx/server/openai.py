@@ -716,6 +716,17 @@ def _server_runtime_env_overrides(
         # model_type: the family rides the generic native_mtp descriptor, so
         # args.backend_id cannot identify it.
         overrides["MTPLX_SKIP_VERIFY_SNAPSHOT"] = "0"
+    if _served_model_type_is_qwen4_exp(args):
+        # Pipelined AR decode + compiled GDN runs (2026-08-27 receipts:
+        # 42.6 -> 51.9 t/s AR, GPU 57% -> 96.6% busy). The lane arms itself
+        # only when the n-gram table went resident (RAM-plan gated via
+        # MTPLX_NGRAM_RESIDENT=auto in the model loader); smaller machines
+        # keep the staged classic loop. An explicit operator export wins:
+        # profile-env application would otherwise overwrite it, so only
+        # default these when the launcher environment left them unset.
+        for key in ("MTPLX_AR_PIPELINE", "MTPLX_COMPILED_GDN"):
+            if os.environ.get(key) is None:
+                overrides.setdefault(key, "1")
     return overrides
 
 

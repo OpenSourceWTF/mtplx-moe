@@ -39,6 +39,7 @@ import json
 import math
 import os
 import struct
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -633,7 +634,62 @@ class NGramTable(nn.Module):
             group_size=int(meta.get("ngram_group_size", 32)),
         )
 
+    def attach_resident(self, path: Path) -> bool:
+        """Materialize the table as RESIDENT mx arrays for in-graph gathers.
+
+        mx.load's lazy arrays are NOT page-granular — the first eval reads
+        the whole tensor (measured: a mid-request ~32G materialization train
+        collapsed decode to 8 t/s and trips the GPU watchdog in a bare
+        process). So residency is paid ONCE, up front, at model load — and
+        only on machines whose memory plan can afford it (the pipelined AR
+        lane needs in-graph gathers on LAZY ids; smaller machines keep the
+        pread sidecar + staged classic loop, which SSD serves at zero cost).
+        """
+        try:
+            header, _ = _read_safetensors_header(path)
+            meta = header.get("__metadata__", {})
+            bits = int(meta.get("ngram_bits", 4))
+            started = time.perf_counter()
+            raw = mx.load(str(path))
+            if bits == 0:
+                parts = (raw["ngram.weight"], None, None)
+                mx.eval(parts[0])
+                nbytes = parts[0].nbytes
+            else:
+                parts = (
+                    raw["ngram.weight"],
+                    raw["ngram.scales"],
+                    raw["ngram.biases"],
+                )
+                mx.eval(*parts)
+                nbytes = sum(p.nbytes for p in parts)
+            self._lazy_parts = parts
+            self._lazy_bits = bits
+            self._lazy_group = int(meta.get("ngram_group_size", 32))
+            self.prefer_lazy = False
+            print(
+                f"[qwen4_exp] ngram table resident: {nbytes / 2**30:.1f}G in "
+                f"{time.perf_counter() - started:.1f}s (pipelined-AR lane armed)",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(f"[qwen4_exp] ngram resident bind failed: {exc!r}", flush=True)
+            self._lazy_parts = None
+            return False
+
+    def _lazy_gather(self, ids: mx.array) -> mx.array:
+        w, s, b = self._lazy_parts
+        rows_w = w[ids]
+        if self._lazy_bits == 0:
+            return rows_w
+        return mx.dequantize(
+            rows_w, s[ids], b[ids], group_size=self._lazy_group, bits=self._lazy_bits
+        )
+
     def __call__(self, ids: mx.array) -> mx.array:
+        if getattr(self, "prefer_lazy", False) and getattr(self, "_lazy_parts", None) is not None:
+            return self._lazy_gather(ids)
         if self._sidecar is not None:
             return self._sidecar(ids, self.dim)
         if self._sidecar_mode:
@@ -734,6 +790,24 @@ def _read_safetensors_header(path: Path):
         n = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(n))
     return header, 8 + n
+
+
+def _ngram_resident_policy() -> bool:
+    """Should the n-gram table go RAM-resident (arming the pipelined AR
+    lane)? MTPLX_NGRAM_RESIDENT=1/0 pins it; default is auto by machine
+    memory — the resident table costs ~32G on top of the pack, which the
+    128G class affords with headroom and smaller machines must not pay
+    (they keep the SSD sidecar + staged classic loop)."""
+    raw = (os.environ.get("MTPLX_NGRAM_RESIDENT") or "auto").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError):
+        return False
+    return total >= 112 * 2**30
 
 
 class NGramEmbedding(nn.Module):
@@ -844,6 +918,11 @@ class NGramEmbedding(nn.Module):
 
         sidecar = self.ngram_embedding._sidecar
         if sidecar is None or os.environ.get("MTPLX_NGRAM_STAGE", "1") == "0":
+            return
+        if getattr(self, "_stage_disabled", False):
+            # Pipelined AR lane: input ids are LAZY — np.asarray below would
+            # force a graph sync and collapse the pipeline. The lane gathers
+            # in-graph via the table's mmap-lazy binding instead.
             return
         try:
             ids_np = np.asarray(input_ids, dtype=np.int64)
@@ -1050,6 +1129,12 @@ class Qwen4ExpTextModel(nn.Module):
             (i for i, t in enumerate(args.layer_types) if t != "linear_attention"),
             self.ssm_idx,
         )
+        self._gdn_compiled_env = (
+            os.environ.get("MTPLX_COMPILED_GDN", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._gdn_compiled_lane = False
+        self._decode_runs = None
 
     def __call__(self, inputs, cache=None, input_embeddings=None):
         h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
@@ -1060,12 +1145,94 @@ class Qwen4ExpTextModel(nn.Module):
             ple = self.layers[self._ple_stage_idx].ple
             ple.ple_embedding.stage(inputs, cache[self._ple_stage_idx], ple.NGRAM_IDX)
         h = mx.tile(h, (1, 1, self.args.hc_count))
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, input_ids=inputs, ssm_mask=ssm_mask, cache=c)
+        if (
+            h.shape[1] == 1
+            and ssm_mask is None
+            and (self._gdn_compiled_env or self._gdn_compiled_lane)
+            and cache[self.ssm_idx] is not None
+        ):
+            h = self._decode_layers_compiled(h, inputs, cache)
+        else:
+            for layer, c in zip(self.layers, cache):
+                h = layer(h, input_ids=inputs, ssm_mask=ssm_mask, cache=c)
         # The MTP head consumes the pre-mixer widened stream; keep the last
         # one reachable (lazy ref, freed on the next step).
         self._last_widened = h
         return self.hyper_connection_mixer(h)
+
+    # ---- compiled GDN decode runs ----------------------------------------
+    # The qL=1 decode step is CPU-dispatch-bound: ~20.8ms of Python graph
+    # construction per token against <=14ms of GPU work (measured 2026-08-27,
+    # ar-lane census: build=20.79ms wait=0.00ms). GDN layers have FIXED state
+    # shapes at decode (conv tape + SSM state), so contiguous non-PLE GDN
+    # runs compile once and replay in C++. QSA layers grow their caches every
+    # step (KV slab + raw-key concat) and the PLE layer consumes token ids —
+    # both stay eager until the slab/graphbank arc.
+
+    def _build_decode_runs(self):
+        runs = []
+        cur = []
+        for i, layer in enumerate(self.layers):
+            if layer.is_linear and "ple" not in layer:
+                cur.append(i)
+            else:
+                if cur:
+                    runs.append(("run", (tuple(cur), self._compiled_run_fn(cur))))
+                    cur = []
+                runs.append(("eager", i))
+        if cur:
+            runs.append(("run", (tuple(cur), self._compiled_run_fn(cur))))
+        return runs
+
+    def _compiled_run_fn(self, idxs):
+        layers = [self.layers[i] for i in idxs]
+
+        def step(h, *flat):
+            out_states = []
+            k = 0
+            for layer in layers:
+                c = ArraysCache(size=2)
+                c[0], c[1] = flat[k], flat[k + 1]
+                k += 2
+                h = layer(h, input_ids=None, ssm_mask=None, cache=c)
+                out_states.extend((c[0], c[1]))
+            return (h, *out_states)
+
+        return mx.compile(step)
+
+    def _decode_layers_compiled(self, h, inputs, cache):
+        if self._decode_runs is None:
+            self._decode_runs = self._build_decode_runs()
+        for kind, payload in self._decode_runs:
+            if kind == "eager":
+                i = payload
+                h = self.layers[i](
+                    h, input_ids=inputs, ssm_mask=None, cache=cache[i]
+                )
+                continue
+            idxs, fn = payload
+            flat = []
+            usable = True
+            for i in idxs:
+                s0, s1 = cache[i][0], cache[i][1]
+                if s0 is None or s1 is None:
+                    usable = False
+                    break
+                flat.extend((s0, s1))
+            if not usable:
+                for i in idxs:
+                    h = self.layers[i](
+                        h, input_ids=inputs, ssm_mask=None, cache=cache[i]
+                    )
+                continue
+            out = fn(h, *flat)
+            h = out[0]
+            k = 1
+            for i in idxs:
+                cache[i][0] = out[k]
+                cache[i][1] = out[k + 1]
+                k += 2
+        return h
 
 
 class TextModel(nn.Module):
@@ -1353,9 +1520,33 @@ class Model(nn.Module):
         path = Path(model_path) / "ngram-table.safetensors"
         if not path.exists():
             return
+        resident = _ngram_resident_policy()
         for layer in self.layers:
             if "ple" in layer:
-                layer.ple.ple_embedding.ngram_embedding.attach_sidecar(path)
+                table = layer.ple.ple_embedding.ngram_embedding
+                table.attach_sidecar(path)
+                if resident:
+                    table.attach_resident(path)
+
+    def set_ar_pipeline_mode(self, enabled: bool) -> bool:
+        """Flip the family into (or out of) the pipelined-AR decode contract:
+        n-gram staging off + in-graph mmap-lazy gathers, so a forward built
+        on LAZY token ids records no host sync. Returns False when the lazy
+        table binding is unavailable (lane must not engage)."""
+        ready = True
+        for layer in self.layers:
+            if "ple" not in layer:
+                continue
+            emb = layer.ple.ple_embedding
+            table = emb.ngram_embedding
+            if enabled and getattr(table, "_lazy_parts", None) is None:
+                ready = False
+                continue
+            emb._stage_disabled = bool(enabled)
+            table.prefer_lazy = bool(enabled)
+        if ready:
+            self.language_model.model._gdn_compiled_lane = bool(enabled)
+        return ready
 
     # -- weight plumbing ---------------------------------------------------
 
