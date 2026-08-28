@@ -748,6 +748,12 @@ def _server_runtime_env_overrides(
         #   +1.03 t/s (+1.7%, B took the two fastest rows), order-reversed
         #   B/A/B +1.26 t/s (+2.2%), B took the six fastest warm rows and
         #   the trailing B arm beat A against the session's downward drift.
+        # - Verify-width conv+silu+l2norm rows kernel (2026-08-27): the same
+        #   chain for speculative verify blocks (S<=6, sliding in-block conv
+        #   window, capture-stash-compatible; the recurrence stays in the
+        #   library gated_delta_update dispatch). MTP two boot-triples, both
+        #   orders: B/A/B +1.95 t/s (+3.06%, fused arm held the top-5 rows),
+        #   A/B/A +1.45 t/s (+2.28%). Best arm mean of the campaign (67.15).
         for key in (
             "MTPLX_AR_PIPELINE",
             "MTPLX_COMPILED_GDN",
@@ -757,6 +763,7 @@ def _server_runtime_env_overrides(
             "MTPLX_FUSED_GATE_UP",
             "MTPLX_FUSED_GDN_CONVNORM",
             "MTPLX_FUSED_GDN_STEP",
+            "MTPLX_FUSED_CONVNORM_VERIFY",
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")

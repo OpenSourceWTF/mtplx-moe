@@ -857,7 +857,7 @@ def test_mtp_batch_installs_qwen35b_optimized_kernel_routes_at_construction():
     }
 
 
-_QWEN4_EXP_FAMILY_ENV_OCTET = (
+_QWEN4_EXP_FAMILY_ENV_DEFAULTS = (
     "MTPLX_AR_PIPELINE",
     "MTPLX_COMPILED_GDN",
     "MTPLX_FAMILY_CAPTURE_COMMIT",
@@ -866,6 +866,7 @@ _QWEN4_EXP_FAMILY_ENV_OCTET = (
     "MTPLX_FUSED_GATE_UP",
     "MTPLX_FUSED_GDN_CONVNORM",
     "MTPLX_FUSED_GDN_STEP",
+    "MTPLX_FUSED_CONVNORM_VERIFY",
 )
 
 
@@ -886,11 +887,11 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
         verify_strategy="capture_commit",
         model=str(tmp_path),
     )
-    for key in (*_QWEN4_EXP_FAMILY_ENV_OCTET, "MTPLX_NAX_VERIFY"):
+    for key in (*_QWEN4_EXP_FAMILY_ENV_DEFAULTS, "MTPLX_NAX_VERIFY"):
         monkeypatch.delenv(key, raising=False)
 
     overrides = openai._server_runtime_env_overrides(args, {})
-    for key in _QWEN4_EXP_FAMILY_ENV_OCTET:
+    for key in _QWEN4_EXP_FAMILY_ENV_DEFAULTS:
         assert overrides.get(key) == "1", key
     assert overrides.get("MTPLX_NAX_VERIFY") == "0"
 
@@ -924,7 +925,7 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
         ),
         {},
     )
-    for key in (*_QWEN4_EXP_FAMILY_ENV_OCTET, "MTPLX_NAX_VERIFY"):
+    for key in (*_QWEN4_EXP_FAMILY_ENV_DEFAULTS, "MTPLX_NAX_VERIFY"):
         assert key not in other, key
 
 

@@ -295,6 +295,10 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # One-dispatch GDN decode step (2026-08-27 family default; two
         # boot-triple receipt in the server's family octet comment).
         "MTPLX_FUSED_GDN_STEP",
+        # Verify-width conv+silu+l2norm rows kernel (2026-08-27 candidate,
+        # A/B pending — registered ahead of any default flip per the
+        # boot-time-validator lesson in mistakes/).
+        "MTPLX_FUSED_CONVNORM_VERIFY",
         # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
         # NAX verify patch OFF under turbo until it earns a family receipt.
         "MTPLX_NAX_VERIFY",

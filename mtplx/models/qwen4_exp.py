@@ -297,6 +297,19 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
             k = k_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
             v = v_f.reshape(B, S, self.num_v_heads, self.head_v_dim)
             state = cache[1] if cache else None
+        elif self._fused_conv_norm_rows_applies(B, S, mask, cache):
+            from mtplx.kernels.gdn_conv_norm import fused_gdn_conv_norm_rows
+
+            q_f, k_f, v_f, new_state = fused_gdn_conv_norm_rows(
+                qkv.reshape(S, -1),
+                conv_state.reshape(self.conv_kernel_size - 1, self.conv_dim),
+                self.conv1d.weight,
+            )
+            cache[0] = new_state.reshape(B, self.conv_kernel_size - 1, self.conv_dim)
+            q = q_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
+            k = k_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
+            v = v_f.reshape(B, S, self.num_v_heads, self.head_v_dim)
+            state = cache[1] if cache else None
         else:
             conv_input = mx.concatenate([conv_state, qkv], axis=1)
             if cache is not None:
@@ -386,6 +399,27 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
         if B != 1 or S != 1 or mask is not None or cache is None:
             return False
         if not _fused_gdn_conv_norm_enabled() or self.training:
+            return False
+        if getattr(cache, "lengths", None) is not None:
+            return False
+        if self.conv_dim != 10240 or self.key_dim != 2048:
+            return False
+        if self.conv_kernel_size != 4 or self.head_k_dim != 128:
+            return False
+        if getattr(self.conv1d, "bias", None) is not None:
+            return False
+        return True
+
+    def _fused_conv_norm_rows_applies(self, B, S, mask, cache) -> bool:
+        # Verify-width conv+silu+l2norm (MTPLX_FUSED_CONVNORM_VERIFY): the
+        # same chain the S=1 kernel replaces, for speculative verify blocks
+        # of 2..6 sequential rows. Deliberately ALLOWED under the capture
+        # scope — the kernel produces exactly the q/k/v rows the
+        # capture-commit stash retains, in the S=1 kernel's tolerance class.
+        # The recurrence stays in the library gated_delta_update dispatch.
+        if B != 1 or S < 2 or S > 6 or mask is not None or cache is None:
+            return False
+        if not _fused_conv_norm_rows_enabled() or self.training:
             return False
         if getattr(cache, "lengths", None) is not None:
             return False
@@ -901,6 +935,11 @@ def _fused_gdn_conv_norm_enabled() -> bool:
 
 def _fused_gdn_step_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_GDN_STEP") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_conv_norm_rows_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_CONVNORM_VERIFY") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 

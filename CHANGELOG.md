@@ -19,6 +19,14 @@ All notable user-facing changes to MTPLX. The format is based on
   (`mtplx-flash-next-bare-speed`, `mtplx-flash-next-optimized-speed`)
   now resolve from HF ids, folder names, and `mtplx pull` aliases;
   derivative or renamed packs deliberately do not inherit the ids.
+- **Verify-width GDN conv kernel.** The conv + SiLU + L2-norm chain that
+  speculative verify blocks previously ran as an eager op sequence now runs
+  as one Metal dispatch for blocks of up to six rows, with a sliding
+  in-block conv window, and stays fully compatible with the family's
+  capture-commit rollback (it emits the exact rows the stash retains).
+  Default-on for the family after two boot-triple A/B batteries in both
+  orders (+3.1% and +2.3% MTP decode; the fused arm posted the campaign's
+  best arm mean).
 - **One-dispatch GDN decode step.** The whole GatedDeltaNet decode
   step — causal conv + SiLU + L2 norm, decay/beta gates, the fp32 delta
   recurrence, and the gated-RMS output epilogue — now runs as a single
