@@ -195,7 +195,15 @@ class QSAIndexer(nn.Module):
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-    def __call__(self, x, rope, cache, offset: int) -> Optional[mx.array]:
+    def __call__(
+        self,
+        x,
+        rope,
+        cache,
+        q_pos: mx.array,
+        cos_q: mx.array,
+        sin_q: mx.array,
+    ) -> Optional[mx.array]:
         B, S, _ = x.shape
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
@@ -223,8 +231,6 @@ class QSAIndexer(nn.Module):
         cos_k, sin_k = rope(block_starts[None, :])
         pooled = _rope_partial(pooled, cos_k, sin_k)
 
-        q_pos = mx.arange(offset, offset + S)
-        cos_q, sin_q = rope(q_pos[None, :])
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
 
@@ -292,8 +298,10 @@ class Attention(nn.Module):
     def __call__(self, x, rope, mask, cache, idx_cache) -> mx.array:
         B, S, _ = x.shape
         offset = cache.offset if cache is not None else 0
+        q_pos = mx.arange(offset, offset + S)
+        cos_q, sin_q = rope(q_pos[None, :])
 
-        sparse = self.indexer(x, rope, idx_cache, offset)
+        sparse = self.indexer(x, rope, idx_cache, q_pos, cos_q, sin_q)
 
         q_proj, k_proj, v_proj = self._project_qkv(x)
         q, gate = mx.split(q_proj.reshape(B, S, self.n_heads, -1), 2, axis=-1)
@@ -304,8 +312,7 @@ class Attention(nn.Module):
         )
         v = v_proj.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        cos, sin = rope(mx.arange(offset, offset + S)[None])
-        cos, sin = cos[:, None], sin[:, None]
+        cos, sin = cos_q[:, None], sin_q[:, None]
         q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 
         if cache is not None:

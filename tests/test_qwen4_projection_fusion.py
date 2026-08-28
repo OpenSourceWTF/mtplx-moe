@@ -4,7 +4,13 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mtplx.models.qwen4_omlx import Attention, GatedDeltaNet, TextArgs
+from mtplx.models.qwen4_omlx import (
+    Attention,
+    GatedDeltaNet,
+    QSAKVCache,
+    RotaryEmbedding,
+    TextArgs,
+)
 from mtplx.proj_fusion import configure_fused_projections
 from mtplx.qwen4_projection_fusion import install_qwen4_fused_projection_routes
 
@@ -91,3 +97,25 @@ def test_qwen4_attention_installs_one_exact_small_row_projection_route():
         actual = layer._project_qkv(x)
         mx.eval(*expected, *actual)
         assert all(mx.array_equal(got, want) for got, want in zip(actual, expected))
+
+
+def test_qwen4_attention_reuses_query_rope_with_sparse_indexer():
+    args = _args()
+    args.indexer_budget = 2
+    args.indexer_compress_ratio = 1
+    layer = Attention(args)
+    cache = QSAKVCache()
+    base_rope = RotaryEmbedding(args.head_dim, args.rope_theta)
+    rope_calls = []
+
+    def counted_rope(positions):
+        rope_calls.append(positions)
+        return base_rope(positions)
+
+    x = mx.random.normal((1, 3, args.hidden_size), dtype=mx.float16)
+    output = layer(x, counted_rope, None, cache, cache.indexer)
+    mx.eval(output)
+
+    # One call for pooled indexer blocks and one shared by indexer-query and
+    # attention-query rotations.
+    assert len(rope_calls) == 2
