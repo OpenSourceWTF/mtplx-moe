@@ -1000,7 +1000,7 @@ struct SettingsTab: View {
                 FormRow(
                     label: "Profile",
                     caption: "Auto picks the recommended profile for the "
-                        + "selected model — Turbo for the 27B models."
+                        + "selected model — Turbo for the 27B and Flash-Next models."
                 ) {
                     // Only persistable profiles may appear here; a stray
                     // tag value persists into config and kills serve at

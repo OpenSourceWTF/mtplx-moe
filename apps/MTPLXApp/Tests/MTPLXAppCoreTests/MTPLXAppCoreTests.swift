@@ -5059,23 +5059,26 @@ final class MTPLXAppCoreTests: XCTestCase {
     }
 
     func testOpenCodeReasoningEffortRoutesFlashNextBeforeQwen38Markers() {
-        // Both served ids carry the qwen4_exp dial (xhigh/medium/low,
-        // default xhigh — engine QWEN4_EXP_REASONING_CODEC).
+        // Both served ids carry the qwen4_exp dial (xhigh/medium/low).
+        // The OpenCode surface writes the AGENT-lane default medium (engine
+        // codec default_agent_effort, 2026-08-28 wall-clock A/B: xhigh
+        // 150.2s vs medium 44.2s, same correct output); chat keeps xhigh.
         for served in ["mtplx-flash-next-bare-speed", "mtplx-flash-next-optimized-speed"] {
             XCTAssertEqual(
                 OpenCodeIntegration.reasoningEffortLevels(forModelID: served),
                 ["xhigh", "medium", "low"],
                 served
             )
-            XCTAssertEqual(OpenCodeIntegration.reasoningEffort(forModelID: served), "xhigh", served)
+            XCTAssertEqual(OpenCodeIntegration.reasoningEffort(forModelID: served), "medium", served)
         }
         // The HF repo id carries BOTH markers ("Qwen3.8" and "Flash-Next");
-        // flash-next must win or the 27B medium default would claim it.
+        // flash-next must win or the 27B arm would claim it (same value
+        // today, distinct rationale and comment trail).
         XCTAssertEqual(
             OpenCodeIntegration.reasoningEffort(
                 forModelID: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed"
             ),
-            "xhigh"
+            "medium"
         )
         // The other collision direction: plain 27B ids keep medium.
         XCTAssertEqual(
@@ -5096,9 +5099,10 @@ final class MTPLXAppCoreTests: XCTestCase {
             desktopSettingsStoreURL: desktopSettingsURL
         )
 
-        // No app dial set: the qwen4_exp family default (xhigh) is mirrored,
-        // and the "Qwen3.8-Flash-Next" name resolves the Flash-Next served
-        // id, never the dense-27B one it also substring-matches.
+        // No app dial set: the qwen4_exp AGENT-lane default (medium, engine
+        // codec default_agent_effort; chat keeps xhigh) is mirrored, and the
+        // "Qwen3.8-Flash-Next" name resolves the Flash-Next served id, never
+        // the dense-27B one it also substring-matches.
         let result = try integration.sync(
             configuration: MTPLXAppConfiguration(
                 model: "/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
@@ -5118,7 +5122,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(model["reasoning"]?.boolValue, true)
         XCTAssertEqual(
             model["options"]?.objectValue?["reasoningEffort"]?.stringValue,
-            "xhigh"
+            "medium"
         )
         var variants = try XCTUnwrap(model["variants"]?.objectValue)
         XCTAssertEqual(Set(variants.keys), ["none", "minimal", "high"])
@@ -5143,7 +5147,7 @@ final class MTPLXAppCoreTests: XCTestCase {
         model = try XCTUnwrap(models["mtplx-flash-next-optimized-speed"]?.objectValue)
         XCTAssertEqual(
             model["options"]?.objectValue?["reasoningEffort"]?.stringValue,
-            "xhigh"
+            "medium"
         )
         variants = try XCTUnwrap(model["variants"]?.objectValue)
         XCTAssertEqual(Set(variants.keys), ["none", "minimal", "high"])

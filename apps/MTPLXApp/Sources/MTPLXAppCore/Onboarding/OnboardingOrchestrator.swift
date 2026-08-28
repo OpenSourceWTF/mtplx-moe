@@ -253,6 +253,7 @@ public final class OnboardingOrchestrator: ObservableObject {
         case "qwen3_5": return "Qwen 3.5"
         case "qwen3_6": return "Qwen 3.6"
         case "qwen3_8": return "Qwen 3.8"
+        case "qwen4_exp": return "Flash-Next"
         case "gemma4": return "Gemma"
         case "step": return "Step"
         case "glm": return "GLM"

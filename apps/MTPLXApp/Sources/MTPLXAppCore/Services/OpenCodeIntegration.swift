@@ -557,10 +557,13 @@ public struct OpenCodeIntegration: Sendable {
     public static func reasoningEffort(forModelID modelID: String) -> String? {
         let lower = modelID.lowercased()
         if lower.contains("flash-next") || lower.contains("flash_next") || lower.contains("qwen4") {
-            // QWEN4_EXP_REASONING_CODEC default: xhigh (founder call
-            // 2026-08-28) — before the 3.8 markers, which the pack names
-            // also contain and whose default is medium.
-            return "xhigh"
+            // Agent-lane default is medium (engine codec default_agent_effort):
+            // the 2026-08-28 wall-clock A/B on the identical multifile coding
+            // task measured xhigh 150.2s vs medium 44.2s with the same correct
+            // output. Chat surfaces keep the family chat default (xhigh); the
+            // OpenCode effort picker still offers xhigh per request. Checked
+            // before the 3.8 markers, which the pack names also contain.
+            return "medium"
         }
         if lower.contains("qwen38") || lower.contains("qwen3.8") || lower.contains("qwen3-8") {
             // QWEN3_8_REASONING_CODEC default: medium (strict max-fan A/B,
