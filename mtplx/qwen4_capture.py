@@ -6,6 +6,7 @@ from types import MethodType
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from .gdn_capture import (
     _linear_gated_delta_from_conv_headquarter_kernel,
@@ -56,6 +57,60 @@ def _make_qwen4_norm_gate_kernel():
 _QWEN4_NORM_GATE_KERNEL = _make_qwen4_norm_gate_kernel()
 
 
+def _make_qwen4_combine_norm_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="mtplx_qwen4_m2_hyper_combine_norm_bf16",
+        input_names=["residual", "value", "inject", "weight", "eps"],
+        output_names=["hidden", "normed"],
+        source=r"""
+            constexpr uint D = 2560;
+            constexpr uint HC = 4;
+            constexpr uint READS = 10;
+            uint unit = thread_position_in_grid.z;
+            uint token = unit / HC;
+            uint stream = unit - token * HC;
+            uint tid = thread_position_in_threadgroup.x;
+            uint lane = thread_index_in_simdgroup;
+            uint simd = simdgroup_index_in_threadgroup;
+            uint base = token * HC * D + stream * D;
+            InT values[READS];
+            float sumsq = 0.0f;
+            threadgroup float partial[32];
+            threadgroup float inv_rms;
+            for (uint i = 0; i < READS; ++i) {
+                uint column = tid + i * 256;
+                InT product = static_cast<InT>(
+                    value[token * D + column] * inject[token * HC + stream]);
+                values[i] = static_cast<InT>(residual[base + column] + product);
+                sumsq += float(values[i]) * float(values[i]);
+                hidden[base + column] = values[i];
+            }
+            sumsq = simd_sum(sumsq);
+            if (simd == 0) partial[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) partial[simd] = sumsq;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0) {
+                float total = simd_sum(partial[lane]);
+                if (lane == 0)
+                    inv_rms = metal::precise::rsqrt(total / float(D) + eps);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < READS; ++i) {
+                uint column = tid + i * 256;
+                InT normalized = static_cast<InT>(float(values[i]) * inv_rms);
+                normed[base + column] = static_cast<InT>(
+                    normalized * weight[stream * D + column]);
+            }
+        """,
+    )
+
+
+_QWEN4_COMBINE_NORM_KERNEL = _make_qwen4_combine_norm_kernel()
+
+
 def _qwen4_norm_gate(x: mx.array, gate: mx.array, weight: mx.array, eps: float):
     rows = int(x.shape[0]) * int(x.shape[1]) * 48
     (out,) = _QWEN4_NORM_GATE_KERNEL(
@@ -69,6 +124,29 @@ def _qwen4_norm_gate(x: mx.array, gate: mx.array, weight: mx.array, eps: float):
     return out
 
 
+def _qwen4_combine_norm(residual, value, inject, norm):
+    batch, rows, _ = residual.shape
+    hidden, normed = _QWEN4_COMBINE_NORM_KERNEL(
+        inputs=[residual, value, inject, norm.weight, float(norm.eps)],
+        template=[("InT", residual.dtype)],
+        grid=(256, 1, batch * rows * 4),
+        threadgroup=(256, 1, 1),
+        output_shapes=[tuple(residual.shape), tuple(residual.shape)],
+        output_dtypes=[residual.dtype, residual.dtype],
+    )
+    return hidden, normed
+
+
+def _qwen4_hyper_from_normed(module, hidden, normed):
+    weight = mx.sigmoid(
+        module.input_mix_weight_up(nn.silu(module.input_mix_weight_down(normed) / 4))
+    )
+    weight = weight.reshape(*weight.shape[:-1], 4, 2560)
+    mixed = (weight * normed.reshape(*normed.shape[:-1], 4, 2560)).mean(axis=-2)
+    inject = 2 * mx.sigmoid(module.block_inject_weight(normed) / 4)
+    return mixed, hidden, inject
+
+
 def is_exact_qwen4_capture_config(config: dict[str, Any]) -> bool:
     """Return whether *config* matches the measured fixed-shape capture lane."""
 
@@ -78,6 +156,8 @@ def is_exact_qwen4_capture_config(config: dict[str, Any]) -> bool:
         and isinstance(text, dict)
         and text.get("model_type") == "qwen4_exp_text"
         and int(text.get("hidden_size", -1)) == 2560
+        and int(text.get("hc_count", -1)) == 4
+        and int(text.get("hc_lowrank", -1)) == 320
         and int(text.get("num_hidden_layers", -1)) == 48
         and int(text.get("linear_num_key_heads", -1)) == 16
         and int(text.get("linear_num_value_heads", -1)) == 48
@@ -193,11 +273,12 @@ def _qwen4_forward_with_capture(
                 layer_cache,
                 indexer_cache,
             )
-        hidden = residual + (value[..., None, :] * inject[..., None]).reshape(
-            *value.shape[:-1], -1
+        hidden, normed = _qwen4_combine_norm(
+            residual, value, inject, layer.mlp_hyper_connection.hc_norm
         )
-
-        value, residual, inject = layer.mlp_hyper_connection(hidden)
+        value, residual, inject = _qwen4_hyper_from_normed(
+            layer.mlp_hyper_connection, hidden, normed
+        )
         value = layer.mlp(value)
         hidden = residual + (value[..., None, :] * inject[..., None]).reshape(
             *value.shape[:-1], -1
@@ -250,9 +331,20 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
             or norm.activation != "sigmoid"
         ):
             raise Qwen4CaptureConfigError("capture norm geometry is invalid")
+    for layer in layers:
+        hyper = layer.mlp_hyper_connection
+        if (
+            int(hyper.hc) != 4
+            or int(hyper.d) != 2560
+            or tuple(hyper.hc_norm.weight.shape) != (10240,)
+            or float(hyper.hc_norm.eps) != 1e-6
+            or hyper.block_inject_weight is None
+        ):
+            raise Qwen4CaptureConfigError("capture hyper geometry is invalid")
     if (
         _linear_gated_delta_from_conv_headquarter_kernel is None
         or _QWEN4_NORM_GATE_KERNEL is None
+        or _QWEN4_COMBINE_NORM_KERNEL is None
     ):
         raise Qwen4CaptureConfigError("capture Metal kernels are unavailable")
     runtime.forward_ar_capture = MethodType(_forward_ar_capture, runtime)

@@ -11,6 +11,8 @@ def _config():
         "text_config": {
             "model_type": "qwen4_exp_text",
             "hidden_size": 2560,
+            "hc_count": 4,
+            "hc_lowrank": 320,
             "num_hidden_layers": 48,
             "linear_num_key_heads": 16,
             "linear_num_value_heads": 48,
@@ -23,8 +25,15 @@ def _config():
 
 
 def _runtime():
+    hyper = SimpleNamespace(
+        hc=4,
+        d=2560,
+        hc_norm=SimpleNamespace(weight=SimpleNamespace(shape=(10240,)), eps=1e-6),
+        block_inject_weight=object(),
+    )
     linear = SimpleNamespace(
         is_linear=True,
+        mlp_hyper_connection=hyper,
         linear_attn=SimpleNamespace(
             n_k=16,
             n_v=48,
@@ -39,7 +48,7 @@ def _runtime():
             ),
         ),
     )
-    attention = SimpleNamespace(is_linear=False)
+    attention = SimpleNamespace(is_linear=False, mlp_hyper_connection=hyper)
     layers = [linear for _ in range(36)] + [attention for _ in range(12)]
     model = SimpleNamespace(
         language_model=SimpleNamespace(model=SimpleNamespace(layers=layers))
