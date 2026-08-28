@@ -20,10 +20,9 @@ class Qwen4WholeMoeConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class _Binding:
-    router: Any
-    routed: Any
-    shared: Any
-    shared_gate: Any
+    stage1: Callable[[Any], tuple[Any, Any]]
+    stage2: Callable[[Any, Any], Any]
+    stage3: Callable[[Any, Any, Any, Any], Any]
 
 
 @dataclass(frozen=True)
@@ -165,20 +164,19 @@ def _validate_block(block: Any, index: int) -> None:
 
 
 def _m2_call(block: Any, binding: _Binding, value: Any) -> Any:
-    logits, shared_gate = kernels.stage1(value, binding)
+    logits, shared_gate = binding.stage1(value)
     expert_ids, selected_logits = kernels.route_top10(logits)
     route_scores = mx.softmax(
         selected_logits,
         axis=-1,
         precise=True,
     )
-    activations = kernels.stage2(value, expert_ids, binding)
-    output = kernels.stage3(
+    activations = binding.stage2(value, expert_ids)
+    output = binding.stage3(
         activations,
         expert_ids,
         route_scores,
         shared_gate,
-        binding,
     )
     return output.reshape(value.shape)
 
@@ -194,12 +192,13 @@ def _installed_call(self: Any, value: Any) -> Any:
 
 
 def _bind(block: Any) -> _Binding:
-    return _Binding(
+    stage1, stage2, stage3 = kernels.bind_stages(
         router=block.gate,
         routed=block.switch_mlp,
         shared=block.shared_expert,
         shared_gate=block.shared_expert_gate,
     )
+    return _Binding(stage1=stage1, stage2=stage2, stage3=stage3)
 
 
 def _selfcheck(block: Any, accepted_call: Callable[[Any, Any], Any]) -> float:

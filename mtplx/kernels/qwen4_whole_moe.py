@@ -537,8 +537,7 @@ def _kernel(key: str, input_names: list[str], output_name: str):
     return kernel
 
 
-def stage1(value: Any, binding: Any):
-    shared_gate = binding.shared_gate
+def _stage1_kernel():
     kernel = _KERNELS.get("stage1")
     if kernel is None:
         kernel = mx.fast.metal_kernel(
@@ -555,6 +554,103 @@ def stage1(value: Any, binding: Any):
             ensure_row_contiguous=True,
         )
         _KERNELS["stage1"] = kernel
+    return kernel
+
+
+def bind_stages(*, router: Any, routed: Any, shared: Any, shared_gate: Any):
+    """Bind invariant kernels and weight arrays once for the installed M=2 lane."""
+    stage1_kernel = _stage1_kernel()
+    stage1_static = (
+        router.weight,
+        shared_gate.weight,
+        shared_gate.scales,
+        shared_gate.biases,
+    )
+    stage2_kernel = _kernel(
+        "stage2",
+        [
+            "value", "expert_ids",
+            "routed_gate_weight", "routed_gate_scales", "routed_gate_biases",
+            "routed_up_weight", "routed_up_scales", "routed_up_biases",
+            "shared_gate_weight", "shared_gate_scales", "shared_gate_biases",
+            "shared_up_weight", "shared_up_scales", "shared_up_biases",
+        ],
+        "activations",
+    )
+    stage2_static = tuple(
+        array
+        for projection in (
+            routed.gate_proj,
+            routed.up_proj,
+            shared.gate_proj,
+            shared.up_proj,
+        )
+        for array in (projection.weight, projection.scales, projection.biases)
+    )
+    stage3_kernel = _kernel(
+        "stage3",
+        [
+            "activations", "expert_ids", "route_scores", "shared_gate",
+            "routed_down_weight", "routed_down_scales", "routed_down_biases",
+            "shared_down_weight", "shared_down_scales", "shared_down_biases",
+        ],
+        "output",
+    )
+    stage3_static = (
+        routed.down_proj.weight,
+        routed.down_proj.scales,
+        routed.down_proj.biases,
+        shared.down_proj.weight,
+        shared.down_proj.scales,
+        shared.down_proj.biases,
+    )
+
+    def stage1(value: Any):
+        return stage1_kernel(
+            inputs=[value, *stage1_static],
+            grid=(STAGE1_GROUPS * STAGE1_THREADS, 1, 1),
+            threadgroup=(STAGE1_THREADS, 1, 1),
+            output_shapes=[(ROWS, EXPERTS), (ROWS,)],
+            output_dtypes=[mx.float32, mx.bfloat16],
+        )
+
+    def stage2(value: Any, expert_ids: Any):
+        (activations,) = stage2_kernel(
+            inputs=[value, expert_ids, *stage2_static],
+            grid=(STAGE2_GROUPS * THREADS, 1, 1),
+            threadgroup=(THREADS, 1, 1),
+            output_shapes=[(ROWS, ACTIVATION_SLOTS, INTERMEDIATE)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return activations
+
+    def stage3(
+        activations: Any,
+        expert_ids: Any,
+        route_scores: Any,
+        shared_gate_values: Any,
+    ):
+        (output,) = stage3_kernel(
+            inputs=[
+                activations,
+                expert_ids,
+                route_scores,
+                shared_gate_values,
+                *stage3_static,
+            ],
+            grid=(STAGE3_GROUPS * THREADS, 1, 1),
+            threadgroup=(THREADS, 1, 1),
+            output_shapes=[(ROWS, HIDDEN)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return output
+
+    return stage1, stage2, stage3
+
+
+def stage1(value: Any, binding: Any):
+    shared_gate = binding.shared_gate
+    kernel = _stage1_kernel()
     router = binding.router
     router_weight = router.weight
     (router_logits, shared_gate_values) = kernel(
@@ -654,6 +750,7 @@ def stage3(
 
 
 __all__ = [
+    "bind_stages",
     "launch_geometry",
     "route_top10",
     "sources",
