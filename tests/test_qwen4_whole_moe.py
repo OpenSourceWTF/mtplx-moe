@@ -26,7 +26,7 @@ def test_exact_sources_encode_qwen4_storage_and_right_shapes():
     assert "constexpr uint Q4_GROUP = 32" in sources["stage2"]
     assert "constexpr uint Q8_GROUP = 128" in sources["stage3"]
     assert kernels.launch_geometry() == {
-        "stage1": ((16 * 128, 1, 1), (128, 1, 1)),
+        "stage1": ((128 * 32, 1, 1), (32, 1, 1)),
         "stage2": ((440 * 128, 1, 1), (128, 1, 1)),
         "stage3": ((160 * 128, 1, 1), (128, 1, 1)),
     }

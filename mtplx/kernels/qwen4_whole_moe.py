@@ -14,7 +14,9 @@ INTERMEDIATE = 640
 ACTIVATION_SLOTS = 11
 ROWS = 2
 THREADS = 128
-STAGE1_GROUPS = EXPERTS // 32
+STAGE1_THREADS = 32
+STAGE1_EXPERTS_PER_GROUP = 4
+STAGE1_GROUPS = EXPERTS // STAGE1_EXPERTS_PER_GROUP
 STAGE2_GROUPS = ACTIVATION_SLOTS * (INTERMEDIATE // 16)
 STAGE3_GROUPS = HIDDEN // 16
 
@@ -35,53 +37,48 @@ def _preamble() -> str:
 
 def _stage1_source() -> str:
     return _preamble() + r"""
-        constexpr uint EXPERTS_PER_GROUP = 32;
-        constexpr uint EXPERTS_PER_SUBTILE = 16;
+        constexpr uint EXPERTS_PER_GROUP = 4;
         constexpr uint VALUES_PER_LANE = 16;
         constexpr uint K_BLOCK = VALUES_PER_LANE * 32;
         constexpr uint SHARED_GROUP = 64;
 
         uint expert_tile = threadgroup_position_in_grid.x;
-        uint simd_gid = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
 
-        for (uint subtile = 0; subtile < 2; ++subtile) {
-            uint expert_base = expert_tile * EXPERTS_PER_GROUP
-                + subtile * EXPERTS_PER_SUBTILE + simd_gid * 4;
-            float result[ROWS][4] = {};
-            for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
-                uint k_lane = k_block + lane * VALUES_PER_LANE;
-                float input_values[ROWS][VALUES_PER_LANE];
-                for (uint row = 0; row < ROWS; ++row) {
-                    for (uint item = 0; item < VALUES_PER_LANE; ++item) {
-                        input_values[row][item] = float(
-                            value[row * HIDDEN + k_lane + item]);
-                    }
-                }
-                for (uint result_index = 0; result_index < 4; ++result_index) {
-                    uint expert = expert_base + result_index;
-                    uint weight_base = expert * HIDDEN + k_lane;
-                    for (uint item = 0; item < VALUES_PER_LANE; ++item) {
-                        float weight_value = float(router_weight[weight_base + item]);
-                        for (uint row = 0; row < ROWS; ++row) {
-                            result[row][result_index] +=
-                                input_values[row][item] * weight_value;
-                        }
-                    }
+        uint expert_base = expert_tile * EXPERTS_PER_GROUP;
+        float result[ROWS][4] = {};
+        for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
+            uint k_lane = k_block + lane * VALUES_PER_LANE;
+            float input_values[ROWS][VALUES_PER_LANE];
+            for (uint row = 0; row < ROWS; ++row) {
+                for (uint item = 0; item < VALUES_PER_LANE; ++item) {
+                    input_values[row][item] = float(
+                        value[row * HIDDEN + k_lane + item]);
                 }
             }
-            for (uint row = 0; row < ROWS; ++row) {
-                for (uint result_index = 0; result_index < 4; ++result_index) {
-                    float reduced = simd_sum(result[row][result_index]);
-                    if (lane == 0) {
-                        uint expert = expert_base + result_index;
-                        router_logits[row * EXPERTS + expert] = reduced;
+            for (uint result_index = 0; result_index < 4; ++result_index) {
+                uint expert = expert_base + result_index;
+                uint weight_base = expert * HIDDEN + k_lane;
+                for (uint item = 0; item < VALUES_PER_LANE; ++item) {
+                    float weight_value = float(router_weight[weight_base + item]);
+                    for (uint row = 0; row < ROWS; ++row) {
+                        result[row][result_index] +=
+                            input_values[row][item] * weight_value;
                     }
                 }
             }
         }
+        for (uint row = 0; row < ROWS; ++row) {
+            for (uint result_index = 0; result_index < 4; ++result_index) {
+                float reduced = simd_sum(result[row][result_index]);
+                if (lane == 0) {
+                    uint expert = expert_base + result_index;
+                    router_logits[row * EXPERTS + expert] = reduced;
+                }
+            }
+        }
 
-        if (expert_tile == 0 && simd_gid == 0) {
+        if (expert_tile == 0) {
             const device uchar* weights =
                 reinterpret_cast<const device uchar*>(shared_gate_weight);
             float result[ROWS] = {};
@@ -428,7 +425,10 @@ def sources() -> dict[str, str]:
 
 def launch_geometry() -> dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]]:
     return {
-        "stage1": ((STAGE1_GROUPS * THREADS, 1, 1), (THREADS, 1, 1)),
+        "stage1": (
+            (STAGE1_GROUPS * STAGE1_THREADS, 1, 1),
+            (STAGE1_THREADS, 1, 1),
+        ),
         "stage2": ((STAGE2_GROUPS * THREADS, 1, 1), (THREADS, 1, 1)),
         "stage3": ((STAGE3_GROUPS * THREADS, 1, 1), (THREADS, 1, 1)),
     }
@@ -476,8 +476,8 @@ def stage1(value: Any, binding: Any):
             shared_gate.scales,
             shared_gate.biases,
         ],
-        grid=(STAGE1_GROUPS * THREADS, 1, 1),
-        threadgroup=(THREADS, 1, 1),
+        grid=(STAGE1_GROUPS * STAGE1_THREADS, 1, 1),
+        threadgroup=(STAGE1_THREADS, 1, 1),
         output_shapes=[(ROWS, EXPERTS), (ROWS,)],
         output_dtypes=[mx.float32, mx.bfloat16],
     )
