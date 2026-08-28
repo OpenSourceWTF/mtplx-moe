@@ -211,6 +211,49 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(detected?.path, globalCLI.path)
     }
 
+    func testDetectShellWinningCLIUsesLoginShellPathOrder() throws {
+        // The app's own PATH is the wrong oracle for what a user's terminal
+        // runs (Finder launches never see the shell rc's /opt/homebrew/bin
+        // ordering — 2026-08-28 false-green receipt). The probe must trust
+        // the login shell's answer and still refuse the app-owned runtime.
+        let home = temporaryDirectory()
+        let winner = try makeExecutable(
+            named: "mtplx",
+            body: "#!/bin/sh\necho 'mtplx 2.9.2 (2.9.2)'\n"
+        )
+        let shell = try makeExecutable(
+            named: "fake-shell",
+            body: "#!/bin/sh\necho '\(winner.path)'\n"
+        )
+        let detected = MTPLXCommandBuilder.detectShellWinningCLIExecutable(environment: [
+            "HOME": home.path,
+            "SHELL": shell.path,
+        ])
+        XCTAssertEqual(detected?.path, winner.path)
+
+        // A shell whose winner is the app-owned launcher is the healthy
+        // state — the probe reports no foreign CLI to grade.
+        let appBin = URL(
+            fileURLWithPath: MTPLXCommandBuilder.appRuntimeBinDirectory(
+                environment: ["HOME": home.path]
+            )
+        )
+        try FileManager.default.createDirectory(at: appBin, withIntermediateDirectories: true)
+        let owned = appBin.appendingPathComponent("mtplx")
+        try "#!/bin/sh\necho 'mtplx 9.9.9 (9.9.9)'\n".data(using: .utf8)!.write(to: owned)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: owned.path)
+        let ownedShell = try makeExecutable(
+            named: "fake-shell-owned",
+            body: "#!/bin/sh\necho '\(owned.path)'\n"
+        )
+        XCTAssertNil(
+            MTPLXCommandBuilder.detectShellWinningCLIExecutable(environment: [
+                "HOME": home.path,
+                "SHELL": ownedShell.path,
+            ])
+        )
+    }
+
     /// Manifest-live + a stale pip-like CLI on PATH must install the
     /// bundled wheel instead of throwing "manual update required" —
     /// the pre-existing global CLI must never block the app.

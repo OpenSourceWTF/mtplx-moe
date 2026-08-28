@@ -539,6 +539,58 @@ public struct MTPLXCommandBuilder: Sendable {
         return nil
     }
 
+    /// The executable a real terminal resolves for `mtplx`/`MTPLX`, probed
+    /// through the user's login shell. The app's own process PATH is the
+    /// wrong oracle: a Finder-launched app never inherits the shell rc's
+    /// /opt/homebrew/bin ordering, so setup certified "up to date (2.10)"
+    /// off a launcher the user's terminal never wins with while
+    /// `command -v MTPLX` served Homebrew 2.9.x (issue receipt 2026-08-28).
+    /// Returns nil when the probe fails or only resolves the app-owned
+    /// runtime; callers then fall back to the in-process PATH scan.
+    public static func detectShellWinningCLIExecutable(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        let shell = (environment["SHELL"]?.isEmpty == false ? environment["SHELL"]! : "/bin/zsh")
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: shell)
+        // -l loads the user's login rc (where PATH order actually comes
+        // from); command -v prints one resolution per name.
+        probe.arguments = ["-l", "-c", "command -v mtplx; command -v MTPLX"]
+        let out = Pipe()
+        probe.standardOutput = out
+        probe.standardError = Pipe()
+        do {
+            try probe.run()
+        } catch {
+            return nil
+        }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        probe.waitUntilExit()
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let appRuntimeBin = appRuntimeBinDirectory(environment: environment)
+        let appRuntimeBinResolved = URL(fileURLWithPath: appRuntimeBin)
+            .resolvingSymlinksInPath()
+            .path
+        for line in text.split(separator: "\n") {
+            let path = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard path.hasPrefix("/"),
+                  FileManager.default.isExecutableFile(atPath: path)
+            else { continue }
+            if isDevelopmentWrapper(path) { continue }
+            let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+            if resolved.hasPrefix(appRuntimeBin + "/")
+                || resolved.hasPrefix(appRuntimeBinResolved + "/")
+                || path.hasPrefix(appRuntimeBin + "/")
+            {
+                // The app-owned launcher winning the user's PATH is the
+                // healthy state, not a foreign CLI to grade.
+                continue
+            }
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
     public static func isDevelopmentWrapperPath(_ candidatePath: String) -> Bool {
         let candidate = URL(fileURLWithPath: candidatePath).resolvingSymlinksInPath()
         guard candidate.lastPathComponent.lowercased() == "mtplx" else { return false }

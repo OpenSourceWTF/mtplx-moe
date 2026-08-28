@@ -202,6 +202,52 @@ All notable user-facing changes to MTPLX. The format is based on
   exact page users get and the two can no longer drift apart.
   Notes pages already published under mtplx.com/releases/notes/ need a
   one-time re-render and re-upload to pick this up.
+- **Reasoning history preserves by default on Flash-Next.** The
+  `qwen4_exp` family ships the byte-identical Qwen 3.8 chat template and
+  the same preserve-by-default trained contract, but the auto policy
+  only recognized `qwen3_8` and dropped the family onto the scoped
+  fallback. Every agent round's session-cache postcommit then aborted
+  with `reasoning_history_scoping_mismatch` and re-prefilled the whole
+  assistant turn. With preserve on, mid-session agent turns cost about
+  20 new prefill tokens at 0.11 s first token (scoped paid 300 to 1500
+  tokens at 1.8 to 2.2 s, measured on the release wall-clock rig).
+- **Coding-agent lanes default to medium reasoning effort on
+  Flash-Next.** OpenCode and Pi config writers resolve the family's new
+  agent-lane default (codec `default_agent_effort`) instead of the chat
+  default. On the identical multi-file coding task, xhigh measured
+  150.2 s wall clock against 44.2 s at medium with the same correct
+  output. Chat surfaces keep xhigh; both clients' effort pickers still
+  offer every level per request.
+- **The Pi provider merge owns the transport contract.** The
+  user-preserving config merge kept an older MTPLX's
+  `supportsReasoningEffort: false` alive across every re-sync, which
+  silently killed Pi's effort dial after an upgrade. MTPLX's own
+  compatibility keys now update on sync; user-added keys still survive.
+- **The app's offline settings fallback shows family truth.** With the
+  engine stopped, the inference settings panel fell back to a generic
+  temperature 0.6 and the label "Custom model" for Flash-Next (and could
+  persist that 0.6 over the engine's 1.0). The fallback table now
+  carries the family's native 1.0 / 0.95 / 20 and the proper family
+  name; live-daemon state was always correct.
+- **Onboarding verifies the terminal command through the login shell.**
+  The setup step graded whatever executable the app's own process PATH
+  found, and a Finder-launched app never inherits the shell rc's
+  `/opt/homebrew/bin` ordering, so setup could certify "up to date"
+  while the user's actual terminal still ran an older Homebrew install.
+  The check now asks the user's login shell which executable wins and
+  grades that one.
+- **Each conversation streams on its own turn stream** (#324). Switching
+  conversations mid-generation no longer cross-wires or blanks either
+  turn.
+- **Explicit performance settings are honored over client-target
+  defaults** (#325), and the native Chat launch target stops silently
+  ignoring "Handle multiple at once".
+- **The app accepts custom Hugging Face models the engine reports as
+  runnable** (#359). Install completeness is judged by the source repo's
+  own manifest instead of requiring an `mtplx_runtime.json`.
+- **Forge routes official NVIDIA Nemotron-H configs** by deriving the
+  MTP pattern from `mtp_layers_block_type` (#341); load no longer
+  crashes with an AttributeError.
 
 ## [2.9.3] - 2026-08-26 (internal build — never published; ships as part of 2.10.0)
 
