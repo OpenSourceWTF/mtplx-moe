@@ -166,11 +166,9 @@ def _validate_block(block: Any, index: int) -> None:
 
 def _m2_call(block: Any, binding: _Binding, value: Any) -> Any:
     logits, shared_gate = kernels.stage1(value, binding)
-    expert_ids = mx.argpartition(-logits, block.top_k - 1, axis=-1)[
-        ..., : block.top_k
-    ]
+    expert_ids, selected_logits = kernels.route_top10(logits)
     route_scores = mx.softmax(
-        mx.take_along_axis(logits, expert_ids, axis=-1),
+        selected_logits,
         axis=-1,
         precise=True,
     )

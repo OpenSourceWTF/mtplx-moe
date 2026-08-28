@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import mlx.core as mx
+import numpy as np
+
 from mtplx.kernels import qwen4_whole_moe as kernels
 import mtplx.qwen4_whole_moe as whole_moe
 
@@ -30,6 +33,20 @@ def test_exact_sources_encode_qwen4_storage_and_right_shapes():
         "stage2": ((440 * 128, 1, 1), (128, 1, 1)),
         "stage3": ((160 * 128, 1, 1), (128, 1, 1)),
     }
+
+
+def test_row_owned_top10_matches_qwen4_argpartition_order():
+    logits = mx.sin(mx.arange(2 * 512, dtype=mx.float32) * 1.337).reshape(2, 512)
+    expected_ids = mx.argpartition(-logits, 9, axis=-1)[..., :10]
+    expected_logits = mx.take_along_axis(logits, expected_ids, axis=-1)
+
+    actual_ids, actual_logits = kernels.route_top10(logits)
+    mx.eval(expected_ids, expected_logits, actual_ids, actual_logits)
+
+    np.testing.assert_array_equal(np.asarray(actual_ids), np.asarray(expected_ids))
+    np.testing.assert_array_equal(
+        np.asarray(actual_logits), np.asarray(expected_logits)
+    )
 
 
 def test_exact_m2_route_is_installed_once_and_other_rows_stay_stock(monkeypatch):

@@ -19,6 +19,8 @@ STAGE1_EXPERTS_PER_GROUP = 4
 STAGE1_GROUPS = EXPERTS // STAGE1_EXPERTS_PER_GROUP
 STAGE2_GROUPS = ACTIVATION_SLOTS * (INTERMEDIATE // 16)
 STAGE3_GROUPS = HIDDEN // 16
+ROUTE_THREADS = 256
+ROUTE_SIMD_GROUPS = ROUTE_THREADS // 32
 
 _KERNELS: dict[str, Any] = {}
 
@@ -105,6 +107,101 @@ def _stage1_source() -> str:
                 float reduced = simd_sum(result[row]);
                 if (lane == 0) {
                     shared_gate[row] = bfloat(reduced);
+                }
+            }
+        }
+    """
+
+
+def _route_source() -> str:
+    return _preamble() + r"""
+        constexpr uint SIMD_GROUPS = 8;
+        constexpr uint LOCAL_CANDIDATES = SIMD_GROUPS * TOP_K;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+
+        threadgroup float local_logits[LOCAL_CANDIDATES];
+        threadgroup uint local_indices[LOCAL_CANDIDATES];
+
+        uint expert0 = simd_gid * 64 + lane;
+        uint expert1 = expert0 + 32;
+        float candidate0 = router_logits[row * EXPERTS + expert0];
+        float candidate1 = router_logits[row * EXPERTS + expert1];
+
+        _Pragma("unroll")
+        for (uint rank = 0; rank < TOP_K; ++rank) {
+            bool take1 = candidate1 > candidate0
+                || (candidate1 == candidate0 && expert1 > expert0);
+            float lane_logit = take1 ? candidate1 : candidate0;
+            uint lane_expert = take1 ? expert1 : expert0;
+            float winner_logit = simd_max(lane_logit);
+            float winner_expert_value = simd_max(
+                lane_logit == winner_logit ? float(lane_expert) : -1.0f);
+            uint winner_expert = uint(winner_expert_value);
+            if (lane == 0) {
+                uint destination = simd_gid * TOP_K + rank;
+                local_logits[destination] = winner_logit;
+                local_indices[destination] = winner_expert;
+            }
+            if (lane_expert == winner_expert) {
+                if (take1) {
+                    candidate1 = -INFINITY;
+                } else {
+                    candidate0 = -INFINITY;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_gid == 0) {
+            uint slot0 = lane;
+            uint slot1 = lane + 32;
+            uint slot2 = lane + 64;
+            float merge0 = local_logits[slot0];
+            float merge1 = local_logits[slot1];
+            float merge2 = slot2 < LOCAL_CANDIDATES
+                ? local_logits[slot2] : -INFINITY;
+            uint index0 = local_indices[slot0];
+            uint index1 = local_indices[slot1];
+            uint index2 = slot2 < LOCAL_CANDIDATES
+                ? local_indices[slot2] : 0;
+
+            _Pragma("unroll")
+            for (uint rank = 0; rank < TOP_K; ++rank) {
+                uint selected = 0;
+                float lane_logit = merge0;
+                uint lane_expert = index0;
+                if (merge1 > lane_logit
+                    || (merge1 == lane_logit && index1 > lane_expert)) {
+                    selected = 1;
+                    lane_logit = merge1;
+                    lane_expert = index1;
+                }
+                if (merge2 > lane_logit
+                    || (merge2 == lane_logit && index2 > lane_expert)) {
+                    selected = 2;
+                    lane_logit = merge2;
+                    lane_expert = index2;
+                }
+                float winner_logit = simd_max(lane_logit);
+                float winner_expert_value = simd_max(
+                    lane_logit == winner_logit ? float(lane_expert) : -1.0f);
+                uint winner_expert = uint(winner_expert_value);
+                if (lane == 0) {
+                    uint destination = row * TOP_K + rank;
+                    expert_ids[destination] = winner_expert;
+                    selected_logits[destination] = winner_logit;
+                }
+                if (lane_expert == winner_expert) {
+                    if (selected == 0) {
+                        merge0 = -INFINITY;
+                    } else if (selected == 1) {
+                        merge1 = -INFINITY;
+                    } else {
+                        merge2 = -INFINITY;
+                    }
                 }
             }
         }
@@ -418,6 +515,7 @@ def _stage3_source() -> str:
 def sources() -> dict[str, str]:
     return {
         "stage1": _stage1_source(),
+        "route": _route_source(),
         "stage2": _stage2_source(),
         "stage3": _stage3_source(),
     }
@@ -484,6 +582,27 @@ def stage1(value: Any, binding: Any):
     return router_logits, shared_gate_values
 
 
+def route_top10(router_logits: Any):
+    kernel = _KERNELS.get("route")
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name="mtplx_qwen4_whole_moe_route_top10",
+            input_names=["router_logits"],
+            output_names=["expert_ids", "selected_logits"],
+            source=sources()["route"],
+            ensure_row_contiguous=True,
+        )
+        _KERNELS["route"] = kernel
+    expert_ids, selected_logits = kernel(
+        inputs=[router_logits],
+        grid=(ROWS * ROUTE_THREADS, 1, 1),
+        threadgroup=(ROUTE_THREADS, 1, 1),
+        output_shapes=[(ROWS, TOP_K), (ROWS, TOP_K)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    return expert_ids, selected_logits
+
+
 def stage2(value: Any, expert_ids: Any, binding: Any):
     routed = binding.routed
     shared = binding.shared
@@ -543,4 +662,11 @@ def stage3(
     return output
 
 
-__all__ = ["launch_geometry", "sources", "stage1", "stage2", "stage3"]
+__all__ = [
+    "launch_geometry",
+    "route_top10",
+    "sources",
+    "stage1",
+    "stage2",
+    "stage3",
+]
