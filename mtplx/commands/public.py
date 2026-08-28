@@ -130,7 +130,10 @@ from mtplx.profiles import (
     restore_profile_env,
     runtime_env_with_contract_overrides,
 )
-from mtplx.reasoning_effort import REASONING_EFFORT_CHOICES
+from mtplx.reasoning_effort import (
+    REASONING_EFFORT_CHOICES,
+    REASONING_EFFORT_LEVELS,
+)
 from mtplx.server_urls import (
     bind_label,
     connect_host_for_bind,
@@ -1709,6 +1712,36 @@ def _enable_thinking_for_reasoning(mode: str) -> bool | None:
     if mode == "auto":
         return None
     return mode == "on"
+
+
+def _one_shot_reasoning_effort(
+    args: Any, enable_thinking: bool | None, model_ref: str | None
+) -> str | None:
+    """Resolve --reasoning-effort for the in-process one-shot lanes
+    (run/chat/quickstart) with the server's semantics: thinking off or a
+    family without declared levels -> None; auto -> the family default; an
+    undeclared-but-real tier maps to the nearest declared tier up the
+    global ladder, else nearest below."""
+
+    if enable_thinking is False:
+        return None
+    codec = reasoning_policy_for_model(model_ref=str(model_ref or ""))
+    levels = tuple(codec.effort_levels) if codec.supported else ()
+    if not levels:
+        return None
+    requested = str(getattr(args, "reasoning_effort", None) or "auto").strip().lower()
+    if requested in levels:
+        return requested
+    if requested not in REASONING_EFFORT_LEVELS:
+        return codec.default_effort
+    rank = REASONING_EFFORT_LEVELS.index(requested)
+    for candidate in REASONING_EFFORT_LEVELS[rank + 1 :]:
+        if candidate in levels:
+            return candidate
+    for candidate in reversed(REASONING_EFFORT_LEVELS[:rank]):
+        if candidate in levels:
+            return candidate
+    return codec.default_effort
 
 
 def _redact_secret_value(value: Any) -> Any:
@@ -10174,11 +10207,15 @@ def _generate_one_shot_public(
         )
         reasoning_mode = _reasoning_mode(args)
         enable_thinking = _enable_thinking_for_reasoning(reasoning_mode)
+        reasoning_effort = _one_shot_reasoning_effort(
+            args, enable_thinking, runtime_model
+        )
         prompt_ids = encode_prompt_case(
             rt.tokenizer,
             case,
             chat_template=True,
             enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
         )
         budget = _cli_generation_budget(
             tokenizer=rt.tokenizer,
@@ -10945,11 +10982,17 @@ def _quickstart_generate(
     )
     reasoning_mode = _reasoning_mode(args)
     enable_thinking = _enable_thinking_for_reasoning(reasoning_mode)
+    reasoning_effort = _one_shot_reasoning_effort(
+        args,
+        enable_thinking,
+        getattr(rt, "model_path", getattr(args, "model", "")),
+    )
     prompt_ids = encode_prompt_case(
         rt.tokenizer,
         case,
         chat_template=True,
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
     )
     budget = _cli_generation_budget(
         tokenizer=rt.tokenizer,

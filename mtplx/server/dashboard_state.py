@@ -184,7 +184,14 @@ class InFlightRegistry:
             handle = self._handles.get(request_id)
         if handle is None:
             return False
-        handle.cancel_event.set()
+        # Duck-typed: attributed events record that THIS trip really came
+        # from the POST /v1/mtplx/cancel endpoint, so the stream's terminal
+        # frame can stop blaming the endpoint for internal cancels (#381).
+        set_origin = getattr(handle.cancel_event, "set_origin", None)
+        if set_origin is not None:
+            set_origin("post_endpoint")
+        else:
+            handle.cancel_event.set()
         return True
 
     def update_progress(self, request_id: str, progress: dict[str, Any]) -> None:

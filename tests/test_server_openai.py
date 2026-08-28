@@ -9423,6 +9423,120 @@ def test_tool_contract_honors_forced_function_choice():
     assert "instead of a normal text answer" in with_contract[0]["content"]
 
 
+def test_tool_contract_keeps_every_tool_name_when_over_budget():
+    # Issue #376 (adapted from PR #379 by @ArctifoxNL): enough tools that
+    # the joined "Declared tools and schemas" line exceeds the 1200-char
+    # budget. The sentinel `task` sits at the tail — the old raw byte cut
+    # dropped it entirely, and the "never invent ... undeclared tool"
+    # clause then read the dropped name as "tool missing", killing
+    # subagents in agent clients.
+    tools = []
+    for index in range(20):
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": f"tool_{index}",
+                    "description": "x",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            f"prop_{k}": {"type": "string"} for k in range(8)
+                        },
+                        "required": ["prop_0"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+    tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "task",
+                "description": "Launch a subagent task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                    },
+                    "required": ["description", "prompt"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+
+    # Guard: the joined full signatures must exceed the budget so the
+    # fallback path (the code under test) is exercised, not the
+    # under-budget byte-identical path.
+    full = "; ".join(
+        sig for sig in (openai._tool_signature(t) for t in tools) if sig
+    )
+    assert len(full) > 1200
+
+    text = openai._mtplx_tool_contract_text(tools)
+    marker = "Declared tools and schemas: "
+    start = text.find(marker)
+    end = text.find(". Call only these", start)
+    segment = text[start + len(marker) : end]
+
+    for tool in tools:
+        name = tool["function"]["name"]
+        assert re.search(r"\b" + re.escape(name) + r"\b", segment), name
+
+
+def test_anthropic_bridge_forwards_reasoning_effort():
+    # Bridges riding /v1/messages send the flat OpenAI-style field; the
+    # translation dropped it and every family went effort-blind on that
+    # lane (showdown receipt 2026-08-27: low sent, null recorded).
+    request = openai.AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        reasoning_effort="low",
+    )
+    chat = openai._anthropic_to_chat_request(request)
+    assert chat.reasoning_effort == "low"
+
+    without = openai.AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+    )
+    assert openai._anthropic_to_chat_request(without).reasoning_effort is None
+
+
+def test_cancel_attribution_first_origin_wins_and_labels():
+    # #381: one shared cancel event, many setters — the terminal frame
+    # blamed every non-disconnect trip on POST /v1/mtplx/cancel. The first
+    # recorded origin is the one the client is told about.
+    event = openai._AttributedCancelEvent()
+    assert openai._cancel_via_label(event) == "an internal cancellation path"
+    event.set_origin("stop_sequence")
+    event.set_origin("stream_teardown")  # later trips never rewrite history
+    assert event.is_set() and event.origin == "stop_sequence"
+    assert openai._cancel_via_label(event) == "stop-sequence completion"
+
+    from mtplx.server.dashboard_state import InFlightHandle, InFlightRegistry
+
+    post = openai._AttributedCancelEvent()
+    registry = InFlightRegistry()
+    registry.register(
+        InFlightHandle(request_id="r1", cancel_event=post, started_s=0.0)
+    )
+    assert registry.cancel("r1") is True
+    assert post.origin == "post_endpoint" and post.is_set()
+    assert openai._cancel_via_label(post) == "POST /v1/mtplx/cancel"
+
+    plain = Event()  # duck-typed fallback: plain events still just set
+    registry.register(
+        InFlightHandle(request_id="r2", cancel_event=plain, started_s=0.0)
+    )
+    assert registry.cancel("r2") is True and plain.is_set()
+
+
 def test_tool_contract_adds_post_tool_continuation_hint_only_after_tool_result(legacy_rewrites):
     tools = [_bash_tool_schema(), _tool_schema()]
 

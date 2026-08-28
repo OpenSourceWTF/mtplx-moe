@@ -3275,6 +3275,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mtp_toggle_args(run_p)
     run_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(run_p)
+    _add_reasoning_effort_arg(run_p)
     run_p.add_argument("--quiet", action="store_true", help="Hide the stats footer")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     run_p.add_argument("--expect-python", action="store_true")
@@ -3311,6 +3312,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mtp_toggle_args(chat_p)
     chat_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(chat_p)
+    _add_reasoning_effort_arg(chat_p)
     chat_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
     )

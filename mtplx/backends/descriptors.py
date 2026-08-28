@@ -458,6 +458,19 @@ QWEN3_8_REASONING_CODEC = ReasoningCodec(
     effort_levels=("xhigh", "medium", "low"),
     default_effort="medium",
 )
+# Flash-Next ships a byte-identical Qwen think-tag chat template to the dense
+# 27B (diff-verified 2026-08-28), including the template-enforced effort
+# triple (it raise_exceptions outside xhigh/medium/low — "high" would crash
+# the render). Default xhigh is the founder call for this family
+# (2026-08-28) and matches the template's own fallback; the 27B's medium
+# default keeps its separate wall-clock receipt above.
+QWEN4_EXP_REASONING_CODEC = ReasoningCodec(
+    parser="qwen3",
+    display_name="Qwen think tags",
+    default_mode="auto",
+    effort_levels=("xhigh", "medium", "low"),
+    default_effort="xhigh",
+)
 QWEN3_8_DRAFT_SEMANTICS = DraftSemantics(
     request_field="depth",
     display_label="Draft depth",
@@ -1273,6 +1286,8 @@ def reasoning_policy_for_model(
     )
     if family == "qwen3_8":
         return QWEN3_8_REASONING_CODEC
+    if family == "qwen4_exp":
+        return QWEN4_EXP_REASONING_CODEC
     if family in {"qwen3_5", "qwen3_6"}:
         return QWEN3_NEXT_DESCRIPTOR.reasoning_codec
     if family == "gemma4":
@@ -1366,7 +1381,7 @@ def descriptor_for_model(
         model_ref=model_ref,
         descriptor=descriptor,
     )
-    if family != "qwen3_8":
+    if family not in {"qwen3_8", "qwen4_exp"}:
         return descriptor
     return replace(
         descriptor,
@@ -1518,14 +1533,23 @@ def descriptor_from_runtime(runtime: Any, args: Any | None = None) -> BackendDes
     ref_text = str(model_ref or "")
     family_semantics = draft_semantics_for_model(ref_text, None, descriptor)
     family_sampler = sampler_defaults_for_model(ref_text, None, descriptor)
+    # Reasoning follows the same rebind, but only UP: a family with a
+    # declared codec (qwen3_8, qwen4_exp) overrides the generic backend
+    # codec; the unsupported fallback for unrecognized families must never
+    # strip a backend's own codec from custom models.
+    family_reasoning = reasoning_policy_for_model(ref_text, None, descriptor)
+    if not family_reasoning.supported:
+        family_reasoning = descriptor.reasoning_codec
     if (
         family_semantics != descriptor.draft_semantics
         or family_sampler != descriptor.sampler_defaults
+        or family_reasoning != descriptor.reasoning_codec
     ):
         descriptor = replace(
             descriptor,
             draft_semantics=family_semantics,
             sampler_defaults=family_sampler,
+            reasoning_codec=family_reasoning,
         )
     return descriptor
 

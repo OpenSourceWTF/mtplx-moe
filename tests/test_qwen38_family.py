@@ -548,6 +548,103 @@ def test_reasoning_effort_still_none_for_qwen36_state() -> None:
     assert srv._reasoning_effort_for_state(state, thinking_enabled=True) is None
 
 
+def test_flash_next_family_reasoning_codec() -> None:
+    """qwen4_exp shipped effort-blind: reasoning_policy_for_model had no
+    family branch, so reasoning_effort=low was dropped before the request
+    field was read and the template's own xhigh fallback burned 8k+
+    thinking tokens (showdown receipt 2026-08-27). The template is
+    byte-identical to the 27B's, so the declared triple must match it —
+    it raise_exceptions on anything else."""
+
+    for ref in (
+        FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    ):
+        codec = reasoning_policy_for_model(model_ref=ref)
+        assert codec.supported and codec.parser == "qwen3", ref
+        assert codec.effort_levels == ("xhigh", "medium", "low"), ref
+        assert codec.default_effort == "xhigh", ref
+
+
+def test_reasoning_effort_resolves_for_flash_next_state() -> None:
+    from mtplx.server import openai as srv
+
+    state = _state(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID)
+    # Family default (founder call 2026-08-28): xhigh, unlike the 27B's
+    # receipted medium.
+    assert (
+        srv._reasoning_effort_for_state(state, thinking_enabled=True) == "xhigh"
+    )
+    assert (
+        srv._reasoning_effort_for_state(
+            state, thinking_enabled=True, request_effort="low"
+        )
+        == "low"
+    )
+    # "high" is shared vocabulary but outside the template triple: nearest
+    # declared tier UP, never a template crash.
+    assert (
+        srv._reasoning_effort_for_state(
+            state, thinking_enabled=True, request_effort="high"
+        )
+        == "xhigh"
+    )
+    assert (
+        srv._reasoning_effort_for_state(state, thinking_enabled=False) is None
+    )
+
+
+def test_server_defaults_stamp_flash_next_reasoning() -> None:
+    """The daemon twin of _apply_backend_serve_defaults stamped the lane
+    descriptor's codec (native_mtp -> parser "none", no effort), so a child
+    daemon served Flash-Next with reasoning disabled while the CLI parent
+    resolved the family correctly."""
+
+    from mtplx.server import openai as srv
+
+    args = srv.parse_args(["--model", FLASH_NEXT_BARE_SPEED_HF_MODEL_ID])
+    srv._apply_backend_server_defaults(args, explicit_flags=set())
+    assert args.reasoning_parser == "qwen3"
+    assert args.reasoning_effort == "xhigh"
+
+    args27 = srv.parse_args(["--model", BARE_SPEED])
+    srv._apply_backend_server_defaults(args27, explicit_flags=set())
+    assert args27.reasoning_parser == "qwen3"
+    assert args27.reasoning_effort == "medium"  # 27B keeps its own receipt
+
+
+def test_one_shot_cli_reasoning_effort_matches_server_semantics() -> None:
+    from types import SimpleNamespace as NS
+
+    from mtplx.commands.public import _one_shot_reasoning_effort
+
+    flash = FLASH_NEXT_BARE_SPEED_HF_MODEL_ID
+    assert _one_shot_reasoning_effort(NS(), True, flash) == "xhigh"  # auto
+    assert (
+        _one_shot_reasoning_effort(NS(reasoning_effort="low"), True, flash)
+        == "low"
+    )
+    assert (
+        _one_shot_reasoning_effort(NS(reasoning_effort="high"), True, flash)
+        == "xhigh"  # nearest declared tier up
+    )
+    assert _one_shot_reasoning_effort(NS(), False, flash) is None
+    assert _one_shot_reasoning_effort(NS(reasoning_effort="xhigh"), True, V2_36) is None
+    assert _one_shot_reasoning_effort(NS(), True, BARE_SPEED) == "medium"
+
+
+def test_run_and_chat_parsers_accept_reasoning_effort() -> None:
+    from mtplx.cli import build_parser
+
+    parser = build_parser()
+    for command in ("run", "chat"):
+        args = parser.parse_args(
+            [command, "--prompt", "hi", "--reasoning-effort", "xhigh"]
+        )
+        assert args.reasoning_effort == "xhigh"
+        assert parser.parse_args([command, "--prompt", "hi"]).reasoning_effort == "auto"
+
+
 def test_normalize_reasoning_effort_accepts_xhigh() -> None:
     from mtplx.server import openai as srv
 

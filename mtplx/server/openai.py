@@ -603,10 +603,56 @@ def _raise_if_stream_cancelled(
         raise _StreamCancelled(message)
 
 
+class _AttributedCancelEvent(Event):
+    """Per-request cancel flag that remembers WHY it was first tripped.
+
+    One shared event is set by unrelated paths (the POST /v1/mtplx/cancel
+    endpoint, the client-disconnect monitor, stop-sequence completion,
+    early tool-call finalization, the hidden-tool guard, stall
+    containment, stream teardown). The terminal frame used to blame every
+    non-disconnect trip on the POST endpoint (#381); the first origin
+    recorded here is the one the client is told about.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.origin: str | None = None
+
+    def set_origin(self, origin: str) -> None:
+        if self.origin is None:
+            self.origin = origin
+        self.set()
+
+
+_CANCEL_ORIGIN_VIA = {
+    "post_endpoint": "POST /v1/mtplx/cancel",
+    "client_disconnect": "client disconnect",
+    "stop_sequence": "stop-sequence completion",
+    "early_tool_finish": "server tool-call finalization",
+    "hidden_tool_guard": "the hidden-tool stream guard",
+    "stream_stall": "stream-stall containment",
+    "stream_teardown": "server stream teardown",
+}
+
+
+def _cancel_via_label(cancel_event: Event) -> str:
+    origin = getattr(cancel_event, "origin", None)
+    if origin is None:
+        # Attribution unknown: never blame the POST endpoint for a trip
+        # it did not make (#381) — say what is actually known.
+        return "an internal cancellation path"
+    return _CANCEL_ORIGIN_VIA.get(origin, origin)
+
+
 def _cancel_stream_generation(
-    cancel_event: Event, generation_future: Any | None
+    cancel_event: Event,
+    generation_future: Any | None,
+    origin: str | None = None,
 ) -> None:
-    cancel_event.set()
+    if origin is not None and isinstance(cancel_event, _AttributedCancelEvent):
+        cancel_event.set_origin(origin)
+    else:
+        cancel_event.set()
     if generation_future is None:
         return
     try:
@@ -630,7 +676,10 @@ async def _monitor_request_disconnect(
         if disconnected:
             if on_disconnect is not None:
                 on_disconnect()
-            cancel_event.set()
+            if isinstance(cancel_event, _AttributedCancelEvent):
+                cancel_event.set_origin("client_disconnect")
+            else:
+                cancel_event.set()
             return True
         await asyncio.sleep(max(0.01, float(poll_s)))
     return False
@@ -4491,6 +4540,13 @@ def _anthropic_to_chat_request(
         # Carry the Qwen-style kwargs across the translation so the
         # chat-completions path can honor the known keys (enable_thinking).
         extra_fields["chat_template_kwargs"] = dict(request.chat_template_kwargs)
+    # Bridges riding /v1/messages (Claude Code proxies) send the flat
+    # OpenAI-style field; the model is extra="allow" so it parses, but the
+    # translation dropped it and every family went effort-blind on this
+    # lane (showdown receipt 2026-08-27: low sent, null recorded).
+    requested_effort = getattr(request, "reasoning_effort", None)
+    if isinstance(requested_effort, str) and requested_effort.strip():
+        extra_fields["reasoning_effort"] = requested_effort.strip()
     disable_parallel = _anthropic_disable_parallel_tool_use(request.tool_choice)
     chat_request = ChatCompletionRequest(
         model=request.model,
@@ -6147,11 +6203,35 @@ def _mtplx_tool_contract_text(
     *,
     tool_choice: Any = None,
 ) -> str:
-    signatures = [signature for tool in tools if (signature := _tool_signature(tool))]
-    allowed = "; ".join(signatures) if signatures else "(none)"
+    pairs = [
+        (signature, _tool_spec_name(tool) or "")
+        for tool in tools
+        if (signature := _tool_signature(tool))
+    ]
+    allowed = "; ".join(signature for signature, _ in pairs) if pairs else "(none)"
     example = _tool_call_example(tools)
     if len(allowed) > 1200:
-        allowed = allowed[:1197].rstrip() + "..."
+        # Name-preserving fallback (issue #376; adapted from PR #379 by
+        # @ArctifoxNL): the old raw byte cut dropped whole tool names at the
+        # tail, and the "never invent ... undeclared tool" clause below then
+        # treated every dropped name as undeclared — clients lost `task` and
+        # subagents with it. Keep every declared name visible; sacrifice only
+        # per-tool signature detail when the budget runs out (a bare name
+        # still declares the tool).
+        parts: list[str] = []
+        size = 0
+        for signature, name in pairs:
+            for candidate in (signature, name):
+                extra = len(candidate) if not parts else 2 + len(candidate)
+                if candidate and size + extra <= 1200:
+                    parts.append(candidate)
+                    size += extra
+                    break
+            else:
+                if name:
+                    parts.append(name)
+                    size += 2 + len(name)
+        allowed = "; ".join(parts)
     forced_clause = _forced_tool_contract_clause(tool_choice)
     return (
         f"{_MTPLX_TOOL_CONTRACT_SENTINEL} {_current_date_line()} Your "
@@ -25634,7 +25714,14 @@ def _reasoning_effort_for_state(
     return codec.default_effort
 
 
-_AGENT_THINKING_BUDGET_BY_EFFORT = {"low": 1536, "medium": 3072, "high": 6144}
+_AGENT_THINKING_BUDGET_BY_EFFORT = {
+    "low": 1536,
+    "medium": 3072,
+    "high": 6144,
+    # xhigh must sit above high — without this key the opt-in guard silently
+    # clamped xhigh sessions to the medium fallback budget.
+    "xhigh": 12288,
+}
 
 
 def _thinking_guard_config_for_request(
@@ -28673,7 +28760,7 @@ def create_app(state: ServerState) -> FastAPI:
                 yield mark_sse_sent(f"data: {json.dumps(first)}\n\n")
 
                 queue = _LoopFedStreamQueue(asyncio.get_running_loop())
-                cancel_event = Event()
+                cancel_event = _AttributedCancelEvent()
                 # Register this request in the dashboard's in-flight registry
                 # so external cancel (`POST /v1/mtplx/cancel/{id}`) can flip
                 # the same per-request cancel_event the worker already checks.
@@ -28724,7 +28811,9 @@ def create_app(state: ServerState) -> FastAPI:
                     if stop_sequence_cancel_fired:
                         return
                     stop_sequence_cancel_fired = True
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stop_sequence"
+                    )
 
                 stream_interval = max(1, int(state.args.stream_interval))
                 content_tool_translator = (
@@ -30134,7 +30223,11 @@ def create_app(state: ServerState) -> FastAPI:
                         ):
                             early_tool_cancel_used = True
                             pending_tool_cancel_started_s = None
-                            _cancel_stream_generation(cancel_event, generation_future)
+                            _cancel_stream_generation(
+                                cancel_event,
+                                generation_future,
+                                origin="early_tool_finish",
+                            )
                             return chunks
                         if content_tool_translator.invalid_trailing_after_tool_call:
                             streamed_assistant_tool_calls = (
@@ -30150,7 +30243,11 @@ def create_app(state: ServerState) -> FastAPI:
                                 )
                             early_tool_cancel_used = True
                             pending_tool_cancel_started_s = None
-                            _cancel_stream_generation(cancel_event, generation_future)
+                            _cancel_stream_generation(
+                                cancel_event,
+                                generation_future,
+                                origin="early_tool_finish",
+                            )
                         elif content_tool_translator.ready_to_finish_tool_turn:
                             streamed_assistant_tool_calls = (
                                 content_tool_translator.tool_calls
@@ -30166,7 +30263,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 early_tool_cancel_used = True
                                 pending_tool_cancel_started_s = None
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="early_tool_finish",
                                 )
                             elif pending_tool_cancel_started_s is None:
                                 pending_tool_cancel_started_s = time.perf_counter()
@@ -30438,7 +30537,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         error_chunk(
                                             RuntimeError(
                                                 "request cancelled via "
-                                                "POST /v1/mtplx/cancel "
+                                                f"{_cancel_via_label(cancel_event)} "
                                                 "after "
                                                 f"{streamed_progress_tokens} "
                                                 "streamed tokens"
@@ -30457,7 +30556,9 @@ def create_app(state: ServerState) -> FastAPI:
                                 early_tool_cancel_used = True
                                 pending_tool_cancel_started_s = None
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="early_tool_finish",
                                 )
                                 continue
                             frozen_for_s = owner_stall_probe.observe(now_s)
@@ -30478,7 +30579,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     streamed_tokens=streamed_progress_tokens,
                                 )
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="stream_stall",
                                 )
                                 if session is not None and hasattr(
                                     session, "abort_pending_postcommit"
@@ -30623,7 +30726,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     if streamed_assistant_tool_calls:
                                         early_tool_cancel_used = True
                                         _cancel_stream_generation(
-                                            cancel_event, generation_future
+                                            cancel_event,
+                                            generation_future,
+                                            origin="early_tool_finish",
                                         )
                                     else:
                                         reason = (
@@ -30639,7 +30744,9 @@ def create_app(state: ServerState) -> FastAPI:
                                             stream=True,
                                         )
                                         _cancel_stream_generation(
-                                            cancel_event, generation_future
+                                            cancel_event,
+                                            generation_future,
+                                            origin="hidden_tool_guard",
                                         )
                                         yield mark_sse_sent(
                                             error_chunk(
@@ -31504,7 +31611,7 @@ def create_app(state: ServerState) -> FastAPI:
                                     error_chunk(
                                         RuntimeError(
                                             "request cancelled via "
-                                            "POST /v1/mtplx/cancel after "
+                                            f"{_cancel_via_label(cancel_event)} after "
                                             f"{streamed_progress_tokens} "
                                             "streamed tokens"
                                         )
@@ -31522,7 +31629,9 @@ def create_app(state: ServerState) -> FastAPI:
                             return
                 except asyncio.CancelledError:
                     stream_cancelled_by_client = True
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="client_disconnect"
+                    )
                     raise
                 except GeneratorExit:
                     # Starlette closes the async generator when the client
@@ -31542,9 +31651,17 @@ def create_app(state: ServerState) -> FastAPI:
                     nonlocal_cancel_reason = (
                         "client_disconnected"
                         if stream_cancelled_by_client
-                        else "stream_cancelled"
+                        # Truthful cancel accounting (#381): the recorded
+                        # origin (stop_sequence, early_tool_finish,
+                        # post_endpoint, ...) beats the generic bucket.
+                        else (
+                            getattr(cancel_event, "origin", None)
+                            or "stream_cancelled"
+                        )
                     )
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stream_teardown"
+                    )
                     if (
                         stream_cancelled_by_client
                         and session is not None
@@ -32111,7 +32228,7 @@ def create_app(state: ServerState) -> FastAPI:
             # staring at a silent stream for the whole generation.
             async def event_stream():
                 queue = _LoopFedStreamQueue(asyncio.get_running_loop())
-                cancel_event = Event()
+                cancel_event = _AttributedCancelEvent()
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
                 stop_monitor = _StopSequenceStreamMonitor(stop_sequences)
                 streamed_completion_tokens = 0
@@ -32239,7 +32356,9 @@ def create_app(state: ServerState) -> FastAPI:
                         text = stop_monitor.feed(text)
                         if stop_monitor.stopped and not stop_hit:
                             stop_hit = True
-                            _cancel_stream_generation(cancel_event, generation_future)
+                            _cancel_stream_generation(
+                                cancel_event, generation_future, origin="stop_sequence"
+                            )
                         if not text:
                             return []
                     return [text_chunk(text)]
@@ -32264,7 +32383,8 @@ def create_app(state: ServerState) -> FastAPI:
                                     # silent close (#F36).
                                     yield error_chunk(
                                         RuntimeError(
-                                            "request cancelled server-side "
+                                            "request cancelled via "
+                                            f"{_cancel_via_label(cancel_event)} "
                                             "after "
                                             f"{streamed_completion_tokens} "
                                             "streamed tokens"
@@ -32287,7 +32407,9 @@ def create_app(state: ServerState) -> FastAPI:
                                     streamed_tokens=streamed_completion_tokens,
                                 )
                                 _cancel_stream_generation(
-                                    cancel_event, generation_future
+                                    cancel_event,
+                                    generation_future,
+                                    origin="stream_stall",
                                 )
                                 yield error_chunk(
                                     TimeoutError(
@@ -32388,7 +32510,9 @@ def create_app(state: ServerState) -> FastAPI:
                             yield "data: [DONE]\n\n"
                             return
                 except asyncio.CancelledError:
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="client_disconnect"
+                    )
                     raise
                 except GeneratorExit:
                     # Client disconnect closes the async generator; yielding
@@ -32400,7 +32524,9 @@ def create_app(state: ServerState) -> FastAPI:
                     yield "data: [DONE]\n\n"
                     return
                 finally:
-                    _cancel_stream_generation(cancel_event, generation_future)
+                    _cancel_stream_generation(
+                        cancel_event, generation_future, origin="stream_teardown"
+                    )
 
                 if generated is None:
                     yield error_chunk(RuntimeError("generation ended without a result"))
@@ -32890,8 +33016,21 @@ def _apply_backend_server_defaults(
             )
         args.chat_template_profile = required_chat_template_profile
         args.chat_template_path = None
+    # Family-aware reasoning policy, not the raw lane descriptor — the
+    # daemon twin of _apply_backend_serve_defaults (public.py): a family
+    # sharing a generic lane (qwen4_exp on native_mtp, lfm2 on mlx_lm_ar)
+    # carries its own verified codec, and stamping the lane's parser here
+    # read as an operator override downstream — the child daemon served
+    # Flash-Next with parser "none" and no default effort (2026-08-28).
+    # Families without a declared codec keep the lane's own codec.
+    reasoning = reasoning_policy_for_model(
+        model_ref=str(getattr(args, "model", "") or ""),
+        descriptor=backend,
+    )
+    if not reasoning.supported:
+        reasoning = backend.reasoning_codec
     if not _server_flag_present(explicit_flags, "reasoning-parser"):
-        args.reasoning_parser = backend.reasoning_codec.parser
+        args.reasoning_parser = reasoning.parser
     if (
         backend.default_max_response_tokens is not None
         and not _server_flag_present(explicit_flags, "max-response-tokens")
@@ -32901,9 +33040,9 @@ def _apply_backend_server_defaults(
     if (
         not _server_flag_present(explicit_flags, "reasoning-effort")
         and getattr(args, "reasoning_effort", None) in (None, "auto")
-        and backend.reasoning_codec.default_effort
+        and reasoning.default_effort
     ):
-        args.reasoning_effort = backend.reasoning_codec.default_effort
+        args.reasoning_effort = reasoning.default_effort
     if backend.backend_id != GEMMA4_BACKEND:
         return
 
