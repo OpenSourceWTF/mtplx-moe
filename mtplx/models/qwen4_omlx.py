@@ -215,16 +215,32 @@ class QSAIndexer(nn.Module):
             return None
 
         n_blocks = kv_len // self.compress_ratio
-        pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
-            B, n_blocks, self.compress_ratio, self.head_dim
-        )
-        pooled = self.k_layernorm(
-            pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
-        )
-
         block_starts = mx.arange(n_blocks) * self.compress_ratio
-        cos_k, sin_k = rope(block_starts[None, :])
-        pooled = _rope_partial(pooled, cos_k, sin_k)
+        if cache is None:
+            pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
+                B, n_blocks, self.compress_ratio, self.head_dim
+            )
+            pooled = self.k_layernorm(
+                pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
+            )
+            cos_k, sin_k = rope(block_starts[None, :])
+            pooled = _rope_partial(pooled, cos_k, sin_k)
+        else:
+            pooled_at = cache.pooled_offset
+            if pooled_at < n_blocks:
+                suffix = raw_k[
+                    :,
+                    pooled_at * self.compress_ratio : n_blocks * self.compress_ratio,
+                ].reshape(B, n_blocks - pooled_at, self.compress_ratio, self.head_dim)
+                suffix = self.k_layernorm(
+                    suffix.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
+                )
+                suffix_starts = mx.arange(pooled_at, n_blocks) * self.compress_ratio
+                cos_k, sin_k = rope(suffix_starts[None, :])
+                suffix = _rope_partial(suffix, cos_k, sin_k)
+                pooled = cache.append_pooled(suffix)
+            else:
+                pooled = cache.pooled_keys
 
         q_pos = mx.arange(offset, offset + S)
         cos_q, sin_q = rope(q_pos[None, :])
@@ -799,16 +815,63 @@ class Qwen4ExpModel(nn.Module):
 
 
 class _IndexerCache(_BaseCache):
-    """Holds the indexer raw keys (one per token, not pooled)."""
+    """Own QSA raw keys and the derived completed-block key bank."""
 
-    def __init__(self):
+    raw_step = 2048
+
+    def __init__(self, compress_ratio: int = 4):
         self.keys = None
         self.offset = 0
+        self.compress_ratio = int(compress_ratio)
+        self._pooled_keys = None
+        self.pooled_offset = 0
 
     def update(self, k: mx.array) -> mx.array:
-        self.keys = k if self.keys is None else mx.concatenate([self.keys, k], axis=1)
-        self.offset += k.shape[1]
-        return self.keys
+        previous = self.offset
+        needed = previous + int(k.shape[1])
+        if self.keys is None or needed > int(self.keys.shape[1]):
+            current = 0 if self.keys is None else int(self.keys.shape[1])
+            capacity = (
+                ((needed + self.raw_step - 1) // self.raw_step) + 1
+            ) * self.raw_step
+            extension = mx.zeros(
+                (int(k.shape[0]), capacity - current, int(k.shape[2])),
+                dtype=k.dtype,
+            )
+            self.keys = (
+                extension
+                if self.keys is None
+                else mx.concatenate([self.keys, extension], axis=1)
+            )
+        self.offset = needed
+        self.keys[:, previous:needed] = k
+        return self.keys[:, :needed]
+
+    @property
+    def pooled_keys(self):
+        if self._pooled_keys is None:
+            return None
+        return self._pooled_keys[:, : self.pooled_offset]
+
+    def append_pooled(self, pooled: mx.array) -> mx.array:
+        previous = self.pooled_offset
+        needed = previous + int(pooled.shape[1])
+        step = self.raw_step // self.compress_ratio
+        if self._pooled_keys is None or needed > int(self._pooled_keys.shape[1]):
+            current = 0 if self._pooled_keys is None else int(self._pooled_keys.shape[1])
+            capacity = ((needed + step - 1) // step + 1) * step
+            extension = mx.zeros(
+                (int(pooled.shape[0]), capacity - current, int(pooled.shape[2])),
+                dtype=pooled.dtype,
+            )
+            self._pooled_keys = (
+                extension
+                if self._pooled_keys is None
+                else mx.concatenate([self._pooled_keys, extension], axis=1)
+            )
+        self.pooled_offset = needed
+        self._pooled_keys[:, previous:needed] = pooled
+        return self.pooled_keys
 
     def is_trimmable(self):
         return True
@@ -816,25 +879,35 @@ class _IndexerCache(_BaseCache):
     def trim(self, count: int) -> int:
         trimmed = min(self.offset, count)
         self.offset -= trimmed
-        if self.keys is not None:
-            self.keys = self.keys[:, : self.offset]
+        self.pooled_offset = min(
+            self.pooled_offset, self.offset // self.compress_ratio
+        )
         return trimmed
 
     @property
     def state(self):
-        return self.keys
+        return None if self.keys is None else self.keys[:, : self.offset]
 
     @state.setter
     def state(self, v):
         self.keys = v
+        self.offset = 0 if v is None else int(v.shape[1])
+        self._pooled_keys = None
+        self.pooled_offset = 0
+
+    @property
+    def nbytes(self):
+        raw = 0 if self.keys is None else self.keys.nbytes
+        pooled = 0 if self._pooled_keys is None else self._pooled_keys.nbytes
+        return raw + pooled
 
 
 class QSAKVCache(KVCache):
     """QSA attention cache whose raw indexer keys share rollback ownership."""
 
-    def __init__(self):
+    def __init__(self, compress_ratio: int = 4):
         super().__init__()
-        self.indexer = _IndexerCache()
+        self.indexer = _IndexerCache(compress_ratio)
 
     def update_indexer(self, raw_keys: mx.array) -> mx.array:
         return self.indexer.update(raw_keys)
@@ -846,6 +919,10 @@ class QSAKVCache(KVCache):
     @indexer_offset.setter
     def indexer_offset(self, value: int) -> None:
         self.indexer.offset = int(value)
+        self.indexer.pooled_offset = min(
+            self.indexer.pooled_offset,
+            self.indexer.offset // self.indexer.compress_ratio,
+        )
 
     def trim(self, count: int) -> int:
         trimmed = super().trim(count)
@@ -853,9 +930,54 @@ class QSAKVCache(KVCache):
         return trimmed
 
     @property
+    def state(self):
+        if self.keys is None:
+            return None, None, self.indexer.state
+        return (
+            self.keys[..., : self.offset, :],
+            self.values[..., : self.offset, :],
+            self.indexer.state,
+        )
+
+    @state.setter
+    def state(self, value) -> None:
+        if len(value) == 2:
+            self.keys, self.values = value
+            raw_keys = None
+        else:
+            self.keys, self.values, raw_keys = value
+        self.offset = 0 if self.keys is None else int(self.keys.shape[2])
+        compress_ratio = getattr(getattr(self, "indexer", None), "compress_ratio", 4)
+        self.indexer = _IndexerCache(compress_ratio)
+        self.indexer.state = raw_keys
+
+    @property
+    def meta_state(self):
+        return str(self.indexer.compress_ratio)
+
+    @meta_state.setter
+    def meta_state(self, value) -> None:
+        raw_keys = self.indexer.state
+        self.indexer = _IndexerCache(int(value))
+        self.indexer.state = raw_keys
+
+    @property
     def nbytes(self):
-        raw = 0 if self.indexer.keys is None else self.indexer.keys.nbytes
-        return super().nbytes + raw
+        return super().nbytes + self.indexer.nbytes
+
+
+def _register_qsa_cache_type() -> None:
+    """Make MLX prompt-cache name-based restoration resolve this cache."""
+
+    import mlx_lm.models.cache as cache_module
+
+    registered = getattr(cache_module, "QSAKVCache", None)
+    if registered is not None and registered is not QSAKVCache:
+        raise RuntimeError("mlx_lm already registered a different QSAKVCache type")
+    cache_module.QSAKVCache = QSAKVCache
+
+
+_register_qsa_cache_type()
 
 
 class GemmaRMSNorm(nn.Module):
@@ -1058,14 +1180,17 @@ class LanguageModel(nn.Module):
         caches = []
         for t in self.args.text.layer_types:
             if t == "full_attention":
-                caches.append(QSAKVCache())
+                caches.append(QSAKVCache(self.args.text.indexer_compress_ratio))
             else:
                 # 0: deltanet conv, 1: ssm state, 2: PLE conv, 3: n-gram context
                 caches.append(ArraysCache(4))
         return caches
 
     def make_mtp_cache(self):
-        return [QSAKVCache() for _ in self.mtp.layers]
+        return [
+            QSAKVCache(self.args.text.indexer_compress_ratio)
+            for _ in self.mtp.layers
+        ]
 
 
 class Model(nn.Module):

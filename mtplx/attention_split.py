@@ -351,7 +351,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                         "Sustained long-context paged attention attempted dense "
                         "cache.state fallback after the partition threshold"
                     )
-                keys, values = cache.state
+                keys, values = cache.state[:2]
                 output = scaled_dot_product_attention(
                     queries,
                     keys,

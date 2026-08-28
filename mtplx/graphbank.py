@@ -608,6 +608,11 @@ def promote_kv_cache_offsets(
         if isinstance(entry, TensorOffsetKVCache):
             entry.ensure_capacity(entry.size() + reserve_tokens)
             continue
+        if hasattr(entry, "indexer"):
+            failures["auxiliary_qsa_state"] = (
+                failures.get("auxiliary_qsa_state", 0) + 1
+            )
+            continue
         if preserve_paged:
             try:
                 from .cache_state import (

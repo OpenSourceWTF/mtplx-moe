@@ -951,7 +951,7 @@ def inject_mtp_support(
                 cache.update_without_fetch(keys, values)
                 output = cache.paged_attention(queries, scale=attn.scale)
                 if output is None:
-                    keys, values = cache.state
+                    keys, values = cache.state[:2]
                     output = scaled_dot_product_attention(
                         queries,
                         keys,
