@@ -150,6 +150,18 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **The Live tab's acceptance panel no longer goes blank after a finished
+  request.** Two stacked causes: the daemon's idle warmup ladder published
+  its rungs into the dashboard's `latest` slot, replacing the finished
+  request's receipt (a warmup row with a null request id sat where the
+  user's acceptance counters belonged), and the app's Live-tab gates only
+  ever ticked on `.completed` stream frames, which have no replay, so one
+  frame missed during a reconnect kept the panel on its placeholder
+  forever. Warmup rows now stay out of the dashboard ring server side, the
+  app refuses to merge a warmup row over a real receipt, and a finished
+  request observed through the snapshot poller counts as completion
+  evidence (deduplicated per request), so the panel lights up within one
+  poll of a request finishing regardless of stream health.
 - **The compact tool contract no longer drops trailing tools** (#376,
   adapting community PR #379 by @ArctifoxNL). When the "Declared tools
   and schemas" line exceeded its 1200-character budget it was raw
