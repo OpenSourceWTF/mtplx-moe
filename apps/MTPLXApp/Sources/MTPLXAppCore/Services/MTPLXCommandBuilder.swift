@@ -550,6 +550,13 @@ public struct MTPLXCommandBuilder: Sendable {
     public static func detectShellWinningCLIExecutable(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL? {
+        // Hermetic-test escape hatch, same contract as searchPaths: a caller
+        // that disabled standard paths is describing a fabricated seat, and
+        // probing the real login shell would leak this machine's PATH into
+        // it (19 suite failures when this probe first landed unguarded).
+        if environment["MTPLX_APP_DISABLE_STANDARD_PATHS"]?.isEmpty == false {
+            return nil
+        }
         let shell = (environment["SHELL"]?.isEmpty == false ? environment["SHELL"]! : "/bin/zsh")
         let probe = Process()
         probe.executableURL = URL(fileURLWithPath: shell)
