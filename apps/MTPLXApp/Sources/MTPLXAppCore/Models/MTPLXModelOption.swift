@@ -596,7 +596,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             ],
             // Exact byte sum of the local pack (2026-08-27 audit); includes
             // the 32 GB SSD-streamed n-gram table and the vision tower.
-            sizeBytes: 106_336_779_939,
+            sizeBytes: 106_336_812_394,
             // Weights 72.6 GB + MTP 1.7 GB resident (n-gram on SSD) plus
             // KV/working headroom at the default profile.
             peakMemoryGiB: 78.0,
@@ -620,7 +620,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             ],
             // Exact byte sum of the local pack (2026-08-27 audit); includes
             // the 32 GB SSD-streamed n-gram table and the vision tower.
-            sizeBytes: 115_061_220_772,
+            sizeBytes: 115_061_253_339,
             // Weights 81.4 GB + MTP 1.7 GB resident (n-gram on SSD) plus
             // KV/working headroom at the default profile.
             peakMemoryGiB: 87.0,

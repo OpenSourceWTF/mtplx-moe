@@ -260,9 +260,9 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         display_name="Qwen 3.8 Flash-Next Bare Speed",
         detail="Flat 4-bit quantization. Quickest Flash-Next speeds for chat and coding.",
         hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
-        # Exact byte sum of the local pack (2026-08-27 audit); includes the
-        # 32 GB SSD-streamed n-gram table and the vision tower.
-        size_bytes=106_336_779_939,
+        # Exact byte sum of the published HF repo (2026-08-28 audit); includes
+        # the 32 GB SSD-streamed n-gram table and the vision tower.
+        size_bytes=106_336_812_394,
         # Weights 72.6 GB + MTP 1.7 GB resident (n-gram on SSD) plus
         # KV/working headroom at the default profile.
         peak_memory_gib=78.0,
@@ -282,9 +282,9 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
             "slightly slower. Recommended."
         ),
         hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
-        # Exact byte sum of the local pack (2026-08-27 audit); includes the
-        # 32 GB SSD-streamed n-gram table and the vision tower.
-        size_bytes=115_061_220_772,
+        # Exact byte sum of the published HF repo (2026-08-28 audit); includes
+        # the 32 GB SSD-streamed n-gram table and the vision tower.
+        size_bytes=115_061_253_339,
         # Weights 81.4 GB + MTP 1.7 GB resident (n-gram on SSD) plus
         # KV/working headroom at the default profile.
         peak_memory_gib=87.0,
