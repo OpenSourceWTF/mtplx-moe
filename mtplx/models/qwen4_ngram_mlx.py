@@ -36,6 +36,9 @@ class AffineQ4NGramRows(nn.Module):
         self._cache = cache
         self._acquire_rows = cache.acquire_prevalidated_rows
         self._arena_rows = arena.reshape((-1, row_bytes))
+        self._arena_host_rows = np.frombuffer(
+            memoryview(arena), dtype=np.uint8
+        ).reshape((-1, row_bytes))
         self._row_width = row_width
         self._weight_bytes = weight_bytes
         self._parameter_bytes = parameter_bytes
@@ -46,11 +49,26 @@ class AffineQ4NGramRows(nn.Module):
         requested = tuple(int(row_id) for row_id in host_rows)
         lease = self._acquire_rows(requested)
         try:
-            packed = mx.take(
-                self._arena_rows,
-                mx.array(lease.slot_ids, dtype=mx.int64),
-                axis=0,
-            )
+            if len(logical_shape) == 3 and logical_shape[1] == 2:
+                # The fixed verifier M=2 route owns a tiny packed-row copy.
+                # Once copied, cache slots can be unpinned while dequantize
+                # remains lazy and composes with the rest of the verifier.
+                packed_host = np.array(
+                    self._arena_host_rows[
+                        np.asarray(lease.slot_ids, dtype=np.intp)
+                    ],
+                    copy=True,
+                    order="C",
+                )
+                packed = mx.array(packed_host)
+                lease.release()
+                lease = None
+            else:
+                packed = mx.take(
+                    self._arena_rows,
+                    mx.array(lease.slot_ids, dtype=mx.int64),
+                    axis=0,
+                )
             weight_end = self._weight_bytes
             scale_end = weight_end + self._parameter_bytes
             weights = packed[:, :weight_end].view(mx.uint32)
@@ -64,10 +82,12 @@ class AffineQ4NGramRows(nn.Module):
                 bits=4,
                 mode="affine",
             ).reshape((*logical_shape, self._row_width))
-            mx.eval(output)
+            if lease is not None:
+                mx.eval(output)
             return output
         finally:
-            lease.release()
+            if lease is not None:
+                lease.release()
 
     def detach(self, cache: Any) -> None:
         """Drop every arena/cache reference after construction-owned unbinding."""
@@ -77,6 +97,7 @@ class AffineQ4NGramRows(nn.Module):
         self._cache = None
         self._acquire_rows = None
         self._arena_rows = None
+        self._arena_host_rows = None
 
 
 def bind_streamed_ngram_rows(model: Any, cache: Any) -> int:
