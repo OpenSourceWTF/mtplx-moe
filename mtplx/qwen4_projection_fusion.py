@@ -22,6 +22,8 @@ import mlx.nn as nn
 from .models.qwen4_omlx import (
     Attention,
     GatedDeltaNet,
+    _qsa_compact_runtime_enabled,
+    _qsa_compact_attention,
     _rope_partial,
     scaled_dot_product_attention,
 )
@@ -160,7 +162,14 @@ class FusedProjectionAttention(Attention):
         B, S, _ = x.shape
         offset = cache.offset if cache is not None else 0
         index_qk, q_proj, k_proj, v_proj = self._project_indexer_qkv(x)
-        sparse = self.indexer.select_projected(index_qk, rope, idx_cache, offset)
+        sparse = None
+        compact = None
+        if _qsa_compact_runtime_enabled(x, cache):
+            compact = self.indexer.select_projected_compact(
+                index_qk, rope, idx_cache, offset
+            )
+        else:
+            sparse = self.indexer.select_projected(index_qk, rope, idx_cache, offset)
 
         q, gate = mx.split(q_proj.reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
@@ -177,18 +186,23 @@ class FusedProjectionAttention(Attention):
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
 
-        if sparse is not None:
-            neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
-            add = mx.where(sparse, mx.array(0, q.dtype), mx.array(neg, q.dtype))
-            mask = (
-                add
-                if mask is None
-                else (mask + add if not isinstance(mask, str) else add)
+        if compact is not None:
+            out = _qsa_compact_attention(
+                q, k, v, compact, scale=self.scale, mask=mask
             )
+        else:
+            if sparse is not None:
+                neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
+                add = mx.where(sparse, mx.array(0, q.dtype), mx.array(neg, q.dtype))
+                mask = (
+                    add
+                    if mask is None
+                    else (mask + add if not isinstance(mask, str) else add)
+                )
 
-        out = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=mask
-        )
+            out = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=mask
+            )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 

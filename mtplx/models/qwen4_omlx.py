@@ -15,6 +15,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..attention_context import current_attention_phase
 from mlx_lm.models.base import (
     BaseModelArgs,
     create_attention_mask,
@@ -173,6 +174,37 @@ class RotaryEmbedding:
 # ------------------------------------------------------------------------ QSA
 
 
+QSA_COMPACT_MAX_ROWS = 4
+_QSA_COMPACT_PHASES = frozenset(("decode_verify", "ar_decode"))
+
+
+def _qsa_compact_runtime_enabled(x: mx.array, cache: Any | None) -> bool:
+    """Enable compact rows only for the installed incremental phases."""
+
+    return (
+        cache is not None
+        and current_attention_phase() in _QSA_COMPACT_PHASES
+        and int(x.shape[-2]) <= QSA_COMPACT_MAX_ROWS
+    )
+
+
+@dataclass(frozen=True)
+class QSACompactSelection:
+    """Fixed-width per-query token rows selected by the QSA indexer."""
+
+    indices: mx.array
+    valid: mx.array
+
+
+@dataclass(frozen=True)
+class _QSASelectedBlocks:
+    kv_len: int
+    n_blocks: int
+    top: mx.array
+    top_visible: mx.array
+    q_pos: mx.array
+
+
 class QSAIndexer(nn.Module):
     """Select, per query, a budget of compressed key blocks.
 
@@ -199,7 +231,9 @@ class QSAIndexer(nn.Module):
         qk = self.index_qk_proj(x)
         return self.select_projected(qk, rope, cache, offset)
 
-    def select_projected(self, qk, rope, cache, offset: int) -> Optional[mx.array]:
+    def _select_blocks(
+        self, qk, rope, cache, offset: int
+    ) -> Optional[_QSASelectedBlocks]:
         B, S, _ = qk.shape
         split = self.n_heads * self.head_dim
         q = qk[..., :split].reshape(B, S, self.n_heads, self.head_dim)
@@ -260,24 +294,40 @@ class QSAIndexer(nn.Module):
 
         k = min(self.block_topk, n_blocks)
         top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]  # (B, S, k)
+        top_visible = mx.take_along_axis(visible, top, axis=-1)
+        return _QSASelectedBlocks(
+            kv_len=kv_len,
+            n_blocks=n_blocks,
+            top=top,
+            top_visible=top_visible,
+            q_pos=q_pos,
+        )
 
-        keep_block = mx.zeros((B, S, n_blocks + 1), dtype=mx.bool_)
-        top = mx.where(mx.take_along_axis(visible, top, axis=-1), top, n_blocks)
+    def select_projected(self, qk, rope, cache, offset: int) -> Optional[mx.array]:
+        B, S, _ = qk.shape
+        selected = self._select_blocks(qk, rope, cache, offset)
+        if selected is None:
+            return None
+
+        keep_block = mx.zeros((B, S, selected.n_blocks + 1), dtype=mx.bool_)
+        top = mx.where(
+            selected.top_visible, selected.top, selected.n_blocks
+        )
         keep_block = mx.put_along_axis(keep_block, top, mx.array(True), axis=-1)[
-            ..., :n_blocks
+            ..., : selected.n_blocks
         ]
 
         # Remap selected complete blocks to tokens. For each query, retain its
         # own incomplete visible block exactly; a block that is complete only
         # relative to a later query must not disappear from an earlier query.
         keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
-        tail = kv_len - n_blocks * self.compress_ratio
+        tail = selected.kv_len - selected.n_blocks * self.compress_ratio
         if tail:
             keep = mx.concatenate(
                 [keep, mx.zeros((B, S, tail), dtype=mx.bool_)], axis=-1
             )
-        token_positions = mx.arange(kv_len)[None, None, :]
-        visible_length = q_pos[None, :, None] + 1
+        token_positions = mx.arange(selected.kv_len)[None, None, :]
+        visible_length = selected.q_pos[None, :, None] + 1
         partial_start = (
             visible_length // self.compress_ratio
         ) * self.compress_ratio
@@ -286,6 +336,128 @@ class QSAIndexer(nn.Module):
         )
         keep = keep | partial
         return keep[:, None]  # (B, 1, S, kv_len)
+
+    def select_projected_compact(
+        self, qk, rope, cache, offset: int
+    ) -> Optional[QSACompactSelection]:
+        """Return compact token rows without materializing a token mask."""
+
+        B, S, _ = qk.shape
+        selected = self._select_blocks(qk, rope, cache, offset)
+        if selected is None:
+            return None
+
+        ratio = self.compress_ratio
+        full_width = selected.top.shape[-1] * ratio
+        block_offsets = mx.arange(ratio)[None, None, None, :]
+        full_positions = (
+            selected.top[..., None] * ratio + block_offsets
+        ).reshape(B, S, full_width)
+        full_valid = mx.broadcast_to(
+            selected.top_visible[..., None], (B, S, selected.top.shape[-1], ratio)
+        ).reshape(B, S, full_width)
+
+        partial_width = max(ratio - 1, 0)
+        if partial_width:
+            visible_length = selected.q_pos[None, :, None] + 1
+            partial_start = (visible_length // ratio) * ratio
+            partial_offsets = mx.arange(partial_width)[None, None, :]
+            partial_positions = mx.broadcast_to(
+                partial_start + partial_offsets, (B, S, partial_width)
+            )
+            partial_valid = (partial_positions < visible_length) & (
+                partial_positions < selected.kv_len
+            )
+        else:
+            partial_positions = mx.zeros((B, S, 0), dtype=mx.int32)
+            partial_valid = mx.zeros((B, S, 0), dtype=mx.bool_)
+
+        positions = mx.concatenate(
+            [full_positions, partial_positions], axis=-1
+        )
+        valid = mx.concatenate([full_valid, partial_valid], axis=-1)
+        indices = mx.where(valid, positions, mx.array(0, positions.dtype))
+        return QSACompactSelection(indices=indices, valid=valid)
+
+
+def _qsa_compact_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    selection: QSACompactSelection,
+    *,
+    scale: float,
+    mask: Optional[mx.array],
+) -> mx.array:
+    """Run SDPA independently for each query over its selected K/V rows."""
+
+    B, n_heads, S, head_dim = q.shape
+    n_kv_heads, kv_len = k.shape[1], k.shape[2]
+    width = selection.indices.shape[-1]
+    rows = B * S
+
+    q_rows = q.transpose(0, 2, 1, 3).reshape(rows, n_heads, 1, head_dim)
+    indices = selection.indices.reshape(rows, width)
+    indices_batched = selection.indices[:, None, :, :, None]
+    k_rows = mx.take_along_axis(
+        k[:, :, None, :, :], indices_batched, axis=3
+    ).transpose(0, 2, 1, 3, 4).reshape(
+        rows, n_kv_heads, width, head_dim
+    )
+    v_rows = mx.take_along_axis(
+        v[:, :, None, :, :], indices_batched, axis=3
+    ).transpose(0, 2, 1, 3, 4).reshape(
+        rows, n_kv_heads, width, v.shape[-1]
+    )
+
+    neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
+    valid = selection.valid.reshape(rows, width)
+    compact_mask = mx.where(
+        valid, mx.array(0, q.dtype), mx.array(neg, q.dtype)
+    ).reshape(rows, 1, 1, width)
+
+    # QSA already applies causal visibility. Numeric masks (for example padding)
+    # still need to be gathered alongside the selected K/V rows; string masks are
+    # the standard causal marker and are therefore redundant here.
+    if mask is not None and not isinstance(mask, str):
+        if mask.ndim == 2:
+            mask_rows = mx.broadcast_to(mask[None, :, :], (B, S, kv_len))
+            mask_rows = mask_rows.reshape(rows, kv_len)
+            mask_rows = mx.take_along_axis(mask_rows, indices, axis=-1)
+            mask_rows = mask_rows.reshape(rows, 1, 1, width)
+        elif mask.ndim == 3:
+            mask_rows = mx.broadcast_to(mask, (B, S, kv_len))
+            mask_rows = mask_rows.reshape(rows, kv_len)
+            mask_rows = mx.take_along_axis(mask_rows, indices, axis=-1)
+            mask_rows = mask_rows.reshape(rows, 1, 1, width)
+        else:
+            n_mask_heads = mask.shape[1]
+            mask_rows = mx.broadcast_to(mask, (B, n_mask_heads, S, kv_len))
+            mask_rows = mx.take_along_axis(
+                mask_rows, selection.indices[:, None, :, :], axis=-1
+            )
+            mask_rows = mask_rows.transpose(0, 2, 1, 3).reshape(
+                rows, n_mask_heads, width
+            )
+            mask_rows = mask_rows[:, :, None, :]
+        if mask.dtype == mx.bool_:
+            compact_mask = mx.where(
+                valid[:, None, None, :] & mask_rows,
+                mx.array(0, q.dtype),
+                mx.array(neg, q.dtype),
+            )
+        else:
+            compact_mask = compact_mask + mask_rows.astype(q.dtype)
+
+    out = scaled_dot_product_attention(
+        q_rows,
+        k_rows,
+        v_rows,
+        cache=None,
+        scale=scale,
+        mask=compact_mask,
+    )
+    return out.reshape(B, S, n_heads, head_dim).transpose(0, 2, 1, 3)
 
 
 class Attention(nn.Module):
@@ -312,7 +484,15 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         offset = cache.offset if cache is not None else 0
 
-        sparse = self.indexer(x, rope, idx_cache, offset)
+        sparse = None
+        compact = None
+        if _qsa_compact_runtime_enabled(x, cache):
+            index_qk = self.indexer.index_qk_proj(x)
+            compact = self.indexer.select_projected_compact(
+                index_qk, rope, idx_cache, offset
+            )
+        else:
+            sparse = self.indexer(x, rope, idx_cache, offset)
 
         q_proj, k_proj, v_proj = self._project_qkv(x)
         q, gate = mx.split(q_proj.reshape(B, S, self.n_heads, -1), 2, axis=-1)
@@ -330,18 +510,23 @@ class Attention(nn.Module):
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
 
-        if sparse is not None:
-            neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
-            add = mx.where(sparse, mx.array(0, q.dtype), mx.array(neg, q.dtype))
-            mask = (
-                add
-                if mask is None
-                else (mask + add if not isinstance(mask, str) else add)
+        if compact is not None:
+            out = _qsa_compact_attention(
+                q, k, v, compact, scale=self.scale, mask=mask
             )
+        else:
+            if sparse is not None:
+                neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
+                add = mx.where(sparse, mx.array(0, q.dtype), mx.array(neg, q.dtype))
+                mask = (
+                    add
+                    if mask is None
+                    else (mask + add if not isinstance(mask, str) else add)
+                )
 
-        out = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=mask
-        )
+            out = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=mask
+            )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 
