@@ -298,7 +298,7 @@ Expected: all tests pass and the guard restores the service.
 
 - [x] **Step 2: Capture two unchanged depth-2 production controls**
 
-From the clean diagnostic worktree at `ce915106`, run this command twice, changing `r1` to `r2`:
+From a clean temporary worktree at the candidate's exact parent `c226e2ae`, run this command twice, changing `r1` to `r2`:
 
 ```bash
 env MTPLX_FUSE_PROJ=gdn,attn,hyper MTPLX_QWEN4_WHOLE_MOE_M2=1 \
@@ -324,7 +324,7 @@ Expected: both candidate receipts pass construction self-checks, produce valid o
 
 - [x] **Step 4: Reject or record the measured candidate**
 
-If digest, correctness, acceptance trajectory, or throughput fails, retain raw receipts, use non-destructive `git revert` for the unpromoted code commits, and do not publish a success claim.
+If correctness, self-check, repair, or throughput fails, retain raw receipts, use non-destructive `git revert` for the unpromoted code commits, and do not publish a success claim. Record digest and acceptance changes explicitly; the owner-authorized BF16 near-boundary change is allowed.
 
 If all gates pass, append `## Measured outcome` to the design spec with both control and candidate TPS values, means, digest, verifier calls, acceptance by depth, repair count/cost, target evaluation time, and target-forward time. Commit it:
 
@@ -342,7 +342,7 @@ git commit -m "Record Qwen4 M3 production benchmark"
 
 **Does NOT cover:** The palindrome number is not production throughput and does not replace the 16K/1K temperature-1 benchmark.
 
-- [ ] **Step 1: Run palindrome only after production promotion passes**
+- [x] **Step 1: Run palindrome only after production promotion passes**
 
 Run twice, changing `r1` to `r2`:
 
