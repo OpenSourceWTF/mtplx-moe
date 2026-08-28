@@ -91,6 +91,10 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Curated Quality always resolves to a catalog entry")
         s.pick = .curatedGemmaSpeed
         XCTAssertTrue(s.canAdvance, "Curated Gemma Speed always resolves to a catalog entry")
+        s.pick = .curatedFlashNextBareSpeed
+        XCTAssertTrue(s.canAdvance, "Curated Flash-Next Bare Speed always resolves to a catalog entry")
+        s.pick = .curatedFlashNextOptimizedSpeed
+        XCTAssertTrue(s.canAdvance, "Curated Flash-Next Optimized Speed always resolves to a catalog entry")
         s.pick = .curatedStepFlash
         XCTAssertFalse(s.canAdvance, "StepFun is held out of the release catalog")
     }
@@ -334,6 +338,46 @@ final class OnboardingFeatureStateTests: XCTestCase {
             .block7,
             .block8,
         ])
+    }
+
+    func testResolvedModelForFlashNextBareSpeedPassesThroughOnModernApple() {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 128 * 1_073_741_824
+        )
+        let s = OnboardingFeatureState(hardware: m5, pick: .curatedFlashNextBareSpeed)
+        XCTAssertEqual(s.resolvedModel?.id, "flash-next-bare-speed")
+        XCTAssertEqual(s.resolvedRepoID, "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed")
+        XCTAssertEqual(s.resolvedModelFamily, "qwen4_exp")
+        XCTAssertFalse(s.supportsTune)
+    }
+
+    func testResolvedModelForFlashNextOptimizedSpeedPassesThroughOnModernApple() {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 128 * 1_073_741_824
+        )
+        let s = OnboardingFeatureState(hardware: m5, pick: .curatedFlashNextOptimizedSpeed)
+        XCTAssertEqual(s.resolvedModel?.id, "flash-next-optimized-speed")
+        XCTAssertEqual(s.resolvedRepoID, "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed")
+        XCTAssertEqual(s.resolvedModelFamily, "qwen4_exp")
+        XCTAssertFalse(s.supportsTune)
+    }
+
+    func testResolvedModelForFlashNextHasNoFP16SwapOnLegacyApple() {
+        // Flash-Next has no FP16 sibling (modern-tier-only packs), so the
+        // legacy swap the 3.8 trio gets must NOT fire here.
+        let m1 = DetectedHardware(
+            chipName: "Apple M1 Max",
+            appleSiliconGeneration: "m1",
+            unifiedMemoryBytes: 64 * 1_073_741_824
+        )
+        let bare = OnboardingFeatureState(hardware: m1, pick: .curatedFlashNextBareSpeed)
+        let optimized = OnboardingFeatureState(hardware: m1, pick: .curatedFlashNextOptimizedSpeed)
+        XCTAssertEqual(bare.resolvedModel?.id, "flash-next-bare-speed")
+        XCTAssertEqual(optimized.resolvedModel?.id, "flash-next-optimized-speed")
     }
 
     func testResolvedModelForStepIsHeldOutOfReleaseCatalog() {

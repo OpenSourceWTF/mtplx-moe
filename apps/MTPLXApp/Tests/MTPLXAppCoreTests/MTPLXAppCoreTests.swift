@@ -1274,6 +1274,45 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertTrue(command.arguments.containsInOrder(["--reasoning-effort", "xhigh"]))
     }
 
+    func testCommandBuilderFlashNextPinsQwen3ParserAndXHighEffort() throws {
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        for model in [
+            "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+            "/Users/example/.mtplx/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+        ] {
+            let command = try builder.buildServeCommand(
+                configuration: MTPLXAppConfiguration(
+                    executablePath: fake.path,
+                    model: model,
+                    profile: "auto"
+                )
+            )
+            // Flash-Next launches on the qwen4_exp family codec: qwen3
+            // think tags with the xhigh family default, NOT the dense-27B
+            // contract its "Qwen3.8-Flash-Next" name also matches. Profile
+            // and sampler stay unpinned — the engine's qwen4_exp contract
+            // owns them, so app and CLI launch identically.
+            XCTAssertTrue(command.arguments.containsInOrder(["--reasoning-parser", "qwen3"]), model)
+            XCTAssertTrue(command.arguments.containsInOrder(["--reasoning-effort", "xhigh"]), model)
+            XCTAssertFalse(command.arguments.contains("--profile"), model)
+            XCTAssertFalse(command.arguments.contains("--temperature"), model)
+        }
+
+        // The other collision direction: the dense 27B keeps its own
+        // contract — reasoning parser/effort stay server-owned (family
+        // default medium), never the Flash-Next xhigh pin.
+        let qwen38 = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "Youssofal/Qwen3.8-27B-MTPLX-Bare-Speed",
+                profile: "auto"
+            )
+        )
+        XCTAssertFalse(qwen38.arguments.contains("--reasoning-parser"))
+        XCTAssertFalse(qwen38.arguments.contains("--reasoning-effort"))
+    }
+
     func testOnboardingTuneUsesTurboForQwen27BOptimizedModels() {
         for model in [
             "/Users/example/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
@@ -3830,6 +3869,27 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(ids.contains { $0.contains("step") })
     }
 
+    func testFreshModernLargeMemoryOnboardingIDsCarryFlashNextPairBehindTrio() throws {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 128 * 1_073_741_824
+        )
+
+        let ids = MTPLXModelOption.recommendedCatalogIDs(for: m5)
+
+        // First-run onboarding builds its recommendation rows straight
+        // from this id stream (no peak-memory pre-filter), so the
+        // Flash-Next pair must ride right behind the 3.8 trio here too.
+        XCTAssertEqual(Array(ids.prefix(5)), [
+            "qwen38-27b-optimized-speed",
+            "qwen38-27b-bare-speed",
+            "qwen38-27b-optimized-quality",
+            "flash-next-bare-speed",
+            "flash-next-optimized-speed",
+        ])
+    }
+
     func testCurrentModelStaysVisibleEvenWhenHardwareWouldHideIt() throws {
         let m5 = DetectedHardware(
             chipName: "Apple M5",
@@ -4990,6 +5050,97 @@ final class MTPLXAppCoreTests: XCTestCase {
             root["provider"]?.objectValue?["mtplx"]?.objectValue?["models"]?
                 .objectValue?["mtplx-qwen38-27b-optimized-speed"]?.objectValue
         )
+        XCTAssertEqual(
+            model["options"]?.objectValue?["reasoningEffort"]?.stringValue,
+            "xhigh"
+        )
+        variants = try XCTUnwrap(model["variants"]?.objectValue)
+        XCTAssertEqual(Set(variants.keys), ["none", "minimal", "high"])
+    }
+
+    func testOpenCodeReasoningEffortRoutesFlashNextBeforeQwen38Markers() {
+        // Both served ids carry the qwen4_exp dial (xhigh/medium/low,
+        // default xhigh — engine QWEN4_EXP_REASONING_CODEC).
+        for served in ["mtplx-flash-next-bare-speed", "mtplx-flash-next-optimized-speed"] {
+            XCTAssertEqual(
+                OpenCodeIntegration.reasoningEffortLevels(forModelID: served),
+                ["xhigh", "medium", "low"],
+                served
+            )
+            XCTAssertEqual(OpenCodeIntegration.reasoningEffort(forModelID: served), "xhigh", served)
+        }
+        // The HF repo id carries BOTH markers ("Qwen3.8" and "Flash-Next");
+        // flash-next must win or the 27B medium default would claim it.
+        XCTAssertEqual(
+            OpenCodeIntegration.reasoningEffort(
+                forModelID: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed"
+            ),
+            "xhigh"
+        )
+        // The other collision direction: plain 27B ids keep medium.
+        XCTAssertEqual(
+            OpenCodeIntegration.reasoningEffortLevels(forModelID: "mtplx-qwen38-27b-bare-speed"),
+            ["xhigh", "medium", "low"]
+        )
+        XCTAssertEqual(
+            OpenCodeIntegration.reasoningEffort(forModelID: "mtplx-qwen38-27b-bare-speed"),
+            "medium"
+        )
+    }
+
+    func testOpenCodeIntegrationMirrorsFlashNextEffortDial() throws {
+        let url = temporaryDirectory().appendingPathComponent("opencode.json")
+        let desktopSettingsURL = temporaryDirectory().appendingPathComponent("default.dat")
+        let integration = OpenCodeIntegration(
+            configURL: url,
+            desktopSettingsStoreURL: desktopSettingsURL
+        )
+
+        // No app dial set: the qwen4_exp family default (xhigh) is mirrored,
+        // and the "Qwen3.8-Flash-Next" name resolves the Flash-Next served
+        // id, never the dense-27B one it also substring-matches.
+        let result = try integration.sync(
+            configuration: MTPLXAppConfiguration(
+                model: "/models/Youssofal--Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+                host: "127.0.0.1",
+                port: 18100,
+                contextWindow: nil
+            )
+        )
+        XCTAssertEqual(result.modelReference, "mtplx/mtplx-flash-next-bare-speed")
+
+        var root = try JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: url))
+        var models = try XCTUnwrap(
+            root["provider"]?.objectValue?["mtplx"]?.objectValue?["models"]?.objectValue
+        )
+        XCTAssertNil(models["mtplx-qwen38-27b-bare-speed"])
+        var model = try XCTUnwrap(models["mtplx-flash-next-bare-speed"]?.objectValue)
+        XCTAssertEqual(model["reasoning"]?.boolValue, true)
+        XCTAssertEqual(
+            model["options"]?.objectValue?["reasoningEffort"]?.stringValue,
+            "xhigh"
+        )
+        var variants = try XCTUnwrap(model["variants"]?.objectValue)
+        XCTAssertEqual(Set(variants.keys), ["none", "minimal", "high"])
+        for value in variants.values {
+            XCTAssertEqual(value.objectValue?["disabled"]?.boolValue, true)
+        }
+
+        // The Optimized Speed sibling resolves its own served id with the
+        // same dial.
+        _ = try integration.sync(
+            configuration: MTPLXAppConfiguration(
+                model: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+                host: "127.0.0.1",
+                port: 18100,
+                contextWindow: nil
+            )
+        )
+        root = try JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: url))
+        models = try XCTUnwrap(
+            root["provider"]?.objectValue?["mtplx"]?.objectValue?["models"]?.objectValue
+        )
+        model = try XCTUnwrap(models["mtplx-flash-next-optimized-speed"]?.objectValue)
         XCTAssertEqual(
             model["options"]?.objectValue?["reasoningEffort"]?.stringValue,
             "xhigh"

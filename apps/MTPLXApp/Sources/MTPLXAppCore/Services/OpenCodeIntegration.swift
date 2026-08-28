@@ -422,6 +422,19 @@ public struct OpenCodeIntegration: Sendable {
         {
             return "qwen3.5-4b-mtplx-optimized-speed"
         }
+        // Flash-Next (qwen4_exp) before the 3.8 branch: the pack names
+        // carry "Qwen3.8-Flash-Next"+"bare-speed"/"optimized-speed" and
+        // would otherwise be claimed by the 27B ids below (engine twin:
+        // default_models._public_model_id_from_name resolves flash-next
+        // first). Derivative names fall through to the sanitized id.
+        if lower.contains("flash-next") || lower.contains("flash_next") {
+            if lower.contains("bare-speed") {
+                return "mtplx-flash-next-bare-speed"
+            }
+            if lower.contains("optimized-speed") {
+                return "mtplx-flash-next-optimized-speed"
+            }
+        }
         // Qwen 3.8 family before the generic qwen branches: a 3.8 name
         // also contains "qwen"+"optimized-speed"/"optimized-quality" and
         // would otherwise be claimed by the 3.6 ids below.
@@ -520,6 +533,14 @@ public struct OpenCodeIntegration: Sendable {
     /// family effort dial.
     public static func reasoningEffortLevels(forModelID modelID: String) -> [String]? {
         let lower = modelID.lowercased()
+        // Flash-Next (qwen4_exp) before the 3.8 markers: the pack names
+        // carry "Qwen3.8-Flash-Next" and would otherwise be claimed by the
+        // 27B codec below (engine twin: descriptors._QWEN4_PREVIEW_MARKER
+        // routes flash-next away first).
+        if lower.contains("flash-next") || lower.contains("flash_next") || lower.contains("qwen4") {
+            // QWEN4_EXP_REASONING_CODEC: same official effort triple.
+            return ["xhigh", "medium", "low"]
+        }
         if lower.contains("qwen38") || lower.contains("qwen3.8") || lower.contains("qwen3-8") {
             // QWEN3_8_REASONING_CODEC: official reasoning_effort levels.
             return ["xhigh", "medium", "low"]
@@ -535,6 +556,12 @@ public struct OpenCodeIntegration: Sendable {
 
     public static func reasoningEffort(forModelID modelID: String) -> String? {
         let lower = modelID.lowercased()
+        if lower.contains("flash-next") || lower.contains("flash_next") || lower.contains("qwen4") {
+            // QWEN4_EXP_REASONING_CODEC default: xhigh (founder call
+            // 2026-08-28) — before the 3.8 markers, which the pack names
+            // also contain and whose default is medium.
+            return "xhigh"
+        }
         if lower.contains("qwen38") || lower.contains("qwen3.8") || lower.contains("qwen3-8") {
             // QWEN3_8_REASONING_CODEC default: medium (strict max-fan A/B,
             // 2026-08-14 — same correct uncapped result 51.52s vs 314.91s

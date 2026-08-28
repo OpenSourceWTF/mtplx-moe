@@ -1073,6 +1073,7 @@ private enum ModelLaunchFamily {
     case qwen36_27BOptimizedQuality
     case qwen35_9BOptimizedSpeed
     case qwen38_27B
+    case flashNext
     case gemma4
     case step
     case hy3
@@ -1098,6 +1099,16 @@ private enum ModelLaunchFamily {
             || normalized.contains("qwen35-9b-optimized-speed")
         {
             return .qwen35_9BOptimizedSpeed
+        }
+        // Flash-Next (qwen4_exp) BEFORE the 3.8 family test: the pack
+        // names carry "Qwen3.8-Flash-Next" and must not be claimed by the
+        // dense-27B launch contract (engine twin:
+        // descriptors._QWEN4_PREVIEW_MARKER routes flash-next away first).
+        if normalized.contains("flash-next")
+            || normalized.contains("flashnext")
+            || MTPLXModelOption.modelFamily(for: model) == "qwen4_exp"
+        {
+            return .flashNext
         }
         // Qwen3.8 27B MTPLX family (Bare Speed / Optimized Speed /
         // Optimized Quality). Trunk geometry is identical to the Qwen3.6
@@ -1275,6 +1286,8 @@ private struct TargetPreset {
             return applyingQwen35_9BOptimizedSpeedDefaults()
         case .qwen38_27B:
             return applyingQwen38_27BDefaults()
+        case .flashNext:
+            return applyingFlashNextDefaults()
         case .qwenDefault:
             return self
         case .gemma4:
@@ -1356,6 +1369,22 @@ private struct TargetPreset {
         // same draft sampler for the same artifact (incl. the FP16 siblings)
         // and a stamp change never needs an app release. A user-set sampler
         // in Settings still carries to the draft, as for every family.
+        return preset
+    }
+
+    private func applyingFlashNextDefaults() -> TargetPreset {
+        var preset = self
+        // Flash-Next (qwen4_exp) shares the 27B's Qwen think-tag codec but
+        // its family default effort is xhigh (engine
+        // QWEN4_EXP_REASONING_CODEC, founder call 2026-08-28); pinning it
+        // here keeps the app launch on the family default the way the Step
+        // preset does. A user-set effort in Settings still overrides.
+        // Profile, sampler, and draft sampler are deliberately NOT pinned:
+        // the engine's qwen4_exp contract (QWEN4_EXP_SAMPLER_DEFAULTS, the
+        // turbo allowlist, the artifact draft-sampler stamp) owns them, so
+        // the app and the CLI launch identically.
+        preset.reasoningParser = "qwen3"
+        preset.reasoningEffort = "xhigh"
         return preset
     }
 

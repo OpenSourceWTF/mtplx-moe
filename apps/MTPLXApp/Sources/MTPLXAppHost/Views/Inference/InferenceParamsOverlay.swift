@@ -667,6 +667,17 @@ struct InferenceParamsOverlay: View, Equatable {
                 effortLevels: ["xhigh", "medium", "low"],
                 defaultEffort: "medium"
             )
+        case "qwen4_exp":
+            // Same think-tag codec as the 27B lane; the Flash-Next family
+            // default is xhigh (engine QWEN4_EXP_REASONING_CODEC), not medium.
+            return ReasoningPolicy(
+                supported: true,
+                parser: "qwen3",
+                defaultMode: "auto",
+                historyPolicy: "preserve_when_enabled",
+                effortLevels: ["xhigh", "medium", "low"],
+                defaultEffort: "xhigh"
+            )
         case "step", "unknown":
             if selectedModelFamily == "step" {
                 return ReasoningPolicy(

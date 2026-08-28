@@ -612,7 +612,7 @@ struct ModelPickerOverlay: View, Equatable {
         config.prefillChunkTokens = nil
 
         switch family {
-        case "qwen3_5", "qwen3_6", "qwen3_8", "gemma4", "step":
+        case "qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp", "gemma4", "step":
             config.generationMode = "mtp"
             config.loadMTP = true
             config.liveSettingsModelFamily = family
