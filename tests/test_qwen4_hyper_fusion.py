@@ -8,7 +8,11 @@ import pytest
 
 def _model():
     layers = [
-        SimpleNamespace(mlp_hyper_connection=SimpleNamespace()) for _ in range(48)
+        SimpleNamespace(
+            attn_hyper_connection=SimpleNamespace(),
+            mlp_hyper_connection=SimpleNamespace(),
+        )
+        for _ in range(48)
     ]
     return SimpleNamespace(
         language_model=SimpleNamespace(model=SimpleNamespace(layers=layers))
@@ -35,10 +39,16 @@ def test_exact_m2_hyper_route_is_bound_once_at_construction(monkeypatch):
     assert report == {
         "installed": True,
         "installed_blocks": 48,
+        "installed_attention_blocks": 48,
+        "installed_mlp_blocks": 48,
         "rows": 2,
         "selfcheck_dmax": None,
     }
-    assert len(bound) == 48
+    assert len(bound) == 96
+    assert all(
+        callable(layer.attn_hyper_connection._mtplx_m2_hyper_call)
+        for layer in model.language_model.model.layers
+    )
     assert all(
         callable(layer.mlp_hyper_connection._mtplx_m2_hyper_call)
         for layer in model.language_model.model.layers
@@ -65,8 +75,8 @@ def test_storage_and_exact_selfcheck_run_before_install(monkeypatch):
 
     report = fusion.configure_qwen4_hyper_fusion(model)
 
-    assert [index for _, index in validated] == list(range(48))
-    assert len(checked) == 48
+    assert [index for _, index in validated] == list(range(48)) * 2
+    assert len(checked) == 96
     assert report["selfcheck_dmax"] == 0.0
 
 

@@ -154,22 +154,28 @@ def configure_qwen4_hyper_fusion(
     if len(layers) != 48:
         raise Qwen4HyperFusionConfigError("Qwen4 hyper fusion requires 48 blocks")
 
+    attention_modules = tuple(layer.attn_hyper_connection for layer in layers)
+    mlp_modules = tuple(layer.mlp_hyper_connection for layer in layers)
+    modules = attention_modules + mlp_modules
     if validate_storage:
-        for index, layer in enumerate(layers):
-            _validate_hyper(layer.mlp_hyper_connection, index)
-    bindings = tuple(_bind(layer.mlp_hyper_connection) for layer in layers)
+        for block_modules in (attention_modules, mlp_modules):
+            for index, module in enumerate(block_modules):
+                _validate_hyper(module, index)
+    bindings = tuple(_bind(module) for module in modules)
     selfcheck_dmax = None
     if run_selfcheck:
         selfcheck_dmax = max(
-            _selfcheck(layer.mlp_hyper_connection, binding)
-            for layer, binding in zip(layers, bindings)
+            _selfcheck(module, binding)
+            for module, binding in zip(modules, bindings)
         )
-    for layer, binding in zip(layers, bindings):
-        layer.mlp_hyper_connection._mtplx_m2_hyper_call = binding
+    for module, binding in zip(modules, bindings):
+        module._mtplx_m2_hyper_call = binding
 
     return {
         "installed": True,
-        "installed_blocks": len(bindings),
+        "installed_blocks": len(layers),
+        "installed_attention_blocks": len(attention_modules),
+        "installed_mlp_blocks": len(mlp_modules),
         "rows": 2,
         "selfcheck_dmax": selfcheck_dmax,
     }

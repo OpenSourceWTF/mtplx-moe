@@ -153,6 +153,17 @@ def _qwen4_m2_hyper_from_normed(module, hidden, normed):
     return _qwen4_stock_hyper_from_normed(module, hidden, normed)
 
 
+def _qwen4_stock_attn_hyper(module, hidden):
+    return module(hidden)
+
+
+def _qwen4_m2_attn_hyper(module, hidden):
+    if hidden.shape == (1, 2, 10240):
+        normed = module.hc_norm(hidden)
+        return module._mtplx_m2_hyper_call(hidden, normed)
+    return _qwen4_stock_attn_hyper(module, hidden)
+
+
 def _qwen4_stock_mlp_tail(layer, value, residual, inject):
     value = layer.mlp(value)
     return residual + (value[..., None, :] * inject[..., None]).reshape(
@@ -263,6 +274,7 @@ def _qwen4_forward_with_capture(
 
     hidden = mx.tile(hidden, (1, 1, inner.hc))
     mlp_tail = inner._mtplx_capture_mlp_tail
+    attn_hyper = inner._mtplx_capture_attn_hyper
     hyper_from_normed = inner._mtplx_capture_hyper_from_normed
     captures: dict[int, dict[str, mx.array]] = {}
     for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
@@ -280,7 +292,7 @@ def _qwen4_forward_with_capture(
                 conv_mask=conv_mask,
             )
 
-        value, residual, inject = layer.attn_hyper_connection(hidden)
+        value, residual, inject = attn_hyper(layer.attn_hyper_connection, hidden)
         if layer.is_linear:
             value, capture = _gdn_with_capture(
                 layer.linear_attn, value, conv_mask, layer_cache
@@ -350,15 +362,15 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
         ):
             raise Qwen4CaptureConfigError("capture norm geometry is invalid")
     for layer in layers:
-        hyper = layer.mlp_hyper_connection
-        if (
-            int(hyper.hc) != 4
-            or int(hyper.d) != 2560
-            or tuple(hyper.hc_norm.weight.shape) != (10240,)
-            or float(hyper.hc_norm.eps) != 1e-6
-            or hyper.block_inject_weight is None
-        ):
-            raise Qwen4CaptureConfigError("capture hyper geometry is invalid")
+        for hyper in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
+            if (
+                int(hyper.hc) != 4
+                or int(hyper.d) != 2560
+                or tuple(hyper.hc_norm.weight.shape) != (10240,)
+                or float(hyper.hc_norm.eps) != 1e-6
+                or hyper.block_inject_weight is None
+            ):
+                raise Qwen4CaptureConfigError("capture hyper geometry is invalid")
     residual_routes = tuple(
         hasattr(type(getattr(layer, "mlp", None)), "_mtplx_residual_call")
         for layer in layers
@@ -367,6 +379,19 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
         raise Qwen4CaptureConfigError("capture residual MoE route is only partly installed")
     inner._mtplx_capture_mlp_tail = (
         _qwen4_residual_mlp_tail if all(residual_routes) else _qwen4_stock_mlp_tail
+    )
+    attention_hyper_routes = tuple(
+        callable(getattr(layer.attn_hyper_connection, "_mtplx_m2_hyper_call", None))
+        for layer in layers
+    )
+    if any(attention_hyper_routes) and not all(attention_hyper_routes):
+        raise Qwen4CaptureConfigError(
+            "capture attention hyper M=2 route is only partly installed"
+        )
+    inner._mtplx_capture_attn_hyper = (
+        _qwen4_m2_attn_hyper
+        if all(attention_hyper_routes)
+        else _qwen4_stock_attn_hyper
     )
     hyper_routes = tuple(
         callable(getattr(layer.mlp_hyper_connection, "_mtplx_m2_hyper_call", None))

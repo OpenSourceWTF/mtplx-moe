@@ -33,31 +33,42 @@ def _config():
 
 
 def _runtime():
-    hyper = SimpleNamespace(
-        hc=4,
-        d=2560,
-        hc_norm=SimpleNamespace(weight=SimpleNamespace(shape=(10240,)), eps=1e-6),
-        block_inject_weight=object(),
-    )
-    linear = SimpleNamespace(
-        is_linear=True,
-        mlp_hyper_connection=hyper,
-        linear_attn=SimpleNamespace(
-            n_k=16,
-            n_v=48,
-            dk=128,
-            dv=128,
-            key_dim=2048,
-            conv_dim=10240,
-            norm=SimpleNamespace(
-                weight=SimpleNamespace(shape=(128,)),
-                eps=1e-6,
-                activation="sigmoid",
+    def hyper():
+        return SimpleNamespace(
+            hc=4,
+            d=2560,
+            hc_norm=SimpleNamespace(weight=SimpleNamespace(shape=(10240,)), eps=1e-6),
+            block_inject_weight=object(),
+        )
+
+    layers = [
+        SimpleNamespace(
+            is_linear=True,
+            attn_hyper_connection=hyper(),
+            mlp_hyper_connection=hyper(),
+            linear_attn=SimpleNamespace(
+                n_k=16,
+                n_v=48,
+                dk=128,
+                dv=128,
+                key_dim=2048,
+                conv_dim=10240,
+                norm=SimpleNamespace(
+                    weight=SimpleNamespace(shape=(128,)),
+                    eps=1e-6,
+                    activation="sigmoid",
+                ),
             ),
-        ),
-    )
-    attention = SimpleNamespace(is_linear=False, mlp_hyper_connection=hyper)
-    layers = [linear for _ in range(36)] + [attention for _ in range(12)]
+        )
+        for _ in range(36)
+    ] + [
+        SimpleNamespace(
+            is_linear=False,
+            attn_hyper_connection=hyper(),
+            mlp_hyper_connection=hyper(),
+        )
+        for _ in range(12)
+    ]
     model = SimpleNamespace(
         language_model=SimpleNamespace(model=SimpleNamespace(layers=layers))
     )
@@ -81,6 +92,11 @@ def test_installer_selects_constructed_m2_hyper_route():
     runtime = _runtime()
     inner = runtime.model.language_model.model
     for layer in inner.layers:
+        layer.attn_hyper_connection._mtplx_m2_hyper_call = lambda hidden, normed: (
+            hidden,
+            normed,
+            hidden,
+        )
         layer.mlp_hyper_connection._mtplx_m2_hyper_call = lambda hidden, normed: (
             hidden,
             normed,
@@ -93,6 +109,52 @@ def test_installer_selects_constructed_m2_hyper_route():
         inner._mtplx_capture_hyper_from_normed.__name__
         == "_qwen4_m2_hyper_from_normed"
     )
+    assert inner._mtplx_capture_attn_hyper.__name__ == "_qwen4_m2_attn_hyper"
+
+
+def test_m2_attention_hyper_uses_stock_norm_and_bound_kernel():
+    import mtplx.qwen4_capture as capture
+
+    hidden = SimpleNamespace(shape=(1, 2, 10240))
+    module = SimpleNamespace(
+        hc_norm=lambda value: ("normed", value),
+        _mtplx_m2_hyper_call=lambda value, normed: ("fused", value, normed),
+    )
+
+    assert capture._qwen4_m2_attn_hyper(module, hidden) == (
+        "fused",
+        hidden,
+        ("normed", hidden),
+    )
+
+
+def test_m2_attention_hyper_rejects_batched_two_row_input(monkeypatch):
+    import mtplx.qwen4_capture as capture
+
+    hidden = SimpleNamespace(shape=(2, 2, 10240))
+    module = SimpleNamespace(
+        _mtplx_m2_hyper_call=lambda value, normed: "fused",
+    )
+    monkeypatch.setattr(
+        capture,
+        "_qwen4_stock_attn_hyper",
+        lambda candidate, residual: "stock",
+    )
+
+    assert capture._qwen4_m2_attn_hyper(module, hidden) == "stock"
+
+
+def test_installer_rejects_partial_attention_hyper_route():
+    from mtplx.qwen4_capture import Qwen4CaptureConfigError, install_qwen4_capture_route
+
+    runtime = _runtime()
+    inner = runtime.model.language_model.model
+    inner.layers[0].attn_hyper_connection._mtplx_m2_hyper_call = (
+        lambda hidden, normed: None
+    )
+
+    with pytest.raises(Qwen4CaptureConfigError, match="attention hyper M=2 route"):
+        install_qwen4_capture_route(runtime, config=_config())
 
 
 def test_m2_hyper_route_rejects_batched_two_row_input(monkeypatch):
