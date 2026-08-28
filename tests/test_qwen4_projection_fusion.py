@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mtplx.models.qwen4_omlx import Attention, GatedDeltaNet, TextArgs
+from mtplx.models.qwen4_omlx import Attention, GatedDeltaNet, RotaryEmbedding, TextArgs
 from mtplx.proj_fusion import configure_fused_projections
 from mtplx.qwen4_projection_fusion import install_qwen4_fused_projection_routes
 
@@ -78,8 +78,9 @@ def test_generic_projection_configuration_selects_qwen4_route(monkeypatch):
 def test_qwen4_attention_installs_one_exact_small_row_projection_route():
     layer = Attention(_args())
     nn.quantize(layer, group_size=32, bits=4)
+    original_index_qk = layer.indexer.index_qk_proj
     names = ("q_proj", "k_proj", "v_proj")
-    original = tuple(getattr(layer, name) for name in names)
+    original_qkv = tuple(getattr(layer, name) for name in names)
 
     report = install_qwen4_fused_projection_routes(layer, groups={"attn"})
 
@@ -87,7 +88,51 @@ def test_qwen4_attention_installs_one_exact_small_row_projection_route():
     assert type(layer).__name__ == "FusedProjectionAttention"
     for rows in (1, 4, 8):
         x = mx.random.normal((1, rows, 128), dtype=mx.float16)
-        expected = tuple(proj(x) for proj in original)
-        actual = layer._project_qkv(x)
+        expected = (original_index_qk(x), *(proj(x) for proj in original_qkv))
+        actual = layer._project_indexer_qkv(x)
         mx.eval(*expected, *actual)
         assert all(mx.array_equal(got, want) for got, want in zip(actual, expected))
+
+
+def test_qwen4_attention_forward_uses_combined_indexer_projection(monkeypatch):
+    layer = Attention(_args())
+    nn.quantize(layer, group_size=32, bits=4)
+    x = mx.random.normal((1, 2, 128), dtype=mx.float16)
+    rope = RotaryEmbedding(32, 10_000)
+    expected = layer(x, rope, None, None, None)
+    mx.eval(expected)
+    install_qwen4_fused_projection_routes(layer, groups={"attn"})
+    combined_calls = 0
+    combined = type(layer)._project_indexer_qkv
+
+    def counted(self, x):
+        nonlocal combined_calls
+        combined_calls += 1
+        return combined(self, x)
+
+    monkeypatch.setattr(type(layer), "_project_indexer_qkv", counted)
+    out = layer(x, rope, None, None, None)
+    mx.eval(out)
+
+    assert combined_calls == 1
+    assert mx.array_equal(out, expected)
+
+
+def test_qwen4_attention_wide_forward_keeps_separate_indexer_projection(monkeypatch):
+    layer = Attention(_args())
+    nn.quantize(layer, group_size=32, bits=4)
+    install_qwen4_fused_projection_routes(layer, groups={"attn"})
+    combined_calls = 0
+    combined = type(layer)._project_indexer_qkv
+
+    def counted(self, x):
+        nonlocal combined_calls
+        combined_calls += 1
+        return combined(self, x)
+
+    monkeypatch.setattr(type(layer), "_project_indexer_qkv", counted)
+    x = mx.random.normal((1, 8, 128), dtype=mx.float16)
+    out = layer(x, RotaryEmbedding(32, 10_000), None, None, None)
+    mx.eval(out)
+
+    assert combined_calls == 0

@@ -196,8 +196,11 @@ class QSAIndexer(nn.Module):
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
     def __call__(self, x, rope, cache, offset: int) -> Optional[mx.array]:
-        B, S, _ = x.shape
         qk = self.index_qk_proj(x)
+        return self.select_projected(qk, rope, cache, offset)
+
+    def select_projected(self, qk, rope, cache, offset: int) -> Optional[mx.array]:
+        B, S, _ = qk.shape
         split = self.n_heads * self.head_dim
         q = qk[..., :split].reshape(B, S, self.n_heads, self.head_dim)
         raw_k = qk[..., split:].reshape(B, S, self.head_dim)

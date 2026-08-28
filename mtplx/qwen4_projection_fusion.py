@@ -19,7 +19,12 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from .models.qwen4_omlx import Attention, GatedDeltaNet
+from .models.qwen4_omlx import (
+    Attention,
+    GatedDeltaNet,
+    _rope_partial,
+    scaled_dot_product_attention,
+)
 from .proj_fusion import _make_quantized_linear
 
 
@@ -27,8 +32,7 @@ _GDN_NAMES = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 _ATTN_NAMES = ("q_proj", "k_proj", "v_proj")
 
 
-def _validated_quantized_members(owner: Any, names: tuple[str, ...]):
-    members = tuple(getattr(owner, name, None) for name in names)
+def _validated_quantized_members(members: tuple[Any, ...]):
     if any(not isinstance(member, nn.QuantizedLinear) for member in members):
         raise TypeError("Qwen4 projection group is not fully affine-quantized")
     first = members[0]
@@ -61,9 +65,13 @@ def _validated_quantized_members(owner: Any, names: tuple[str, ...]):
     return members, signature, has_biases
 
 
-def _pack_group(owner: Any, names: tuple[str, ...], fused_attr: str) -> list[int]:
+def _pack_bindings(
+    fused_owner: Any,
+    bindings: tuple[tuple[Any, str], ...],
+    fused_attr: str,
+) -> list[int]:
     members, (group_size, bits, mode), has_biases = _validated_quantized_members(
-        owner, names
+        tuple(getattr(owner, name, None) for owner, name in bindings)
     )
     weight = mx.concatenate([member.weight for member in members], axis=0)
     scales = mx.concatenate([member.scales for member in members], axis=0)
@@ -82,12 +90,12 @@ def _pack_group(owner: Any, names: tuple[str, ...], fused_attr: str) -> list[int
         bits=bits,
         mode=mode,
     )
-    setattr(owner, fused_attr, fused)
+    setattr(fused_owner, fused_attr, fused)
 
     split_points: list[int] = []
     weight_at = 0
     scale_at = 0
-    for index, (name, member) in enumerate(zip(names, members)):
+    for index, ((owner, name), member) in enumerate(zip(bindings, members)):
         weight_rows = int(member.weight.shape[0])
         scale_rows = int(member.scales.shape[0])
         replacement = _make_quantized_linear(
@@ -104,6 +112,14 @@ def _pack_group(owner: Any, names: tuple[str, ...], fused_attr: str) -> list[int
         if index + 1 < len(members):
             split_points.append(weight_at)
     return split_points
+
+
+def _pack_group(owner: Any, names: tuple[str, ...], fused_attr: str) -> list[int]:
+    return _pack_bindings(
+        owner,
+        tuple((owner, name) for name in names),
+        fused_attr,
+    )
 
 
 def _split_contiguous(out: mx.array, split_points: list[int]):
@@ -127,9 +143,54 @@ class FusedProjectionAttention(Attention):
     def _project_qkv(self, x):
         if math.prod(x.shape[:-1]) > self._mtplx_fused_max_rows:
             return Attention._project_qkv(self, x)
+        return self._project_indexer_qkv(x)[1:]
+
+    def _project_indexer_qkv(self, x):
+        if math.prod(x.shape[:-1]) > self._mtplx_fused_max_rows:
+            return (self.indexer.index_qk_proj(x), *Attention._project_qkv(self, x))
         return _split_contiguous(
-            self._mtplx_fused_qkv_proj(x), self._mtplx_fused_qkv_splits
+            self._mtplx_fused_indexer_qkv_proj(x),
+            self._mtplx_fused_indexer_qkv_splits,
         )
+
+    def __call__(self, x, rope, mask, cache, idx_cache):
+        if math.prod(x.shape[:-1]) > self._mtplx_fused_max_rows:
+            return Attention.__call__(self, x, rope, mask, cache, idx_cache)
+
+        B, S, _ = x.shape
+        offset = cache.offset if cache is not None else 0
+        index_qk, q_proj, k_proj, v_proj = self._project_indexer_qkv(x)
+        sparse = self.indexer.select_projected(index_qk, rope, idx_cache, offset)
+
+        q, gate = mx.split(q_proj.reshape(B, S, self.n_heads, -1), 2, axis=-1)
+        gate = gate.reshape(B, S, -1)
+        q = self.q_norm(q).transpose(0, 2, 1, 3)
+        k = self.k_norm(k_proj.reshape(B, S, self.n_kv_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        v = v_proj.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+        cos, sin = rope(mx.arange(offset, offset + S)[None])
+        cos, sin = cos[:, None], sin[:, None]
+        q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
+
+        if cache is not None:
+            k, v = cache.update_and_fetch(k, v)
+
+        if sparse is not None:
+            neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
+            add = mx.where(sparse, mx.array(0, q.dtype), mx.array(neg, q.dtype))
+            mask = (
+                add
+                if mask is None
+                else (mask + add if not isinstance(mask, str) else add)
+            )
+
+        out = scaled_dot_product_attention(
+            q, k, v, cache=cache, scale=self.scale, mask=mask
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+        return self.o_proj(out * mx.sigmoid(gate))
 
 
 def install_qwen4_fused_projection_routes(
@@ -151,8 +212,16 @@ def install_qwen4_fused_projection_routes(
             module.__class__ = FusedProjectionGatedDeltaNet
             report["gdn"] += 1
         elif "attn" in groups and type(module) is Attention:
-            splits = _pack_group(module, _ATTN_NAMES, "_mtplx_fused_qkv_proj")
-            module._mtplx_fused_qkv_splits = splits
+            bindings = (
+                (module.indexer, "index_qk_proj"),
+                *((module, name) for name in _ATTN_NAMES),
+            )
+            splits = _pack_bindings(
+                module,
+                bindings,
+                "_mtplx_fused_indexer_qkv_proj",
+            )
+            module._mtplx_fused_indexer_qkv_splits = splits
             module._mtplx_fused_max_rows = int(max_rows)
             module.__class__ = FusedProjectionAttention
             report["attn"] += 1
