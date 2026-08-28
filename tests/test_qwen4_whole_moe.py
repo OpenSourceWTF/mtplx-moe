@@ -58,6 +58,12 @@ def test_exact_sources_encode_qwen4_storage_and_right_shapes():
             "stage3": ((rows * 160 * 128, 1, 1), (128, 1, 1)),
         }
         assert "uint row = group / OUTPUT_TILES" in sources["stage3"]
+        assert "residual" in sources["stage3_residual"]
+        assert "inject" in sources["stage3_residual"]
+        assert "bfloat mlp_value = bfloat(" in sources["stage3_residual"]
+        assert "bfloat product = bfloat(mlp_value * inject_value);" in sources[
+            "stage3_residual"
+        ]
 
 
 def test_row_owned_top10_matches_qwen4_argpartition_order():
@@ -131,6 +137,7 @@ def test_construction_selfchecks_both_rows_before_install(monkeypatch):
     monkeypatch.setenv(whole_moe.WHOLE_MOE_ENV, "1")
     model = _fake_model()
     seen = []
+    residual_seen = []
     monkeypatch.setattr(
         whole_moe,
         "_bind",
@@ -141,6 +148,11 @@ def test_construction_selfchecks_both_rows_before_install(monkeypatch):
         "_selfcheck",
         lambda block, accepted_call, rows: seen.append(rows) or rows / 10,
     )
+    monkeypatch.setattr(
+        whole_moe,
+        "_selfcheck_residual",
+        lambda block, binding, rows: residual_seen.append(rows) or 0.0,
+    )
 
     report = whole_moe.configure_qwen4_whole_moe(
         model,
@@ -150,4 +162,6 @@ def test_construction_selfchecks_both_rows_before_install(monkeypatch):
     )
 
     assert seen == [2, 3]
+    assert residual_seen == [2, 3]
     assert report["selfcheck_dmax"] == {"m2": 0.2, "m3": 0.3}
+    assert report["residual_selfcheck_dmax"] == {"m2": 0.0, "m3": 0.0}

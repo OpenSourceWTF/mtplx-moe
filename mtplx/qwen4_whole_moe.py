@@ -24,6 +24,7 @@ class _Binding:
     route_top10: Callable[[Any], tuple[Any, Any]]
     stage2: Callable[[Any, Any], Any]
     stage3: Callable[[Any, Any, Any, Any], Any]
+    stage3_residual: Callable[[Any, Any, Any, Any, Any, Any], Any]
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,8 @@ class _Route:
     accepted_call: Callable[[Any, Any], Any]
     m2_call: Callable[[Any], Any]
     m3_call: Callable[[Any], Any]
+    m2_residual_call: Callable[[Any, Any, Any], Any]
+    m3_residual_call: Callable[[Any, Any, Any], Any]
 
 
 _STATS: dict[str, Any] = {
@@ -38,6 +41,7 @@ _STATS: dict[str, Any] = {
     "installed": False,
     "installed_blocks": 0,
     "selfcheck_dmax": None,
+    "residual_selfcheck_dmax": None,
     "geometry": None,
 }
 
@@ -183,6 +187,28 @@ def _whole_call(block: Any, binding: _Binding, value: Any) -> Any:
     return output.reshape(value.shape)
 
 
+def _whole_residual_call(
+    block: Any,
+    binding: _Binding,
+    value: Any,
+    residual: Any,
+    inject: Any,
+) -> Any:
+    logits, shared_gate = binding.stage1(value)
+    expert_ids, selected_logits = binding.route_top10(logits)
+    route_scores = mx.softmax(selected_logits, axis=-1, precise=True)
+    activations = binding.stage2(value, expert_ids)
+    hidden = binding.stage3_residual(
+        activations,
+        expert_ids,
+        route_scores,
+        shared_gate,
+        residual,
+        inject,
+    )
+    return hidden.reshape(residual.shape)
+
+
 def _installed_call(self: Any, value: Any) -> Any:
     rows = 1
     for dimension in value.shape[:-1]:
@@ -195,8 +221,25 @@ def _installed_call(self: Any, value: Any) -> Any:
     return route.accepted_call(self, value)
 
 
+def _installed_residual_call(
+    self: Any,
+    value: Any,
+    residual: Any,
+    inject: Any,
+) -> Any:
+    rows = int(value.shape[-2])
+    route = type(self)._mtplx_qwen4_whole_moe_route
+    if rows == 2:
+        return route.m2_residual_call(value, residual, inject)
+    if rows == 3:
+        return route.m3_residual_call(value, residual, inject)
+    raise Qwen4WholeMoeConfigError(
+        f"installed residual route requires M=2 or M=3, got M={rows}"
+    )
+
+
 def _bind(block: Any, rows: int) -> _Binding:
-    stage1, route_top10, stage2, stage3 = kernels.bind_stages(
+    stage1, route_top10, stage2, stage3, stage3_residual = kernels.bind_stages(
         rows=rows,
         router=block.gate,
         routed=block.switch_mlp,
@@ -208,6 +251,7 @@ def _bind(block: Any, rows: int) -> _Binding:
         route_top10=route_top10,
         stage2=stage2,
         stage3=stage3,
+        stage3_residual=stage3_residual,
     )
 
 
@@ -229,6 +273,27 @@ def _selfcheck(
     return dmax
 
 
+def _selfcheck_residual(block: Any, binding: _Binding, rows: int) -> float:
+    values = mx.sin(mx.arange(rows * 2560, dtype=mx.float32) / 97.0)
+    values = values.reshape(1, rows, 2560).astype(mx.bfloat16)
+    residual = mx.cos(mx.arange(rows * 4 * 2560, dtype=mx.float32) / 89.0)
+    residual = residual.reshape(1, rows, 4 * 2560).astype(mx.bfloat16)
+    inject = mx.sigmoid(mx.arange(rows * 4, dtype=mx.float32) / 7.0)
+    inject = inject.reshape(1, rows, 4).astype(mx.bfloat16)
+    output = _whole_call(block, binding, values)
+    expected = residual + (output[..., None, :] * inject[..., None]).reshape(
+        residual.shape
+    )
+    actual = _whole_residual_call(block, binding, values, residual, inject)
+    mx.eval(expected, actual)
+    dmax = float(mx.max(mx.abs(expected.astype(mx.float32) - actual.astype(mx.float32))))
+    if dmax != 0.0:
+        raise Qwen4WholeMoeConfigError(
+            f"whole-MoE M={rows} residual self-check is not exact: {dmax}"
+        )
+    return dmax
+
+
 def configure_qwen4_whole_moe(
     model: Any,
     *,
@@ -245,6 +310,7 @@ def configure_qwen4_whole_moe(
             "installed": False,
             "installed_blocks": 0,
             "selfcheck_dmax": None,
+            "residual_selfcheck_dmax": None,
             "geometry": None,
         }
     )
@@ -271,6 +337,14 @@ def configure_qwen4_whole_moe(
         if run_selfcheck
         else {"m2": None, "m3": None}
     )
+    residual_dmax = (
+        {
+            "m2": _selfcheck_residual(blocks[0], _bind(blocks[0], 2), 2),
+            "m3": _selfcheck_residual(blocks[0], _bind(blocks[0], 3), 3),
+        }
+        if run_selfcheck
+        else {"m2": None, "m3": None}
+    )
     for index, block in enumerate(blocks):
         accepted_call = type(block).__call__
         m2_binding = _bind(block, 2)
@@ -282,16 +356,43 @@ def configure_qwen4_whole_moe(
         def m3_call(value: Any, *, _block=block, _binding=m3_binding):
             return _whole_call(_block, _binding, value)
 
+        def m2_residual_call(
+            value: Any,
+            residual: Any,
+            inject: Any,
+            *,
+            _block=block,
+            _binding=m2_binding,
+        ):
+            return _whole_residual_call(
+                _block, _binding, value, residual, inject
+            )
+
+        def m3_residual_call(
+            value: Any,
+            residual: Any,
+            inject: Any,
+            *,
+            _block=block,
+            _binding=m3_binding,
+        ):
+            return _whole_residual_call(
+                _block, _binding, value, residual, inject
+            )
+
         route = _Route(
             accepted_call=accepted_call,
             m2_call=m2_call,
             m3_call=m3_call,
+            m2_residual_call=m2_residual_call,
+            m3_residual_call=m3_residual_call,
         )
         installed_type = type(
             f"Qwen4WholeM2MoE_{index}_{type(block).__name__}",
             (type(block),),
             {
                 "__call__": _installed_call,
+                "_mtplx_residual_call": _installed_residual_call,
                 "_mtplx_qwen4_whole_moe_route": route,
             },
         )
@@ -302,6 +403,7 @@ def configure_qwen4_whole_moe(
             "installed": True,
             "installed_blocks": 48,
             "selfcheck_dmax": dmax,
+            "residual_selfcheck_dmax": residual_dmax,
             "geometry": {
                 "rows": (2, 3),
                 "hidden": 2560,

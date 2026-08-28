@@ -511,6 +511,23 @@ def _stage3_source(rows: int) -> str:
     """
 
 
+def _stage3_residual_source(rows: int) -> str:
+    stock_store = """output[row * HIDDEN + output_column] = bfloat(
+                    float(routed_accumulator[result_index]) + float(gated_shared));"""
+    fused_store = """bfloat mlp_value = bfloat(
+                    float(routed_accumulator[result_index]) + float(gated_shared));
+                for (uint stream = 0; stream < 4; ++stream) {
+                    uint hidden_index = (row * 4 + stream) * HIDDEN + output_column;
+                    bfloat inject_value = inject[row * 4 + stream];
+                    bfloat product = bfloat(mlp_value * inject_value);
+                    hidden[hidden_index] = bfloat(residual[hidden_index] + product);
+                }"""
+    source = _stage3_source(rows).replace(stock_store, fused_store)
+    if source == _stage3_source(rows):
+        raise RuntimeError("Qwen4 stage3 residual store substitution failed")
+    return source
+
+
 def sources(rows: int = 2) -> dict[str, str]:
     rows = _require_rows(rows)
     return {
@@ -518,6 +535,7 @@ def sources(rows: int = 2) -> dict[str, str]:
         "route": _route_source(rows),
         "stage2": _stage2_source(rows),
         "stage3": _stage3_source(rows),
+        "stage3_residual": _stage3_residual_source(rows),
     }
 
 
@@ -647,6 +665,17 @@ def bind_stages(
         shared.down_proj.scales,
         shared.down_proj.biases,
     )
+    stage3_residual_kernel = _kernel(
+        rows,
+        "stage3_residual",
+        [
+            "activations", "expert_ids", "route_scores", "shared_gate",
+            "residual", "inject",
+            "routed_down_weight", "routed_down_scales", "routed_down_biases",
+            "shared_down_weight", "shared_down_scales", "shared_down_biases",
+        ],
+        "hidden",
+    )
 
     def stage1(value: Any):
         return stage1_kernel(
@@ -698,7 +727,32 @@ def bind_stages(
         )
         return output
 
-    return stage1, route_top10, stage2, stage3
+    def stage3_residual(
+        activations: Any,
+        expert_ids: Any,
+        route_scores: Any,
+        shared_gate_values: Any,
+        residual: Any,
+        inject: Any,
+    ):
+        (hidden,) = stage3_residual_kernel(
+            inputs=[
+                activations,
+                expert_ids,
+                route_scores,
+                shared_gate_values,
+                residual,
+                inject,
+                *stage3_static,
+            ],
+            grid=(rows * (HIDDEN // 16) * THREADS, 1, 1),
+            threadgroup=(THREADS, 1, 1),
+            output_shapes=[(rows, 4 * HIDDEN)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return hidden
+
+    return stage1, route_top10, stage2, stage3, stage3_residual
 
 
 def stage1(value: Any, binding: Any, *, rows: int = 2):

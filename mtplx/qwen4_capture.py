@@ -147,6 +147,19 @@ def _qwen4_hyper_from_normed(module, hidden, normed):
     return mixed, hidden, inject
 
 
+def _qwen4_stock_mlp_tail(layer, value, residual, inject):
+    value = layer.mlp(value)
+    return residual + (value[..., None, :] * inject[..., None]).reshape(
+        *value.shape[:-1], -1
+    )
+
+
+def _qwen4_residual_mlp_tail(layer, value, residual, inject):
+    if int(value.shape[-2]) in (2, 3):
+        return layer.mlp._mtplx_residual_call(value, residual, inject)
+    return _qwen4_stock_mlp_tail(layer, value, residual, inject)
+
+
 def is_exact_qwen4_capture_config(config: dict[str, Any]) -> bool:
     """Return whether *config* matches the measured fixed-shape capture lane."""
 
@@ -243,6 +256,7 @@ def _qwen4_forward_with_capture(
             ple_cache[3] = mx.concatenate([prev_ctx, inputs], axis=1)[:, -context_len:]
 
     hidden = mx.tile(hidden, (1, 1, inner.hc))
+    mlp_tail = inner._mtplx_capture_mlp_tail
     captures: dict[int, dict[str, mx.array]] = {}
     for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         indexer_cache = (
@@ -279,10 +293,7 @@ def _qwen4_forward_with_capture(
         value, residual, inject = _qwen4_hyper_from_normed(
             layer.mlp_hyper_connection, hidden, normed
         )
-        value = layer.mlp(value)
-        hidden = residual + (value[..., None, :] * inject[..., None]).reshape(
-            *value.shape[:-1], -1
-        )
+        hidden = mlp_tail(layer, value, residual, inject)
 
     output = inner.hyper_connection_mixer(hidden)
     logits = text_model._logits(output)
@@ -341,6 +352,15 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
             or hyper.block_inject_weight is None
         ):
             raise Qwen4CaptureConfigError("capture hyper geometry is invalid")
+    residual_routes = tuple(
+        hasattr(type(getattr(layer, "mlp", None)), "_mtplx_residual_call")
+        for layer in layers
+    )
+    if any(residual_routes) and not all(residual_routes):
+        raise Qwen4CaptureConfigError("capture residual MoE route is only partly installed")
+    inner._mtplx_capture_mlp_tail = (
+        _qwen4_residual_mlp_tail if all(residual_routes) else _qwen4_stock_mlp_tail
+    )
     if (
         _linear_gated_delta_from_conv_headquarter_kernel is None
         or _QWEN4_NORM_GATE_KERNEL is None

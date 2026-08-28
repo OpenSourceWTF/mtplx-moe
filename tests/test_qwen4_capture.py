@@ -5,6 +5,14 @@ from types import SimpleNamespace
 import pytest
 
 
+class _TailMlp:
+    def __call__(self, value):
+        return ("stock-mlp", value.shape[-2])
+
+    def _mtplx_residual_call(self, value, residual, inject):
+        return ("fused", value.shape[-2], residual, inject)
+
+
 def _config():
     return {
         "model_type": "qwen4_exp",
@@ -94,3 +102,35 @@ def test_capture_route_support_rejects_a_different_output_gate():
     config["text_config"]["output_gate_type"] = "silu"
 
     assert not is_exact_qwen4_capture_config(config)
+
+
+def test_residual_mlp_tail_routes_only_fixed_decode_rows(monkeypatch):
+    import mtplx.qwen4_capture as capture
+
+    layer = SimpleNamespace(mlp=_TailMlp())
+    monkeypatch.setattr(
+        capture,
+        "_qwen4_stock_mlp_tail",
+        lambda _layer, value, residual, inject: (
+            "stock",
+            value.shape[-2],
+            residual,
+            inject,
+        ),
+    )
+
+    for rows in (2, 3):
+        value = SimpleNamespace(shape=(1, rows, 2560))
+        assert capture._qwen4_residual_mlp_tail(layer, value, "r", "i") == (
+            "fused",
+            rows,
+            "r",
+            "i",
+        )
+    value = SimpleNamespace(shape=(1, 9, 2560))
+    assert capture._qwen4_residual_mlp_tail(layer, value, "r", "i") == (
+        "stock",
+        9,
+        "r",
+        "i",
+    )
