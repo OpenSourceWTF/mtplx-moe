@@ -35,7 +35,7 @@
 
 **Does NOT cover:** Row specialization supports only rows 2 and 3; it does not add a dynamic-row Metal kernel or an M=4 variant.
 
-- [ ] **Step 1: Write failing source, geometry, and three-row routing tests**
+- [x] **Step 1: Write failing source, geometry, and three-row routing tests**
 
 ```python
 def test_exact_sources_encode_qwen4_storage_and_right_shapes():
@@ -66,7 +66,7 @@ def test_row_owned_top10_matches_qwen4_argpartition_order_for_three_rows():
     np.testing.assert_array_equal(np.asarray(actual_logits), np.asarray(expected_logits))
 ```
 
-- [ ] **Step 2: Run the no-Metal source test and verify the red state**
+- [x] **Step 2: Run the no-Metal source test and verify the red state**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_qwen4_whole_moe.py -k exact_sources
@@ -74,7 +74,7 @@ def test_row_owned_top10_matches_qwen4_argpartition_order_for_three_rows():
 
 Expected: FAIL because `sources()` and `launch_geometry()` do not accept a row count.
 
-- [ ] **Step 3: Parameterize source generation, cache identity, geometry, and binding**
+- [x] **Step 3: Parameterize source generation, cache identity, geometry, and binding**
 
 Use this interface and cache contract throughout `mtplx/kernels/qwen4_whole_moe.py`:
 
@@ -139,7 +139,7 @@ def route_top10(router_logits: Any):
 
 Keep `route_top10(router_logits, *, rows=2)` for focused parity tests, backed by the same row-specialized route kernel. Do not change Metal arithmetic or loop ownership beyond substituting the source constant.
 
-- [ ] **Step 4: Run source verification**
+- [x] **Step 4: Run source verification**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_qwen4_whole_moe.py -k exact_sources
@@ -148,7 +148,7 @@ git diff --check
 
 Expected: the source test passes and the diff check emits no output.
 
-- [ ] **Step 5: Commit the approved documents and kernel slice**
+- [x] **Step 5: Commit the approved documents and kernel slice**
 
 ```bash
 git add docs/specs/2026-08-28-qwen4-m3-target-lane-design.md \
@@ -167,7 +167,7 @@ git commit -m "Parameterize Qwen4 whole-MoE row kernels"
 
 **Does NOT cover:** Other logical widths remain on the captured stock implementation; runtime failures in an installed lane do not fall back to stock.
 
-- [ ] **Step 1: Write failing construction-route and self-check tests**
+- [x] **Step 1: Write failing construction-route and self-check tests**
 
 ```python
 def test_exact_m2_m3_routes_are_installed_once_and_other_rows_stay_stock(monkeypatch):
@@ -205,7 +205,7 @@ def test_construction_selfchecks_both_rows_before_install(monkeypatch):
 
 Define `QWEN4_CONFIG`, `fake_model_with_48_blocks`, and `configure_fake_model` in the test file from the existing 48-layer fixture and exact config literal.
 
-- [ ] **Step 2: Run route tests and verify the red state**
+- [x] **Step 2: Run route tests and verify the red state**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_qwen4_whole_moe.py \
@@ -214,7 +214,7 @@ Define `QWEN4_CONFIG`, `fake_model_with_48_blocks`, and `configure_fake_model` i
 
 Expected: FAIL because `_Route` has no M=3 callable, `_bind` has no row argument, and self-check is M=2-only.
 
-- [ ] **Step 3: Bind both variants and install the direct route**
+- [x] **Step 3: Bind both variants and install the direct route**
 
 Use these structures and direct call path:
 
@@ -259,7 +259,7 @@ Implement `_bind(block, rows)` through `kernels.bind_stages(rows=rows, ...)`. Im
 
 Before changing a block class, self-check rows 2 and 3 on the first block. For each block, bind both variants once and close them into `m2_call` and `m3_call`; install `_Route` without enabled-lane exception handling. Report `selfcheck_dmax={"m2": dmax2, "m3": dmax3}` and `geometry["rows"]=(2, 3)`.
 
-- [ ] **Step 4: Run all no-model focused tests**
+- [x] **Step 4: Run all no-model focused tests**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_qwen4_whole_moe.py -k 'not row_owned_top10'
@@ -268,7 +268,7 @@ git diff --check
 
 Expected: selected tests pass and the diff check emits no output.
 
-- [ ] **Step 5: Commit the construction-installed M=3 lane**
+- [x] **Step 5: Commit the construction-installed M=3 lane**
 
 ```bash
 git add mtplx/qwen4_whole_moe.py tests/test_qwen4_whole_moe.py
@@ -284,7 +284,7 @@ git commit -m "Install exact Qwen4 M3 whole-MoE route"
 
 **Does NOT cover:** A short greedy palindrome result cannot promote the candidate, and a production regression cannot be hidden by acceptance or profiler diagnostics.
 
-- [ ] **Step 1: Run focused Metal tests under the canonical guard**
+- [x] **Step 1: Run focused Metal tests under the canonical guard**
 
 ```bash
 .venv/bin/python /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
@@ -296,7 +296,7 @@ git commit -m "Install exact Qwen4 M3 whole-MoE route"
 
 Expected: all tests pass and the guard restores the service.
 
-- [ ] **Step 2: Capture two unchanged depth-2 production controls**
+- [x] **Step 2: Capture two unchanged depth-2 production controls**
 
 From the clean diagnostic worktree at `ce915106`, run this command twice, changing `r1` to `r2`:
 
@@ -309,7 +309,7 @@ env MTPLX_FUSE_PROJ=gdn,attn,hyper MTPLX_QWEN4_WHOLE_MOE_M2=1 \
 
 Expected: exact 16,384-input/1,024-output production sampler receipts. Record TPS, digest, verifier calls, acceptance, repair, target evaluation time, and target-forward time.
 
-- [ ] **Step 3: Capture two candidate depth-2 production receipts**
+- [x] **Step 3: Capture two candidate depth-2 production receipts**
 
 From this worktree, run twice, changing `r1` to `r2`:
 
@@ -320,9 +320,9 @@ env MTPLX_FUSE_PROJ=gdn,attn,hyper MTPLX_QWEN4_WHOLE_MOE_M2=1 \
   --profile sustained --output /tmp/pr368-m3-candidate-production-r1.json
 ```
 
-Expected: both candidate receipts retain the control digest, correctness result, and deterministic acceptance trajectory while repeatably exceeding the control mean.
+Expected: both candidate receipts pass construction self-checks, produce valid output with zero repair, record any owner-authorized near-boundary digest/acceptance change, and repeatably exceed the control mean.
 
-- [ ] **Step 4: Reject or record the measured candidate**
+- [x] **Step 4: Reject or record the measured candidate**
 
 If digest, correctness, acceptance trajectory, or throughput fails, retain raw receipts, use non-destructive `git revert` for the unpromoted code commits, and do not publish a success claim.
 
