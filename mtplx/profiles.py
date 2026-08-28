@@ -151,6 +151,17 @@ QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID = "mtplx-qwen38-27b-optimized-speed-
 QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID = (
     "mtplx-qwen38-27b-optimized-quality-fp16"
 )
+# Qwen 3.8 Flash-Next serve identities (2026-08-27 turbo-first-class
+# promotion). The public ids equal the model_catalog aliases so catalog
+# installs, `mtplx pull mtplx-flash-next-*`, and served-dir name inference
+# all converge on one identity. Derivative packs (-hc8, -v1a, RC dirs) fall
+# through to sanitized names by the exact-equality fence in default_models.
+FLASH_NEXT_BARE_SPEED_HF_MODEL_ID = "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed"
+FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID = (
+    "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed"
+)
+FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID = "mtplx-flash-next-bare-speed"
+FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID = "mtplx-flash-next-optimized-speed"
 # Public default (2026-08-15, founder ruling on the Qwen3.8 release): the
 # Qwen 3.8 Optimized Speed dynamic 4-bit build is the recommended pick and the
 # fresh-install default on modern Apple Silicon. Its weights are published on
@@ -281,6 +292,12 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         "MTPLX_FUSED_GDN_OUT",
         "MTPLX_FUSED_QSA_QKV",
         "MTPLX_FUSED_GDN_CONVNORM",
+        # One-dispatch GDN decode step (2026-08-27 family default; two
+        # boot-triple receipt in the server's family octet comment).
+        "MTPLX_FUSED_GDN_STEP",
+        # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
+        # NAX verify patch OFF under turbo until it earns a family receipt.
+        "MTPLX_NAX_VERIFY",
         "MTPLX_FUSED_HC_V3",
         "MTPLX_FUSED_MOE_DECODE",
         "MTPLX_MTP_HISTORY_POLICY",

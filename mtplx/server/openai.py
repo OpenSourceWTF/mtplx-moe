@@ -739,6 +739,15 @@ def _server_runtime_env_overrides(
         # - GDN conv+silu+l2norm fused between the GEMVs (2026-08-27 A/B/A:
         #   59.31 -> 60.96, every B row above every A row — the first config
         #   past the 60-AR line).
+        # - One-dispatch GDN decode step (2026-08-27): conv+silu+l2norm,
+        #   g/beta, fp32 delta recurrence, and the SigmoidRMSNormGated
+        #   epilogue in a single kernel between the in_proj/out_proj GEMVs —
+        #   a GDN layer is now 3 sends (was ~6). Supersedes CONVNORM at
+        #   decode (that kernel still covers the S>1 / verify shapes this
+        #   gate refuses). Two boot-triples, both arm orders: A/B/A
+        #   +1.03 t/s (+1.7%, B took the two fastest rows), order-reversed
+        #   B/A/B +1.26 t/s (+2.2%), B took the six fastest warm rows and
+        #   the trailing B arm beat A against the session's downward drift.
         for key in (
             "MTPLX_AR_PIPELINE",
             "MTPLX_COMPILED_GDN",
@@ -747,9 +756,21 @@ def _server_runtime_env_overrides(
             "MTPLX_FUSED_GDN_INPROJ",
             "MTPLX_FUSED_GATE_UP",
             "MTPLX_FUSED_GDN_CONVNORM",
+            "MTPLX_FUSED_GDN_STEP",
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")
+        if os.environ.get("MTPLX_NAX_VERIFY") is None:
+            # The turbo profile arms the 27B NAX verify patch
+            # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
+            # mostly bypassed — the fused family modules call
+            # mx.quantized_matmul directly, so the patch could only touch
+            # foreign-shape leftovers (248320-vocab lm_head, expert
+            # gathers). Hold it OFF until it earns a family receipt at
+            # verify widths. An explicit operator export still wins via the
+            # env gate above, and runtime_env_overrides are applied AFTER
+            # the profile env (apply_profile_env), so this beats turbo's 1.
+            overrides["MTPLX_NAX_VERIFY"] = "0"
     return overrides
 
 

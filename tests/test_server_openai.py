@@ -857,6 +857,77 @@ def test_mtp_batch_installs_qwen35b_optimized_kernel_routes_at_construction():
     }
 
 
+_QWEN4_EXP_FAMILY_ENV_OCTET = (
+    "MTPLX_AR_PIPELINE",
+    "MTPLX_COMPILED_GDN",
+    "MTPLX_FAMILY_CAPTURE_COMMIT",
+    "MTPLX_FUSED_HC_V3",
+    "MTPLX_FUSED_GDN_INPROJ",
+    "MTPLX_FUSED_GATE_UP",
+    "MTPLX_FUSED_GDN_CONVNORM",
+    "MTPLX_FUSED_GDN_STEP",
+)
+
+
+def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatch):
+    """qwen4_exp packs get the measured fast-lane octet plus NAX held OFF.
+
+    The octet ships the family's measured wins (newest: the one-dispatch
+    GDN step, two boot-triples in both arm orders 2026-08-27). NAX verify
+    is family-neutralized because turbo's 27B patch is unmeasured here; an
+    explicit operator export must win over both defaults.
+    """
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp"}), encoding="utf-8"
+    )
+    args = SimpleNamespace(
+        generation_mode="mtp",
+        verify_strategy="capture_commit",
+        model=str(tmp_path),
+    )
+    for key in (*_QWEN4_EXP_FAMILY_ENV_OCTET, "MTPLX_NAX_VERIFY"):
+        monkeypatch.delenv(key, raising=False)
+
+    overrides = openai._server_runtime_env_overrides(args, {})
+    for key in _QWEN4_EXP_FAMILY_ENV_OCTET:
+        assert overrides.get(key) == "1", key
+    assert overrides.get("MTPLX_NAX_VERIFY") == "0"
+
+    # Every emitted key must survive the boot-time validator — the 08-27
+    # turbo QA boot died on an unregistered MTPLX_FUSED_GDN_STEP while this
+    # test was green, because normalize only runs inside apply_profile_env.
+    from mtplx.profiles import normalize_runtime_env_overrides
+
+    assert normalize_runtime_env_overrides(overrides) == overrides
+
+    # Operator env beats every family default (the launch-time export lane).
+    monkeypatch.setenv("MTPLX_FUSED_GDN_STEP", "0")
+    monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
+    pinned = openai._server_runtime_env_overrides(args, {})
+    assert "MTPLX_FUSED_GDN_STEP" not in pinned
+    assert "MTPLX_NAX_VERIFY" not in pinned
+
+    # Non-family models get neither the octet nor the neutralize.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_next"}), encoding="utf-8"
+    )
+    monkeypatch.delenv("MTPLX_FUSED_GDN_STEP", raising=False)
+    monkeypatch.delenv("MTPLX_NAX_VERIFY", raising=False)
+    other = openai._server_runtime_env_overrides(
+        SimpleNamespace(
+            generation_mode="mtp",
+            verify_strategy="capture_commit",
+            model=str(plain),
+        ),
+        {},
+    )
+    for key in (*_QWEN4_EXP_FAMILY_ENV_OCTET, "MTPLX_NAX_VERIFY"):
+        assert key not in other, key
+
+
 def test_server_parser_accepts_tool_prompt_and_template_profile():
     args = parse_args(
         [

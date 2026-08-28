@@ -87,6 +87,10 @@ from mtplx.profiles import (
     DEFAULT_MODEL_ID,
     DEFAULT_PROFILE_NAME,
     DEFAULT_PUBLIC_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     OPTIMIZED_SPEED_V1_HF_MODEL_ID,
@@ -1125,6 +1129,18 @@ _TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
         QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID,
         QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
         QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID,
+        # Qwen 3.8 Flash-Next serve packs (2026-08-27). Turbo here does NOT
+        # ride the 27B NAX/vk verify machinery: the qwen4_exp family carries
+        # its own measured fast lane — the family env octet in
+        # openai.py:_server_runtime_env_overrides (AR pipeline, compiled GDN,
+        # layer-owned capture-commit, fused hc/gdn kernels) — and the same
+        # block family-neutralizes MTPLX_NAX_VERIFY until it earns a receipt
+        # on this family. Newest member's receipt (one-dispatch GDN step,
+        # 2026-08-27): two boot-triples in both arm orders, A/B/A +1.7% and
+        # B/A/B +2.2%, AR 60-62 t/s on 512-tok rows, zero-overlap warm rows
+        # in the confirm triple.
+        FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     }
 )
 
@@ -8921,6 +8937,16 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         Path(
             QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID
         ).name.lower(): QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+        FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_BARE_SPEED_HF_MODEL_ID.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        Path(
+            FLASH_NEXT_BARE_SPEED_HF_MODEL_ID
+        ).name.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(
+            FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID
+        ).name.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
         "qwen3.6-35b-a3b-mtplx-official4-cyankiwimtp-cleanrecipe": QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     }
     for candidate in lookup_keys:

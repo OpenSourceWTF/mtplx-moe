@@ -8,6 +8,24 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Added
 
+- **Flash-Next turbo, first-class.** The two Qwen 3.8 Flash-Next serve
+  packs now resolve the **turbo** launch profile by default across
+  `mtplx start` / `serve` / `quickstart` / the app — the same measured
+  launch rule the quantized 27B/9B flagships follow. On this family turbo
+  rides the qwen4_exp fast lane (pipelined AR decode, compiled GDN,
+  layer-owned capture-commit, and the fused hyper-read/GDN kernels below)
+  rather than the 27B NAX verify patch, which stays off for the family
+  until it earns its own measured win. Both packs' canonical ids
+  (`mtplx-flash-next-bare-speed`, `mtplx-flash-next-optimized-speed`)
+  now resolve from HF ids, folder names, and `mtplx pull` aliases;
+  derivative or renamed packs deliberately do not inherit the ids.
+- **One-dispatch GDN decode step.** The whole GatedDeltaNet decode
+  step — causal conv + SiLU + L2 norm, decay/beta gates, the fp32 delta
+  recurrence, and the gated-RMS output epilogue — now runs as a single
+  Metal dispatch between the in/out projections, cutting a GDN layer
+  from ~6 GPU sends to 3. Default-on for the family after two
+  boot-triple A/B batteries in both arm orders (+1.7% and +2.2% decode,
+  the confirm triple's fused arm holding the six fastest rows).
 - **Qwen 3.8 Flash-Next, day-0 native.** A new first-class model family
   (`qwen4_exp`): the 125B-A6B Qwen4-generation preview with GDN hybrid
   MoE, Qwen Sparse Attention, and the 32 GB n-gram memory sidecar —

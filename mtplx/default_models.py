@@ -17,6 +17,10 @@ from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
     DEFAULT_MODEL_ID,
     DEFAULT_PUBLIC_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     OPTIMIZED_SPEED_V1_HF_MODEL_ID,
     OPTIMIZED_SPEED_V1_PUBLIC_MODEL_ID,
@@ -530,6 +534,18 @@ def _public_model_id_from_name(value: str) -> str | None:
         return None
     lowered = text.replace("\\", "/").lower()
     components = _ref_name_components(text)
+    if FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID in components:
+        return FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID
+    if FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in components:
+        return FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if FLASH_NEXT_BARE_SPEED_HF_MODEL_ID.lower() in components:
+        return FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID
+    if FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID.lower() in components:
+        return FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
+    if "qwen3.8-flash-next-mtplx-bare-speed" in components:
+        return FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID
+    if "qwen3.8-flash-next-mtplx-optimized-speed" in components:
+        return FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID
     if QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID in components:
         return QWEN35_9B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID
     if QWEN35_9B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID in components:

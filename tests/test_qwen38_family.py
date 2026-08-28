@@ -30,6 +30,10 @@ from mtplx.backends.descriptors import (
 from mtplx.default_models import public_model_id_for_ref
 from mtplx.reasoning_effort import REASONING_EFFORT_CHOICES
 from mtplx.profiles import (
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     QWEN38_BARE_SPEED_HF_MODEL_ID,
     QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
     QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
@@ -243,6 +247,26 @@ def test_qwen38_resolved_descriptor_matches_model_controls() -> None:
             "~/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Bare-Speed",
             QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
         ),
+        # Flash-Next serve packs (2026-08-27 promotion): HF id, public id,
+        # and released folder name all resolve to the canonical id the
+        # turbo allowlist gates on.
+        (FLASH_NEXT_BARE_SPEED_HF_MODEL_ID, FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID),
+        (
+            FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+            FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+            FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            "~/.mtplx/models/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+            FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            "~/.mtplx/models/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+            FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        ),
     ],
 )
 def test_qwen38_public_model_id_resolution(ref: str, public_id: str) -> None:
@@ -255,6 +279,16 @@ def test_qwen38_derivative_names_fall_through() -> None:
         public_model_id_for_ref("Youssofal/Qwen3.8-27B-MTPLX-Bare-Speed-RC1")
         != QWEN38_BARE_SPEED_PUBLIC_MODEL_ID
     )
+    # Flash-Next derivative packs (hc8 kernel donor, superseded v1a) keep
+    # falling through to sanitized names — no first-party id inheritance.
+    for derivative in (
+        "Qwen3.8-Flash-Next-MTPLX-Bare-Speed-hc8",
+        "Qwen3.8-Flash-Next-MTPLX-OS-v1a",
+    ):
+        assert public_model_id_for_ref(derivative) not in {
+            FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+            FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        }
 
 
 def test_qwen38_turbo_default_promotion() -> None:
@@ -267,11 +301,18 @@ def test_qwen38_turbo_default_promotion() -> None:
         QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
         QWEN38_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
         QWEN38_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID,
+        # Flash-Next serve packs promoted 2026-08-27 (family fast lane
+        # under turbo; two-boot-triple GDN-step receipt).
+        FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     ):
         assert public_id in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
     args = SimpleNamespace(profile="sustained", _cli_flags=set())
     assert _apply_model_default_profile(args, QWEN38_BARE_SPEED_PUBLIC_MODEL_ID)
     assert args.profile == "turbo"
+    fn_args = SimpleNamespace(profile="sustained", _cli_flags=set())
+    assert _apply_model_default_profile(fn_args, FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID)
+    assert fn_args.profile == "turbo"
     # An explicit --profile flag still wins.
     pinned = SimpleNamespace(profile="sustained", _cli_flags={"profile"})
     assert not _apply_model_default_profile(pinned, QWEN38_BARE_SPEED_PUBLIC_MODEL_ID)

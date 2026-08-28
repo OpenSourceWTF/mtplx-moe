@@ -1134,7 +1134,7 @@ def _cmd_profiles(args: argparse.Namespace) -> int:
     print(f"library default: {DEFAULT_PROFILE_NAME}")
     print(
         "start/serve default: resolves per model — turbo for the quantized "
-        "27B/9B flagships, sustained otherwise"
+        "27B/9B flagships and the Flash-Next packs, sustained otherwise"
     )
     for profile in payload["profiles"]:
         print(f"{profile['name']}: {profile['summary']}")
@@ -2126,7 +2126,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_profile_arg,
         metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
-        help="Runtime profile. Default resolves per model: Turbo for the quantized 27B and 9B flagships (the app's launch rule), Sustained otherwise. An explicit value always wins. Use --profile performance-cold --max for Burst.",
+        help="Runtime profile. Default resolves per model: Turbo for the quantized 27B/9B flagships and the Qwen 3.8 Flash-Next packs (the app's launch rule), Sustained otherwise. An explicit value always wins. Use --profile performance-cold --max for Burst.",
     )
     start_flow_p.add_argument(
         "--download",
@@ -2449,7 +2449,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_profile_arg,
         metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
-        help="Runtime profile. Default resolves per model (Turbo for the quantized 27B and 9B flagships, Sustained otherwise); use --profile performance-cold --max for Burst.",
+        help="Runtime profile. Default resolves per model (Turbo for the quantized 27B/9B flagships and the Flash-Next packs, Sustained otherwise); use --profile performance-cold --max for Burst.",
     )
     quickstart_server_p.add_argument("--unsafe-force-unverified", action="store_true")
     quickstart_server_p.add_argument(
@@ -3665,7 +3665,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(*PROFILE_CHOICES, "native-mtp-60"),
         help=(
             "Runtime profile for product benchmark actions. Default follows the launch rule: "
-            "Turbo for the quantized 27B/9B flagships across every suite; Sustained otherwise "
+            "Turbo for the quantized 27B/9B flagships and the Flash-Next packs across every suite; Sustained otherwise "
             "(context and long-generation suites stay Sustained for non-flagship models); "
             "native-mtp-60 is a legacy alias for performance-cold."
         ),

@@ -1141,6 +1141,11 @@ def test_serve_defaults_quantized_27b_flagships_to_turbo(monkeypatch, tmp_path, 
         # kernels: live ABBA MTP D3 110/102 vs sustained 90/69 tok/s.
         "Qwen3.5-9B-MTPLX-Optimized-Speed",
         "Qwen3.5-9B-MTPLX-Optimized-Speed-FP16",
+        # Flash-Next serve packs promoted 2026-08-27: turbo rides the
+        # qwen4_exp family fast lane (env octet + family NAX neutralize in
+        # the server), receipts in _TURBO_DEFAULT_PUBLIC_MODEL_IDS.
+        "Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+        "Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
     ):
         model_dir = tmp_path / dir_name
         model_dir.mkdir()
