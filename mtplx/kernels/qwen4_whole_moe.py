@@ -57,6 +57,9 @@ def _stage1_source(rows: int) -> str:
 
         uint expert_base = expert_tile * EXPERTS_PER_GROUP;
         float result[ROWS][4] = {};
+        const device uchar* shared_gate_weights =
+            reinterpret_cast<const device uchar*>(shared_gate_weight);
+        float shared_gate_result[ROWS] = {};
         for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
             uint k_lane = k_block + lane * VALUES_PER_LANE;
             float input_values[ROWS][VALUES_PER_LANE];
@@ -77,6 +80,25 @@ def _stage1_source(rows: int) -> str:
                     }
                 }
             }
+            if (expert_tile == 0) {
+                uint metadata_index = k_lane / SHARED_GROUP;
+                float scale = float(shared_gate_scales[metadata_index]);
+                float bias = float(shared_gate_biases[metadata_index]);
+                float input_sum[ROWS] = {};
+                float quantized_dot[ROWS] = {};
+                for (uint item = 0; item < VALUES_PER_LANE; ++item) {
+                    float weight_value = float(shared_gate_weights[k_lane + item]);
+                    for (uint row = 0; row < ROWS; ++row) {
+                        float input_value = input_values[row][item];
+                        input_sum[row] += input_value;
+                        quantized_dot[row] += input_value * weight_value;
+                    }
+                }
+                for (uint row = 0; row < ROWS; ++row) {
+                    shared_gate_result[row] +=
+                        scale * quantized_dot[row] + input_sum[row] * bias;
+                }
+            }
         }
         for (uint row = 0; row < ROWS; ++row) {
             for (uint result_index = 0; result_index < 4; ++result_index) {
@@ -89,30 +111,8 @@ def _stage1_source(rows: int) -> str:
         }
 
         if (expert_tile == 0) {
-            const device uchar* weights =
-                reinterpret_cast<const device uchar*>(shared_gate_weight);
-            float result[ROWS] = {};
-            for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
-                uint k_lane = k_block + lane * VALUES_PER_LANE;
-                uint metadata_index = k_lane / SHARED_GROUP;
-                float scale = float(shared_gate_scales[metadata_index]);
-                float bias = float(shared_gate_biases[metadata_index]);
-                float input_sum[ROWS] = {};
-                float quantized_dot[ROWS] = {};
-                for (uint item = 0; item < VALUES_PER_LANE; ++item) {
-                    float weight_value = float(weights[k_lane + item]);
-                    for (uint row = 0; row < ROWS; ++row) {
-                        float input_value = float(value[row * HIDDEN + k_lane + item]);
-                        input_sum[row] += input_value;
-                        quantized_dot[row] += input_value * weight_value;
-                    }
-                }
-                for (uint row = 0; row < ROWS; ++row) {
-                    result[row] += scale * quantized_dot[row] + input_sum[row] * bias;
-                }
-            }
             for (uint row = 0; row < ROWS; ++row) {
-                float reduced = simd_sum(result[row]);
+                float reduced = simd_sum(shared_gate_result[row]);
                 if (lane == 0) {
                     shared_gate[row] = bfloat(reduced);
                 }

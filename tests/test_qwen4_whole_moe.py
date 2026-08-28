@@ -66,6 +66,22 @@ def test_exact_sources_encode_qwen4_storage_and_right_shapes():
         ]
 
 
+def test_stage1_reuses_loaded_activation_tile_for_shared_q8_gate():
+    for rows in (2, 3):
+        source = kernels.sources(rows)["stage1"]
+        shared_gate_start = source.index("if (expert_tile == 0)")
+        shared_gate_source = source[shared_gate_start:]
+
+        # The router and shared q8/g64 gate consume the same 16-value tile. A
+        # second value[] read in the gate path would erase the intended reuse.
+        assert source.count("float input_values[ROWS][VALUES_PER_LANE];") == 1
+        assert source.count("value[row * HIDDEN + k_lane + item]") == 1
+        assert "input_values[row][item]" in shared_gate_source
+        assert "SHARED_GROUP = 64" in source
+        assert "shared_gate_scales[metadata_index]" in shared_gate_source
+        assert "shared_gate_biases[metadata_index]" in shared_gate_source
+
+
 def test_row_owned_top10_matches_qwen4_argpartition_order():
     logits = mx.sin(mx.arange(2 * 512, dtype=mx.float32) * 1.337).reshape(2, 512)
     expected_ids = mx.argpartition(-logits, 9, axis=-1)[..., :10]
