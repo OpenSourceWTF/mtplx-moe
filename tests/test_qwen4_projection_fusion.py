@@ -34,13 +34,21 @@ def _args() -> TextArgs:
     )
 
 
-def test_qwen4_gdn_installs_one_exact_small_row_projection_route():
+def test_qwen4_gdn_installs_one_exact_small_row_projection_route(monkeypatch):
     layer = GatedDeltaNet(_args())
     nn.quantize(layer, group_size=32, bits=4)
     names = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
     original = tuple(getattr(layer, name) for name in names)
+    contiguous_calls = 0
+    original_contiguous = mx.contiguous
+
+    def counted_contiguous(value):
+        nonlocal contiguous_calls
+        contiguous_calls += 1
+        return original_contiguous(value)
 
     report = install_qwen4_fused_projection_routes(layer, groups={"gdn"})
+    monkeypatch.setattr(mx, "contiguous", counted_contiguous)
 
     assert report == {"gdn": 1, "attn": 0, "skipped": 0}
     assert type(layer).__name__ == "FusedProjectionGatedDeltaNet"
@@ -52,6 +60,7 @@ def test_qwen4_gdn_installs_one_exact_small_row_projection_route():
         actual = layer._project_inputs(x)
         mx.eval(*expected, *actual)
         assert all(mx.array_equal(got, want) for got, want in zip(actual, expected))
+    assert contiguous_calls == 0
 
 
 def test_generic_projection_configuration_selects_qwen4_route(monkeypatch):

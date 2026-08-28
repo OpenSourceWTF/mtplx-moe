@@ -110,11 +110,15 @@ def _split_contiguous(out: mx.array, split_points: list[int]):
     return tuple(mx.contiguous(part) for part in mx.split(out, split_points, axis=-1))
 
 
+def _split_views(out: mx.array, split_points: list[int]):
+    return tuple(mx.split(out, split_points, axis=-1))
+
+
 class FusedProjectionGatedDeltaNet(GatedDeltaNet):
     def _project_inputs(self, x):
         if math.prod(x.shape[:-1]) > self._mtplx_fused_max_rows:
             return GatedDeltaNet._project_inputs(self, x)
-        return _split_contiguous(
+        return _split_views(
             self._mtplx_fused_in_proj(x), self._mtplx_fused_in_proj_splits
         )
 
