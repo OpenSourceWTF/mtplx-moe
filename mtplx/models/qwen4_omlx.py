@@ -398,17 +398,16 @@ def _qsa_compact_attention(
 
     q_rows = q.transpose(0, 2, 1, 3).reshape(rows, n_heads, 1, head_dim)
     indices = selection.indices.reshape(rows, width)
-    indices_batched = selection.indices[:, None, :, :, None]
+    # Gather directly into the row-major layout consumed by SDPA.  Placing the
+    # query-row axis before the KV-head axis avoids a transpose followed by a
+    # multi-megabyte contiguous copy for every K and V bank.
+    indices_batched = selection.indices[:, :, None, :, None]
     k_rows = mx.take_along_axis(
-        k[:, :, None, :, :], indices_batched, axis=3
-    ).transpose(0, 2, 1, 3, 4).reshape(
-        rows, n_kv_heads, width, head_dim
-    )
+        k[:, None, :, :, :], indices_batched, axis=3
+    ).reshape(rows, n_kv_heads, width, head_dim)
     v_rows = mx.take_along_axis(
-        v[:, :, None, :, :], indices_batched, axis=3
-    ).transpose(0, 2, 1, 3, 4).reshape(
-        rows, n_kv_heads, width, v.shape[-1]
-    )
+        v[:, None, :, :, :], indices_batched, axis=3
+    ).reshape(rows, n_kv_heads, width, v.shape[-1])
 
     neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
     valid = selection.valid.reshape(rows, width)
