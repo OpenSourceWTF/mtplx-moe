@@ -13816,3 +13816,23 @@ def test_server_state_memory_budget_simulates_the_small_seat(monkeypatch, capsys
     # window a real 48G Mac gets — the whole 48G test story hangs on this.
     assert state.context_window == 196_608
     assert state.memory_plan.memory_budget_bytes == 48 * 1024**3
+
+
+def test_warmup_rows_stay_out_of_dashboard_metrics_ring():
+    """Warmup generations (startup pass + idle warm ladder) must never
+    become /v1/mtplx/snapshot `latest`: a ladder rung minutes after a real
+    request was replacing that request's receipt, so the app's Live tab
+    lost the user's acceptance counters (2026-08-28 founder report)."""
+    state = SimpleNamespace(last_metrics=[], args=SimpleNamespace(request_log_jsonl=None))
+    openai._record_request_metrics(
+        state, {"request_id": "warm-1", "warmup": True, "completion_tokens": 8}
+    )
+    assert state.last_metrics == []
+    openai._record_request_metrics(
+        state, {"request_id": "real-1", "completion_tokens": 128}
+    )
+    assert [row["request_id"] for row in state.last_metrics] == ["real-1"]
+    openai._record_request_metrics(
+        state, {"request_id": "warm-2", "warmup": True, "completion_tokens": 8}
+    )
+    assert state.last_metrics[-1]["request_id"] == "real-1"

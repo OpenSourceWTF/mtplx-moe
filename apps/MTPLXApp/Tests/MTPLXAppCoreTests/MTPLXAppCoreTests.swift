@@ -10919,3 +10919,33 @@ private extension Array where Element == String {
         }
     }
 }
+
+final class CompletionFingerprintTests: XCTestCase {
+    private func values(_ json: String) throws -> [String: JSONValue] {
+        try JSONDecoder().decode([String: JSONValue].self, from: Data(json.utf8))
+    }
+
+    func testWarmupAndIdleRowsProduceNoEvidence() throws {
+        // The idle warm ladder must not light the acceptance panel or
+        // displace a real request (2026-08-28 founder report).
+        XCTAssertNil(MTPLXBackendStore.completionFingerprint(
+            of: try values(#"{"warmup": true, "completion_tokens": 8, "decode_tok_s": 95.4}"#)))
+        XCTAssertNil(MTPLXBackendStore.completionFingerprint(
+            of: try values(#"{"completion_tokens": 0}"#)))
+    }
+
+    func testRequestIDWinsAndCompositeIsStable() throws {
+        XCTAssertEqual(MTPLXBackendStore.completionFingerprint(
+            of: try values(#"{"request_id": "chatcmpl-1", "completion_tokens": 128}"#)),
+            "chatcmpl-1")
+        let a = try MTPLXBackendStore.completionFingerprint(
+            of: values(#"{"completion_tokens": 27530, "prompt_tokens": 59, "ttft_s": 0.561, "decode_tok_s": 51.4}"#))
+        let b = try MTPLXBackendStore.completionFingerprint(
+            of: values(#"{"completion_tokens": 27530, "prompt_tokens": 59, "ttft_s": 0.561, "decode_tok_s": 51.4}"#))
+        let c = try MTPLXBackendStore.completionFingerprint(
+            of: values(#"{"completion_tokens": 3963, "prompt_tokens": 59, "ttft_s": 0.146, "decode_tok_s": 87.6}"#))
+        XCTAssertNotNil(a)
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(a, c)
+    }
+}

@@ -13392,8 +13392,18 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
     except Exception:
         pass
     safe = _json_safe(record)
-    state.last_metrics.append(safe)
-    state.last_metrics = state.last_metrics[-100:]
+    # Warmup generations (startup pass and the idle background ladder) are
+    # not user requests: keep them out of the RAM ring that feeds the
+    # dashboard's `latest`/`recent` — the same contract
+    # _dashboard_record_completion enforces for the bus and rolling gauge.
+    # A ladder rung firing minutes after a real request was replacing that
+    # request's receipt as /v1/mtplx/snapshot `latest`, handing the app a
+    # warmup row (request_id null) in place of the user's acceptance
+    # counters. Flight end + the durable JSONL below still record warmup
+    # rows so forensics keeps the full trail.
+    if not bool(safe.get("warmup")):
+        state.last_metrics.append(safe)
+        state.last_metrics = state.last_metrics[-100:]
     # Flight recorder terminal event: every completion path (normal, cancel,
     # disconnect) funnels through this sink, so the flight "end" is written
     # even for requests whose client-side accounting is lost (turn-13 class).
@@ -20252,8 +20262,11 @@ def _finalize_batched_ar_generation(
     stats["server_tok_s"] = (
         completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
-    state.last_metrics.append(dict(envelope))
-    state.last_metrics = state.last_metrics[-100:]
+    # Warmup rows stay out of the dashboard ring (see
+    # _record_request_metrics); real-request bookkeeping below still runs.
+    if not bool(envelope.get("warmup")):
+        state.last_metrics.append(dict(envelope))
+        state.last_metrics = state.last_metrics[-100:]
     state.last_request_at = time.time()
     state.requests_completed += 1
     _dashboard_record_completion(state, envelope=envelope, stats=stats)
@@ -20445,8 +20458,11 @@ def _finalize_mtp_batch_generation(
     stats["server_tok_s"] = (
         completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
-    state.last_metrics.append(dict(envelope))
-    state.last_metrics = state.last_metrics[-100:]
+    # Warmup rows stay out of the dashboard ring (see
+    # _record_request_metrics); real-request bookkeeping below still runs.
+    if not bool(envelope.get("warmup")):
+        state.last_metrics.append(dict(envelope))
+        state.last_metrics = state.last_metrics[-100:]
     state.last_request_at = time.time()
     state.requests_completed += 1
     _dashboard_record_completion(state, envelope=envelope, stats=stats)

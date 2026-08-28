@@ -193,12 +193,18 @@ public final class MTPLXBackendStore: ObservableObject {
     @Published public private(set) var prefillHistory: PrefillHistoryPayload? = nil
     /// `/v1/models` list, populated lazily for the About sheet.
     @Published public private(set) var models: ModelsResponse? = nil
-    /// Number of `.completed` SSE events we've actually observed since
-    /// the current daemon started. The daemon's own
+    /// Number of completed user requests we've actually observed since
+    /// the current daemon started — via `.completed` SSE frames, or via
+    /// a finished request's receipt arriving on the snapshot poller
+    /// (`noteSnapshotCompletionEvidence`). The daemon's own
     /// `lifetime.requestsTotal` counts the model warm-up as a request
     /// (it does emit decode tokens), so we can't trust it to gate "is
-    /// this a real user request?" — we count our own.
+    /// this a real user request?" — we count our own, and warmup-marked
+    /// receipts never tick this.
     @Published public private(set) var observedCompletionCount: Int = 0
+    /// Dedup key for snapshot-derived completion evidence (see
+    /// `noteSnapshotCompletionEvidence`).
+    private var snapshotCompletionFingerprint: String?
     @Published public private(set) var observedUserMetricEventCount: Int = 0
     @Published public private(set) var piTerminalAgentRunning: Bool = false
     @Published public private(set) var piTerminalAgentProcessIDs: [Int] = []
@@ -1509,6 +1515,7 @@ public final class MTPLXBackendStore: ObservableObject {
         models = nil
         observedCompletionCount = 0
         observedUserMetricEventCount = 0
+        snapshotCompletionFingerprint = nil
         lastProgressPublishS = 0
         headlineDecode = .absent
         smoothedMetrics = SmoothedMetrics()
@@ -3660,11 +3667,24 @@ public final class MTPLXBackendStore: ObservableObject {
         // cleanly when a new request_id / session_id arrives, and a
         // latest-less snapshot no longer wipes the live readout.
         if let incoming = snapshot.latest, shouldAcceptSnapshotLatest(snapshot) {
-            let merged = Self.mergeLatestValues(existing: latest?.values ?? [:],
-                                                incoming: incoming.values)
-            let mergedLatest = MetricsLatest(values: merged)
-            latest = mergedLatest
-            updateSmoothedMetrics(mergedLatest)
+            // A warmup row (startup pass or the daemon's idle warm ladder)
+            // must never replace a real request's receipt: daemons without
+            // the ring-side fix publish ladder rungs into snapshot
+            // `latest`, and this merge was quietly swapping the user's
+            // finished-request counters (acceptance above all) for the
+            // rung's. Merge a warmup row only when we hold nothing better.
+            let incomingIsWarmup = incoming.values["warmup"]?.boolValue == true
+            let existingIsReal = latest.map { $0.values["warmup"]?.boolValue != true } ?? false
+            if !(incomingIsWarmup && existingIsReal) {
+                let merged = Self.mergeLatestValues(existing: latest?.values ?? [:],
+                                                    incoming: incoming.values)
+                let mergedLatest = MetricsLatest(values: merged)
+                latest = mergedLatest
+                updateSmoothedMetrics(mergedLatest)
+                if snapshot.inFlight.isEmpty {
+                    noteSnapshotCompletionEvidence(mergedLatest)
+                }
+            }
         }
         rolling = snapshot.rolling
         inFlight = snapshot.inFlight
@@ -3763,6 +3783,10 @@ public final class MTPLXBackendStore: ObservableObject {
             // safely replace `latest`.
             let envelope = MetricsLatest(values: payload.values["envelope"]?.objectValue ?? payload.values)
             latest = envelope
+            // Prime the snapshot-evidence dedup key so the next idle
+            // poll does not count this same request a second time.
+            snapshotCompletionFingerprint = Self.completionFingerprint(of: envelope.values)
+                ?? snapshotCompletionFingerprint
             // Snap the smoothed metrics to the request's exact final
             // values, then freeze them so subsequent idle snapshot polls
             // can't keep nudging acceptance/cached upward after the
@@ -4045,6 +4069,45 @@ public final class MTPLXBackendStore: ObservableObject {
             return false
         }
         return snapshot.inFlight.contains { $0.requestId == incomingRequestID }
+    }
+
+    /// Identity of a finished, non-warmup request receipt, or nil when the
+    /// row is warmup / has no completed decode. `request_id` when present;
+    /// otherwise a composite of fields that are stable for one finished
+    /// request and virtually never collide across two (warmup rows and
+    /// some lanes publish `request_id: null`).
+    nonisolated static func completionFingerprint(of values: [String: JSONValue]) -> String? {
+        guard values["warmup"]?.boolValue != true else { return nil }
+        guard let completion = values["completion_tokens"]?.doubleValue,
+              completion > 0 else { return nil }
+        if let requestID = values["request_id"]?.stringValue, !requestID.isEmpty {
+            return requestID
+        }
+        let parts = [
+            "session_id", "completion_tokens", "prompt_tokens", "ttft_s",
+            "decode_tok_s",
+        ].map { key in
+            values[key].map(String.init(describing:)) ?? ""
+        }
+        return parts.joined(separator: "|")
+    }
+
+    /// Completion evidence from the snapshot poller. `observedCompletionCount`
+    /// historically ticked only on `.completed` SSE frames, but the stream
+    /// has no replay: a frame missed during a reconnect (long generations)
+    /// or finished before we attached left the Live tab's gates at zero
+    /// forever — "engine finished decoding but acceptance still shows the
+    /// placeholder" — even though every snapshot poll was already carrying
+    /// the finished request's counters. Snapshot `latest` is the daemon's
+    /// most recent completed request, so a non-warmup completed row observed
+    /// while nothing is in flight is completion evidence of the same rank as
+    /// a stream frame; the fingerprint keeps idle polls from re-counting the
+    /// same request.
+    private func noteSnapshotCompletionEvidence(_ mergedLatest: MetricsLatest) {
+        guard let fingerprint = Self.completionFingerprint(of: mergedLatest.values) else { return }
+        guard fingerprint != snapshotCompletionFingerprint else { return }
+        snapshotCompletionFingerprint = fingerprint
+        observedCompletionCount += 1
     }
 
     private static func prefillPhase(in payload: DynamicObject) -> String? {
