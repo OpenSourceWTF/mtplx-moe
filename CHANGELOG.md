@@ -4,9 +4,43 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.10.0] - 2026-08-28
 
 ### Added
+
+- **Reasoning effort works on Flash-Next, everywhere.** The `qwen4_exp`
+  family now declares the same reasoning codec as the dense 27B (Qwen
+  think-tag parser; effort levels `xhigh` / `medium` / `low`; modes
+  auto/on/off), so `reasoning_effort` on a request is honored instead of
+  silently dropped — previously the family resolved "no levels", the
+  field was discarded before it was read, and the chat template's own
+  `xhigh` fallback burned thousands of thinking tokens with no way to
+  turn it down. The family default is `xhigh`; the 27B keeps its
+  measured `medium` coding default. Full surface parity in the same
+  pass: the app's effort picker renders and persists for the family,
+  `mtplx run` and `mtplx chat` gain `--reasoning-effort`, and
+  `/v1/messages` (Anthropic-bridge) requests now forward the flat
+  `reasoning_effort` field for every family instead of dropping it.
+- **The n-gram sidecar stops costing 30 GB of RAM on paper.** The 32 GB
+  Flash-Next n-gram table streams from SSD by default, but the memory
+  plan, session-bank budget, Metal floor, and the app's memory card all
+  still counted it as wired weights — a 128 GB Mac printed a false
+  "MODEL DOES NOT FIT", resolved a 30 GB-pessimistic context window, and
+  auto-budgeted the session bank 30 GB too small. One policy now drives
+  gather behavior and every accounting surface; the serve banner and the
+  app's Memory Detail card say `n-gram table 29.8G streamed from SSD
+  (not wired)`. A new hot-row LRU (`MTPLX_NGRAM_HOT_MB`, default 1024)
+  keeps decode-sized gathers in RAM, byte-identical by construction and
+  by test — measured against the previously shipping streamed default:
+  +5-10% AR and +7.5-16% MTP decode, at identical memory. In the
+  product default config the MTP register now meets or beats the 30
+  GB-wired resident pin (+2.4%), so the wired mode remains only a
+  bench pin for 160 GB+ machines (`MTPLX_NGRAM_RESIDENT=1`).
+- **Both Flash-Next packs are public on Hugging Face** —
+  `Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed` and
+  `Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed` — and first-run
+  onboarding now offers them on Macs that fit them, right behind the
+  27B trio, resolving straight to the published repos.
 
 - **Flash-Next turbo, first-class.** The two Qwen 3.8 Flash-Next serve
   packs now resolve the **turbo** launch profile by default across
@@ -91,6 +125,23 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **The compact tool contract no longer drops trailing tools** (#376,
+  adapting community PR #379 by @ArctifoxNL). When the "Declared tools
+  and schemas" line exceeded its 1200-character budget it was raw
+  byte-cut, deleting whole tool names at the tail (`task` first, in
+  Claude Code-shaped toolsets) — and the contract's own "never invent an
+  undeclared tool" clause then made the model treat every dropped tool
+  as nonexistent, killing subagents. Over budget, every declared tool
+  name is now kept and only per-tool signature detail is shed.
+- **Cancellation errors name their real cause** (#381). One shared
+  per-request cancel flag is tripped by several unrelated paths — the
+  `POST /v1/mtplx/cancel` endpoint, client disconnect, stop-sequence
+  completion, tool-call finalization, the stall watchdog, stream
+  teardown — and the terminal frame blamed every non-disconnect trip on
+  the POST endpoint, framing an endpoint nobody called. The first
+  origin is now recorded when the flag trips, terminal frames and the
+  cancellation metric report it, and an unattributed trip says so
+  instead of inventing a caller.
 - `mtplx connect opencode` now actually writes `~/.config/opencode/opencode.json`
   (merge-preserving: other providers and plugins survive). It previously built
   the config, printed the config path, and wrote nothing — so a `--model-id`
@@ -152,7 +203,7 @@ All notable user-facing changes to MTPLX. The format is based on
   Notes pages already published under mtplx.com/releases/notes/ need a
   one-time re-render and re-upload to pick this up.
 
-## [2.9.3] - 2026-08-26
+## [2.9.3] - 2026-08-26 (internal build — never published; ships as part of 2.10.0)
 
 ### Fixed
 
@@ -167,7 +218,7 @@ All notable user-facing changes to MTPLX. The format is based on
   cancel and a real disconnect behave as before. Deterministic regression
   test included. Only tool-calling turns were affected, which is why plain
   streaming never reproduced it.
-- **The long-context decode cliff.** Past 131,072 prompt tokens dense decode
+- **Long-context decode past 128k, improved.** Past 131,072 prompt tokens dense decode
   silently repaged into a cache layout that structurally excluded the packed
   verify kernel, collapsing speculative decode to plain-AR speed (12.0 tok/s
   at 147k on an M5 Max 128 GB). The dense-decode ceiling is now memory-aware
