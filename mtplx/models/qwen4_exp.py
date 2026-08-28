@@ -948,6 +948,11 @@ def _qsa_gather_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _qsa_flash_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_QSA_FLASH") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _fused_hc_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_HC") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
@@ -1247,6 +1252,17 @@ class QSAIndexer(nn.Module):
         )
         selected = selected & valid  # -inf padding rows never select
 
+        if S == 1 and _qsa_flash_enabled():
+            # Flash-skip lane (MTPLX_QSA_FLASH): hand attention the sorted
+            # selected BLOCK ids + host-side tail bounds; the block-sparse
+            # flash kernel iterates exactly that visible set in place — no
+            # dense mask staged, no gathered copies (both measured slower:
+            # dense = full-context reads, gather = -5.25% from two
+            # materialized copies per layer per token, d6171d2c).
+            blk_idx = mx.sort(top_idx[0].astype(mx.int32))  # [k_eff]
+            tail_start = ((pos_start + 1) // self.ratio) * self.ratio
+            return ("flash", blk_idx, tail_start)
+
         if S == 1 and _qsa_gather_enabled():
             # Decode gather lane (MTPLX_QSA_GATHER): return the selected
             # TOKEN INDICES instead of a dense [T] mask so attention reads
@@ -1360,6 +1376,26 @@ class Attention(nn.Module):
         v = v.transpose(0, 2, 1, 3)
         k, v = cache.kv.update_and_fetch(k, v)
         T = k.shape[2]
+
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash":
+            # Block-sparse flash attention over the indexer's exact visible
+            # set. Reads the cache BACKING arrays in place at their
+            # allocation stride — the :T slice above is non-contiguous, and
+            # forcing it contiguous would copy the entire KV.
+            from mtplx.kernels.qsa_flash_skip import qsa_flash_skip
+
+            _, blk_idx, tail_start = sel_mask
+            out = qsa_flash_skip(
+                q.reshape(self.n_heads, self.head_dim),
+                cache.kv.keys,
+                cache.kv.values,
+                blk_idx,
+                T,
+                tail_start,
+                self.scale,
+            )
+            out = out.reshape(B, S, -1)
+            return self.o_proj(out * mx.sigmoid(gate))
 
         if sel_mask is not None and sel_mask.ndim == 1:
             # QSA gather lane (decode): the indexer returned the selected

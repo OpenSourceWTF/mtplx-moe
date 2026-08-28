@@ -303,6 +303,9 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # gather + maskless SDPA instead of dense-bool-mask over full KV.
         # Long-context A/B pending; registered ahead per the same lesson.
         "MTPLX_QSA_GATHER",
+        # QSA block-sparse flash-skip attention (2026-08-27 candidate):
+        # selected blocks iterated inside the kernel, no staging/copies.
+        "MTPLX_QSA_FLASH",
         # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
         # NAX verify patch OFF under turbo until it earns a family receipt.
         "MTPLX_NAX_VERIFY",
