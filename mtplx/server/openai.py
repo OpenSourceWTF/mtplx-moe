@@ -25869,12 +25869,17 @@ def _reasoning_history_mode(state: "ServerState") -> str:
         return _REASONING_HISTORY_STRIP
     if policy == "on":
         return _REASONING_HISTORY_PRESERVE
-    if policy == "auto" and _model_family_for_state(state) == "qwen3_8":
+    if policy == "auto" and _model_family_for_state(state) in {"qwen3_8", "qwen4_exp"}:
         # Qwen3.8's trained contract inverts the 3.6-era rolling checkpoint:
         # preserve_thinking is on by default for all workloads (model card),
         # keeping historical <think> blocks in the rendered conversation.
         # Append-only histories are also what the session bank wants. An
         # explicit "scoped" policy above still wins for operators who ask.
+        # Flash-Next (qwen4_exp) ships the byte-identical Qwen3.8 template
+        # and the same trained contract; leaving it on the scoped fallback
+        # made every agent round's postcommit abort with
+        # reasoning_history_scoping_mismatch and re-prefill the whole
+        # assistant turn (receipted 2026-08-28, OpenCode wall-clock rig).
         return _REASONING_HISTORY_PRESERVE
     if getattr(state, "reasoning_history_scoped_capable", False):
         return _REASONING_HISTORY_SCOPED

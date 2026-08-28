@@ -11975,12 +11975,13 @@ def _quickstart_opencode_payload(
     )
     enable_thinking = reasoning_mode != "off" and reasoning_policy.supported
     # The app/CLI dial is OpenCode's source of truth for reasoning effort:
-    # an explicit --reasoning-effort wins, otherwise the family default from
-    # the descriptor codec (Qwen3.8: medium). The family's effort levels
-    # drive OpenCode's effort picker so it mirrors the MTPLX dial.
+    # an explicit --reasoning-effort wins, otherwise the family's AGENT-lane
+    # default (codec.agent_effort — Qwen3.8: medium; Flash-Next: medium by
+    # the 2026-08-28 wall-clock A/B, chat default stays xhigh). The family's
+    # effort levels drive OpenCode's effort picker so it mirrors the dial.
     reasoning_effort = getattr(args, "reasoning_effort", None)
     if reasoning_effort in (None, "auto"):
-        reasoning_effort = reasoning_policy.default_effort
+        reasoning_effort = reasoning_policy.agent_effort
     if not enable_thinking:
         reasoning_effort = None
     reasoning_effort_levels = (

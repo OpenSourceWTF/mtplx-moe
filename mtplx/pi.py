@@ -311,12 +311,26 @@ def merge_pi_provider_config(
         {
             key: value
             for key, value in fresh.items()
-            if key not in ("models", "headers")
+            if key not in ("models", "headers", "compat")
         },
     )
     for key in PI_OWNED_PROVIDER_CONNECTION_KEYS:
         if key in fresh:
             merged[key] = fresh[key]
+    # ``compat`` is MTPLX's transport contract with Pi (which wire fields the
+    # server supports), not a user preference: a stale block written by an
+    # older MTPLX must not outlive the engine that wrote it. Receipt
+    # 2026-08-28: a 2.9.x-era ``supportsReasoningEffort: false`` survived
+    # every re-sync and silently killed Pi's effort dial after upgrade. Our
+    # keys win; user-added extra compat keys still survive.
+    existing_compat = (
+        dict(existing_provider.get("compat"))
+        if isinstance(existing_provider.get("compat"), dict)
+        else {}
+    )
+    existing_compat.update(fresh.get("compat") or {})
+    if existing_compat:
+        merged["compat"] = existing_compat
     headers = {
         key: value
         for key, value in (

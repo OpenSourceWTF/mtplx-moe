@@ -717,6 +717,36 @@ def test_every_effort_writing_surface_accepts_the_whole_vocabulary() -> None:
         config_set("ultra")
 
 
+def test_reasoning_history_auto_preserves_for_flash_next() -> None:
+    # Flash-Next ships the byte-identical Qwen3.8 template and the same
+    # preserve-by-default trained contract. The scoped fallback made every
+    # agent round's postcommit abort (reasoning_history_scoping_mismatch)
+    # and re-prefill the assistant turn (2026-08-28 wall-clock receipts).
+    from mtplx.server import openai as srv
+
+    assert (
+        srv._reasoning_history_mode(_state(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID))
+        == "preserve"
+    )
+    assert (
+        srv._reasoning_history_mode(_state(FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID))
+        == "preserve"
+    )
+    # An operator's explicit scoped/off still wins.
+    assert (
+        srv._reasoning_history_mode(
+            _state(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID, preserve_thinking="scoped")
+        )
+        == "scoped"
+    )
+    assert (
+        srv._reasoning_history_mode(
+            _state(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID, preserve_thinking="off")
+        )
+        == "strip"
+    )
+
+
 def test_reasoning_history_auto_preserves_for_qwen38() -> None:
     from mtplx.server import openai as srv
 

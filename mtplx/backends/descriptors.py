@@ -92,6 +92,16 @@ class ReasoningCodec:
     # (test_reasoning_effort_vocabulary_covers_every_family pins it).
     effort_levels: tuple[str, ...] = ()
     default_effort: str | None = None
+    # Agent-lane default (OpenCode/Pi config writers): coding wall clock is
+    # dominated by thinking-token burn, so a family whose chat default is
+    # xhigh can pin a cheaper effort for tool-driven lanes. None -> the
+    # plain default_effort. Receipt 2026-08-28: identical multifile task,
+    # xhigh 150.2s vs medium 44.2s wall clock, same correct output.
+    default_agent_effort: str | None = None
+
+    @property
+    def agent_effort(self) -> str | None:
+        return self.default_agent_effort or self.default_effort
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -489,6 +499,12 @@ QWEN4_EXP_REASONING_CODEC = ReasoningCodec(
     default_mode="auto",
     effort_levels=("xhigh", "medium", "low"),
     default_effort="xhigh",
+    # Coding-agent lanes (OpenCode/Pi config writers) default to medium:
+    # 2026-08-28 wall-clock A/B on the identical multifile coding task
+    # measured xhigh 150.2s vs medium 44.2s with the same correct output —
+    # the xhigh think burn is chat-grade depth, not agent throughput. The
+    # in-client effort picker still offers xhigh per request.
+    default_agent_effort="medium",
 )
 QWEN3_8_DRAFT_SEMANTICS = DraftSemantics(
     request_field="depth",

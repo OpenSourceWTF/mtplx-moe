@@ -2901,6 +2901,34 @@ def test_quickstart_pi_dry_run_json(monkeypatch, tmp_path, capsys):
     assert "--preserve-thinking auto" in payload["pi"]["server_command"]
 
 
+def test_pi_provider_merge_owns_compat_but_keeps_user_extras():
+    # ``compat`` is MTPLX's transport contract, not a user preference: a
+    # 2.9.x-era ``supportsReasoningEffort: false`` survived every re-sync via
+    # the user-preserving merge and silently killed Pi's effort dial after
+    # upgrade (found live 2026-08-28). Fresh values win on our keys; a
+    # user-added extra compat key still survives.
+    from mtplx.pi import build_pi_provider_config, merge_pi_provider_config
+
+    existing = {
+        "baseUrl": "http://127.0.0.1:8002/v1",
+        "compat": {
+            "supportsReasoningEffort": False,
+            "maxTokensField": "max_tokens",
+            "userExtraKey": True,
+        },
+        "models": [{"id": "mtplx-old"}],
+    }
+    fresh = build_pi_provider_config(
+        base_url="http://127.0.0.1:8000/v1",
+        model_id="mtplx-flash-next-bare-speed",
+    )
+    merged = merge_pi_provider_config(existing, fresh)
+    assert merged["compat"]["supportsReasoningEffort"] is True
+    assert merged["compat"]["thinkingFormat"] == "qwen"
+    assert merged["compat"]["userExtraKey"] is True
+    assert merged["baseUrl"] == "http://127.0.0.1:8000/v1"
+
+
 def test_start_pi_missing_cli_stops_before_model_check(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
 
