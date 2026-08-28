@@ -18,7 +18,7 @@ STAGE1_THREADS = 32
 STAGE1_EXPERTS_PER_GROUP = 4
 STAGE1_GROUPS = EXPERTS // STAGE1_EXPERTS_PER_GROUP
 STAGE2_GROUPS = ACTIVATION_SLOTS * (INTERMEDIATE // 16)
-STAGE3_GROUPS = HIDDEN // 16
+STAGE3_GROUPS = ROWS * (HIDDEN // 16)
 ROUTE_THREADS = 256
 ROUTE_SIMD_GROUPS = ROUTE_THREADS // 32
 
@@ -373,13 +373,26 @@ def _stage2_source() -> str:
 
 
 def _stage3_source() -> str:
-    routed_rows = []
-    for row in range(ROWS):
-        routed_rows.append(f"""
-        bfloat routed_accumulator{row}[4] = {{
-            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)}};
-        for (uint slot = 0; slot < TOP_K; ++slot) {{
-            uint expert = expert_ids[{row} * TOP_K + slot];
+    return _preamble() + r"""
+        constexpr uint OUTPUT_TILES = HIDDEN / 16;
+        constexpr uint Q4_GROUP = 32;
+        constexpr uint Q4_VALUES_PER_LANE = 16;
+        constexpr uint Q4_BLOCK = Q4_VALUES_PER_LANE * 32;
+        constexpr uint Q8_GROUP = 128;
+        constexpr uint Q8_VALUES_PER_LANE = 16;
+        constexpr uint Q8_BLOCK = Q8_VALUES_PER_LANE * 32;
+
+        uint group = threadgroup_position_in_grid.x;
+        uint row = group / OUTPUT_TILES;
+        uint tile = group - row * OUTPUT_TILES;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint output_base = tile * 16 + simd_gid * 4;
+
+        bfloat routed_accumulator[4] = {
+            bfloat(0.0f), bfloat(0.0f), bfloat(0.0f), bfloat(0.0f)};
+        for (uint slot = 0; slot < TOP_K; ++slot) {
+            uint expert = expert_ids[row * TOP_K + slot];
             const device uchar* down_bytes =
                 reinterpret_cast<const device uchar*>(routed_down_weight)
                 + expert * HIDDEN * (INTERMEDIATE / 2);
@@ -387,14 +400,14 @@ def _stage3_source() -> str:
                 + expert * HIDDEN * (INTERMEDIATE / Q4_GROUP);
             const device bfloat* down_bias_values = routed_down_biases
                 + expert * HIDDEN * (INTERMEDIATE / Q4_GROUP);
-            float down_result[4] = {{}};
-            for (uint k_block = 0; k_block < INTERMEDIATE; k_block += Q4_BLOCK) {{
+            float down_result[4] = {};
+            for (uint k_block = 0; k_block < INTERMEDIATE; k_block += Q4_BLOCK) {
                 uint k_lane = k_block + lane * Q4_VALUES_PER_LANE;
-                if (k_lane < INTERMEDIATE) {{
+                if (k_lane < INTERMEDIATE) {
                     float input_values[Q4_VALUES_PER_LANE];
                     float input_sum = 0.0f;
-                    for (uint item = 0; item < Q4_VALUES_PER_LANE; item += 4) {{
-                        uint activation_base = ({row} * ACTIVATION_SLOTS + slot)
+                    for (uint item = 0; item < Q4_VALUES_PER_LANE; item += 4) {
+                        uint activation_base = (row * ACTIVATION_SLOTS + slot)
                             * INTERMEDIATE + k_lane + item;
                         float x0 = float(activations[activation_base]);
                         float x1 = float(activations[activation_base + 1]);
@@ -405,71 +418,56 @@ def _stage3_source() -> str:
                         input_values[item + 1] = x1 / 16.0f;
                         input_values[item + 2] = x2 / 256.0f;
                         input_values[item + 3] = x3 / 4096.0f;
-                    }}
-                    for (uint result_index = 0; result_index < 4; ++result_index) {{
+                    }
+                    for (uint result_index = 0; result_index < 4; ++result_index) {
                         uint output_column = output_base + result_index;
                         uint weight_offset = output_column * (INTERMEDIATE / 2)
                             + k_lane / 2;
                         const device ushort* packed =
                             reinterpret_cast<const device ushort*>(down_bytes + weight_offset);
                         float quantized_dot = 0.0f;
-                        for (uint piece = 0; piece < Q4_VALUES_PER_LANE / 4; ++piece) {{
+                        for (uint piece = 0; piece < Q4_VALUES_PER_LANE / 4; ++piece) {
                             ushort bits = packed[piece];
                             uint item = piece * 4;
                             quantized_dot += input_values[item] * float(bits & 0x000f)
                                 + input_values[item + 1] * float(bits & 0x00f0)
                                 + input_values[item + 2] * float(bits & 0x0f00)
                                 + input_values[item + 3] * float(bits & 0xf000);
-                        }}
+                        }
                         uint metadata_index = output_column * (INTERMEDIATE / Q4_GROUP)
                             + k_lane / Q4_GROUP;
                         down_result[result_index] +=
                             float(down_scale_values[metadata_index]) * quantized_dot
                             + input_sum * float(down_bias_values[metadata_index]);
-                    }}
-                }}
-            }}
-            for (uint result_index = 0; result_index < 4; ++result_index) {{
+                    }
+                }
+            }
+            for (uint result_index = 0; result_index < 4; ++result_index) {
                 float down_sum = simd_sum(down_result[result_index]);
-                if (lane == 0) {{
+                if (lane == 0) {
                     bfloat down_value = bfloat(down_sum);
                     bfloat route_product = bfloat(float(down_value)
-                        * float(route_scores[{row} * TOP_K + slot]));
-                    routed_accumulator{row}[result_index] = bfloat(
-                        float(routed_accumulator{row}[result_index])
+                        * float(route_scores[row * TOP_K + slot]));
+                    routed_accumulator[result_index] = bfloat(
+                        float(routed_accumulator[result_index])
                         + float(route_product));
-                }}
-            }}
-        }}
-        """)
-    return _preamble() + r"""
-        constexpr uint Q4_GROUP = 32;
-        constexpr uint Q4_VALUES_PER_LANE = 16;
-        constexpr uint Q4_BLOCK = Q4_VALUES_PER_LANE * 32;
-        constexpr uint Q8_GROUP = 128;
-        constexpr uint Q8_VALUES_PER_LANE = 16;
-        constexpr uint Q8_BLOCK = Q8_VALUES_PER_LANE * 32;
+                }
+            }
+        }
 
-        uint tile = threadgroup_position_in_grid.x;
-        uint simd_gid = simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-        uint output_base = tile * 16 + simd_gid * 4;
-    """ + "".join(routed_rows) + r"""
         const device uchar* shared_down_bytes =
             reinterpret_cast<const device uchar*>(shared_down_weight);
-        float shared_result[ROWS][4] = {};
+        float shared_result[4] = {};
         for (uint k_block = 0; k_block < INTERMEDIATE; k_block += Q8_BLOCK) {
             uint k_lane = k_block + lane * Q8_VALUES_PER_LANE;
             if (k_lane < INTERMEDIATE) {
-                float input_values[ROWS][Q8_VALUES_PER_LANE];
-                float input_sum[ROWS] = {};
-                for (uint row = 0; row < ROWS; ++row) {
-                    for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
-                        float x = float(activations[(row * ACTIVATION_SLOTS + TOP_K)
-                            * INTERMEDIATE + k_lane + item]);
-                        input_values[row][item] = x;
-                        input_sum[row] += x;
-                    }
+                float input_values[Q8_VALUES_PER_LANE];
+                float input_sum = 0.0f;
+                for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
+                    float x = float(activations[(row * ACTIVATION_SLOTS + TOP_K)
+                        * INTERMEDIATE + k_lane + item]);
+                    input_values[item] = x;
+                    input_sum += x;
                 }
                 for (uint result_index = 0; result_index < 4; ++result_index) {
                     uint output_column = output_base + result_index;
@@ -478,35 +476,28 @@ def _stage3_source() -> str:
                         + k_lane / Q8_GROUP;
                     float scale = float(shared_down_scales[metadata_index]);
                     float bias = float(shared_down_biases[metadata_index]);
-                    for (uint row = 0; row < ROWS; ++row) {
-                        float quantized_dot = 0.0f;
-                        for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
-                            quantized_dot += input_values[row][item]
-                                * float(shared_down_bytes[weight_offset + item]);
-                        }
-                        shared_result[row][result_index] += scale * quantized_dot
-                            + input_sum[row] * bias;
+                    float quantized_dot = 0.0f;
+                    for (uint item = 0; item < Q8_VALUES_PER_LANE; ++item) {
+                        quantized_dot += input_values[item]
+                            * float(shared_down_bytes[weight_offset + item]);
                     }
+                    shared_result[result_index] += scale * quantized_dot
+                        + input_sum * bias;
                 }
             }
         }
-        for (uint row = 0; row < ROWS; ++row) {
-            for (uint result_index = 0; result_index < 4; ++result_index) {
-                float shared_sum = simd_sum(shared_result[row][result_index]);
-                if (lane == 0) {
-                    bfloat gate_value = shared_gate[row];
-                    auto sigmoid_y = 1 / (1 + metal::exp(metal::abs(gate_value)));
-                    bfloat sigmoid_value = gate_value < bfloat(0.0f)
-                        ? bfloat(sigmoid_y) : bfloat(1 - sigmoid_y);
-                    bfloat shared_value = bfloat(shared_sum);
-                    bfloat gated_shared = bfloat(sigmoid_value * shared_value);
-                    uint output_column = output_base + result_index;
-                    bfloat routed_value = row == 0
-                        ? routed_accumulator0[result_index]
-                        : routed_accumulator1[result_index];
-                    output[row * HIDDEN + output_column] = bfloat(
-                        float(routed_value) + float(gated_shared));
-                }
+        for (uint result_index = 0; result_index < 4; ++result_index) {
+            float shared_sum = simd_sum(shared_result[result_index]);
+            if (lane == 0) {
+                bfloat gate_value = shared_gate[row];
+                auto sigmoid_y = 1 / (1 + metal::exp(metal::abs(gate_value)));
+                bfloat sigmoid_value = gate_value < bfloat(0.0f)
+                    ? bfloat(sigmoid_y) : bfloat(1 - sigmoid_y);
+                bfloat shared_value = bfloat(shared_sum);
+                bfloat gated_shared = bfloat(sigmoid_value * shared_value);
+                uint output_column = output_base + result_index;
+                output[row * HIDDEN + output_column] = bfloat(
+                    float(routed_accumulator[result_index]) + float(gated_shared));
             }
         }
     """

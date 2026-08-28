@@ -31,8 +31,9 @@ def test_exact_sources_encode_qwen4_storage_and_right_shapes():
     assert kernels.launch_geometry() == {
         "stage1": ((128 * 32, 1, 1), (32, 1, 1)),
         "stage2": ((440 * 128, 1, 1), (128, 1, 1)),
-        "stage3": ((160 * 128, 1, 1), (128, 1, 1)),
+        "stage3": ((320 * 128, 1, 1), (128, 1, 1)),
     }
+    assert "uint row = group / OUTPUT_TILES" in sources["stage3"]
 
 
 def test_row_owned_top10_matches_qwen4_argpartition_order():
