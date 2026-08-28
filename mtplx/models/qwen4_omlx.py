@@ -286,19 +286,23 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.indexer = QSAIndexer(args)
 
+    def _project_qkv(self, x):
+        return self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
     def __call__(self, x, rope, mask, cache, idx_cache) -> mx.array:
         B, S, _ = x.shape
         offset = cache.offset if cache is not None else 0
 
         sparse = self.indexer(x, rope, idx_cache, offset)
 
-        q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
+        q_proj, k_proj, v_proj = self._project_qkv(x)
+        q, gate = mx.split(q_proj.reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
         q = self.q_norm(q).transpose(0, 2, 1, 3)
-        k = self.k_norm(self.k_proj(x).reshape(B, S, self.n_kv_heads, -1)).transpose(
+        k = self.k_norm(k_proj.reshape(B, S, self.n_kv_heads, -1)).transpose(
             0, 2, 1, 3
         )
-        v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        v = v_proj.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         cos, sin = rope(mx.arange(offset, offset + S)[None])
         cos, sin = cos[:, None], sin[:, None]
@@ -359,12 +363,18 @@ class GatedDeltaNet(nn.Module):
         )
         self.out_proj = nn.Linear(self.value_dim, d, bias=False)
 
+    def _project_inputs(self, x):
+        return (
+            self.in_proj_qkv(x),
+            self.in_proj_z(x),
+            self.in_proj_b(x),
+            self.in_proj_a(x),
+        )
+
     def __call__(self, x, mask, cache) -> mx.array:
         B, S, _ = x.shape
-        mixed_qkv = self.in_proj_qkv(x)
-        z = self.in_proj_z(x).reshape(B, S, self.n_v, self.dv)
-        b = self.in_proj_b(x)
-        a = self.in_proj_a(x)
+        mixed_qkv, z, b, a = self._project_inputs(x)
+        z = z.reshape(B, S, self.n_v, self.dv)
 
         conv_state = (
             cache[0]

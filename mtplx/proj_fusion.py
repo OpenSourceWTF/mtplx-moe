@@ -431,6 +431,23 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
     max_rows = _default_max_rows()
     _STATS["max_fused_rows"] = int(max_rows)
 
+    # Qwen4's split GDN and attention projections use one explicit small-row
+    # route per group.  Install it before the generic member wrappers so the
+    # enabled hot path has no repeated eligibility checks or counters.
+    from .qwen4_projection_fusion import (
+        FusedProjectionAttention,
+        FusedProjectionGatedDeltaNet,
+        install_qwen4_fused_projection_routes,
+    )
+
+    qwen4_report = install_qwen4_fused_projection_routes(
+        model,
+        groups=groups,
+        max_rows=max_rows,
+    )
+    _STATS["gdn"] += qwen4_report["gdn"]
+    _STATS["attn"] += qwen4_report["attn"]
+
     # MLX keeps freed blocks cached, so release periodically or the construction
     # transient is the full ~10 GiB of replaced weights.
     since_release = 0
@@ -442,14 +459,22 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
         return n
 
     for _, module in model.named_modules():
-        if "gdn" in groups and all(hasattr(module, n) for n in _GDN_NAMES):
+        if (
+            "gdn" in groups
+            and not isinstance(module, FusedProjectionGatedDeltaNet)
+            and all(hasattr(module, n) for n in _GDN_NAMES)
+        ):
             reason = _fuse_group(module, _GDN_NAMES, "_mtplx_fused_in_proj", max_rows)
             if reason is None:
                 _STATS["gdn"] += 1
                 since_release = _maybe_release(since_release + 1)
             else:
                 _note_skip("gdn", reason)
-        if "attn" in groups and all(hasattr(module, n) for n in _ATTN_NAMES):
+        if (
+            "attn" in groups
+            and not isinstance(module, FusedProjectionAttention)
+            and all(hasattr(module, n) for n in _ATTN_NAMES)
+        ):
             reason = _fuse_group(module, _ATTN_NAMES, "_mtplx_fused_qkv_proj", max_rows)
             if reason is None:
                 _STATS["attn"] += 1
