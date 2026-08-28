@@ -16,6 +16,8 @@ def _config():
             "linear_num_value_heads": 48,
             "linear_key_head_dim": 128,
             "linear_value_head_dim": 128,
+            "output_gate_type": "sigmoid",
+            "rms_norm_eps": 1e-6,
         },
     }
 
@@ -30,6 +32,11 @@ def _runtime():
             dv=128,
             key_dim=2048,
             conv_dim=10240,
+            norm=SimpleNamespace(
+                weight=SimpleNamespace(shape=(128,)),
+                eps=1e-6,
+                activation="sigmoid",
+            ),
         ),
     )
     attention = SimpleNamespace(is_linear=False)
@@ -68,4 +75,13 @@ def test_capture_route_support_is_limited_to_the_measured_config():
     assert is_exact_qwen4_capture_config(config)
 
     config["text_config"]["hidden_size"] = 2048
+    assert not is_exact_qwen4_capture_config(config)
+
+
+def test_capture_route_support_rejects_a_different_output_gate():
+    from mtplx.qwen4_capture import is_exact_qwen4_capture_config
+
+    config = _config()
+    config["text_config"]["output_gate_type"] = "silu"
+
     assert not is_exact_qwen4_capture_config(config)

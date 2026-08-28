@@ -18,6 +18,57 @@ class Qwen4CaptureConfigError(RuntimeError):
     """The exact two-row Qwen4 capture route cannot be installed."""
 
 
+def _make_qwen4_norm_gate_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="mtplx_qwen4_m2_sigmoid_norm_gate_bf16",
+        input_names=["x", "gate", "weight", "eps"],
+        output_names=["y"],
+        source=r"""
+            constexpr uint AXIS = 128;
+            constexpr uint READS = 4;
+            uint row = threadgroup_position_in_grid.x;
+            uint lane = thread_index_in_simdgroup;
+            uint base = row * AXIS;
+            float values[READS];
+            float sumsq = 0.0f;
+            for (uint i = 0; i < READS; ++i) {
+                uint column = lane * READS + i;
+                values[i] = float(x[base + column]);
+                sumsq += values[i] * values[i];
+            }
+            sumsq = simd_sum(sumsq);
+            float inv_rms = metal::precise::rsqrt(sumsq / float(AXIS) + eps);
+            for (uint i = 0; i < READS; ++i) {
+                uint column = lane * READS + i;
+                InT normed_t = weight[column]
+                    * static_cast<InT>(values[i] * inv_rms);
+                float gate_f = float(gate[base + column]);
+                float sigmoid_y = 1.0f / (1.0f + metal::exp(metal::abs(gate_f)));
+                float sigmoid_value = gate_f < 0.0f ? sigmoid_y : 1.0f - sigmoid_y;
+                y[base + column] = static_cast<InT>(sigmoid_value * float(normed_t));
+            }
+        """,
+    )
+
+
+_QWEN4_NORM_GATE_KERNEL = _make_qwen4_norm_gate_kernel()
+
+
+def _qwen4_norm_gate(x: mx.array, gate: mx.array, weight: mx.array, eps: float):
+    rows = int(x.shape[0]) * int(x.shape[1]) * 48
+    (out,) = _QWEN4_NORM_GATE_KERNEL(
+        inputs=[x, mx.contiguous(gate), weight, float(eps)],
+        template=[("InT", x.dtype)],
+        grid=(32 * rows, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[tuple(x.shape)],
+        output_dtypes=[x.dtype],
+    )
+    return out
+
+
 def is_exact_qwen4_capture_config(config: dict[str, Any]) -> bool:
     """Return whether *config* matches the measured fixed-shape capture lane."""
 
@@ -32,6 +83,8 @@ def is_exact_qwen4_capture_config(config: dict[str, Any]) -> bool:
         and int(text.get("linear_num_value_heads", -1)) == 48
         and int(text.get("linear_key_head_dim", -1)) == 128
         and int(text.get("linear_value_head_dim", -1)) == 128
+        and text.get("output_gate_type") == "sigmoid"
+        and float(text.get("rms_norm_eps", -1.0)) == 1e-6
     )
 
 
@@ -75,7 +128,9 @@ def _gdn_with_capture(gdn: Any, inputs: mx.array, mask: Any, cache: Any):
         cache[0] = mx.contiguous(conv_states[:, -1, :, :])
         cache[1] = states[:, -1, :, :, :]
         cache.advance(rows)
-    out = gdn.norm(out, z).reshape(batch, rows, -1)
+    out = _qwen4_norm_gate(out, z, gdn.norm.weight, gdn.norm.eps).reshape(
+        batch, rows, -1
+    )
     return gdn.out_proj(out), {"conv_states": conv_states, "states": states}
 
 
@@ -188,8 +243,18 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
         observed = (gdn.n_k, gdn.n_v, gdn.dk, gdn.dv, gdn.key_dim, gdn.conv_dim)
         if observed != expected:
             raise Qwen4CaptureConfigError("capture recurrent geometry is invalid")
-    if _linear_gated_delta_from_conv_headquarter_kernel is None:
-        raise Qwen4CaptureConfigError("capture Metal kernel is unavailable")
+        norm = gdn.norm
+        if (
+            tuple(norm.weight.shape) != (128,)
+            or float(norm.eps) != 1e-6
+            or norm.activation != "sigmoid"
+        ):
+            raise Qwen4CaptureConfigError("capture norm geometry is invalid")
+    if (
+        _linear_gated_delta_from_conv_headquarter_kernel is None
+        or _QWEN4_NORM_GATE_KERNEL is None
+    ):
+        raise Qwen4CaptureConfigError("capture Metal kernels are unavailable")
     runtime.forward_ar_capture = MethodType(_forward_ar_capture, runtime)
     return {"installed": True, "linear_layers": 36, "rows": 2}
 
