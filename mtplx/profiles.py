@@ -299,6 +299,10 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # A/B pending — registered ahead of any default flip per the
         # boot-time-validator lesson in mistakes/).
         "MTPLX_FUSED_CONVNORM_VERIFY",
+        # QSA decode gather lane (2026-08-27 candidate): selected-token
+        # gather + maskless SDPA instead of dense-bool-mask over full KV.
+        # Long-context A/B pending; registered ahead per the same lesson.
+        "MTPLX_QSA_GATHER",
         # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
         # NAX verify patch OFF under turbo until it earns a family receipt.
         "MTPLX_NAX_VERIFY",

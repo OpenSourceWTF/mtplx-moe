@@ -943,6 +943,11 @@ def _fused_conv_norm_rows_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _qsa_gather_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_QSA_GATHER") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _fused_hc_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_HC") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
@@ -1242,6 +1247,25 @@ class QSAIndexer(nn.Module):
         )
         selected = selected & valid  # -inf padding rows never select
 
+        if S == 1 and _qsa_gather_enabled():
+            # Decode gather lane (MTPLX_QSA_GATHER): return the selected
+            # TOKEN INDICES instead of a dense [T] mask so attention reads
+            # only budget+tail keys/values. Every returned token is visible
+            # by construction (complete selected blocks are < the tail
+            # start; the tail runs to the current position), so the
+            # gathered SDPA needs no mask — identical math to the masked
+            # dense product over the same visible set.
+            blk_idx = mx.sort(top_idx[0].astype(mx.int32))  # [k_eff]
+            tok_from_blocks = (
+                blk_idx[:, None] * self.ratio + mx.arange(self.ratio, dtype=mx.int32)
+            ).reshape(-1)
+            # Host-side int (no .item() sync — a per-layer eval would stall
+            # the AR pipeline): for the single decode row qpos == pos_start,
+            # so the visible-complete-block count is (pos_start+1) // ratio.
+            tail_start = ((pos_start + 1) // self.ratio) * self.ratio
+            tail_ids = mx.arange(tail_start, T, dtype=mx.int32)
+            return mx.concatenate([tok_from_blocks, tail_ids])
+
         # Blocks -> tokens, plus the visible tail, intersected with causal.
         tok_sel = mx.repeat(selected, self.ratio, axis=1)  # [S, nb*ratio]
         if nb_total * self.ratio < T:
@@ -1337,7 +1361,16 @@ class Attention(nn.Module):
         k, v = cache.kv.update_and_fetch(k, v)
         T = k.shape[2]
 
-        if sel_mask is not None:
+        if sel_mask is not None and sel_mask.ndim == 1:
+            # QSA gather lane (decode): the indexer returned the selected
+            # token indices — attention reads budget+tail keys/values
+            # instead of the full context through a dense bool mask. All
+            # gathered tokens are visible, so no mask is needed; the
+            # softmax over the same visible set is identical math.
+            k = mx.take(k, sel_mask, axis=2)
+            v = mx.take(v, sel_mask, axis=2)
+            mask = None
+        elif sel_mask is not None:
             mask = sel_mask
         elif S > 1:
             qpos = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
