@@ -14516,12 +14516,20 @@ def _memory_attribution(state: Any) -> dict[str, Any]:
     weights = getattr(state, "_model_weights_bytes_cache", None)
     if weights is None:
         try:
-            from mtplx.engine_session import model_weights_bytes
+            from mtplx.engine_session import model_weights_bytes, ngram_table_bytes
+            from mtplx.memory_plan import ngram_table_resident_policy
 
             root = Path(str(state.args.model))
             # model_weights_bytes scans recursively and already counts the
-            # nested MTP sidecar — no manual add, or it double-counts.
+            # nested MTP sidecar — no manual add, or it double-counts. The
+            # n-gram table is excluded from that scan; it belongs in this
+            # wired-weights bucket only when the resident policy actually
+            # materialized it (streamed mode reads file-backed pages that
+            # never enter allocator active — counting them here made
+            # "weights" exceed "active total" in the app).
             weights = int(model_weights_bytes(root) or 0)
+            if ngram_table_resident_policy():
+                weights += ngram_table_bytes(root)
         except Exception:
             weights = 0
         state._model_weights_bytes_cache = weights

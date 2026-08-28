@@ -198,3 +198,23 @@ def test_hot_cache_env_parse_is_forgiving(tmp_path, monkeypatch, value):
     _write_quantized_table(path)
     table = _attached_table(path)
     assert table._sidecar._hot_cap_rows > 0  # bad value falls back to default
+
+
+@pytest.mark.parametrize("resident", [False, True])
+def test_memory_attribution_counts_table_only_when_resident(
+    tmp_path, monkeypatch, resident
+):
+    from types import SimpleNamespace
+
+    from mtplx.server.openai import _memory_attribution
+
+    shard = mx.zeros((256, 8), dtype=mx.float16)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {"w": shard})
+    _write_quantized_table(tmp_path / NGRAM_TABLE_FILENAME)
+    monkeypatch.setenv("MTPLX_NGRAM_RESIDENT", "1" if resident else "0")
+
+    state = SimpleNamespace(args=SimpleNamespace(model=str(tmp_path)))
+    weights = _memory_attribution(state)["model_weights_bytes"]
+    shard_bytes = (tmp_path / "model.safetensors").stat().st_size
+    table_bytes = (tmp_path / NGRAM_TABLE_FILENAME).stat().st_size
+    assert weights == shard_bytes + (table_bytes if resident else 0)
