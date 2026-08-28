@@ -8,6 +8,31 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Added
 
+- **Long generations hold their decode speed.** A 34k-token uncapped chat
+  answer decayed from 86 to 25 tok/s inside one request because every
+  long-generation guard keyed off prompt length: the draft head's committed
+  history cache grew unbounded during decode, and the allocator clear-cache
+  cadence never armed for short prompts (8.6 GB of MLX allocator cache in a
+  single request). The history cache now resets and regrows after 16,384
+  live-appended tokens (`MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD`, keyed on
+  appends so restored session seeds are never dropped; output stream
+  unchanged by the verify contract), and the clear-cache cadence arms
+  mid-generation when live context crosses the threshold (0.6 GB on the
+  same workload with it armed).
+- **Context-copy block rounds on the batched verify lane.** Flash-Next's
+  lane never had the copy mechanic, so file rewrites decoded at plain MTP
+  depth even with every output token already in the prompt. A prompt n-gram
+  match now proposes up to a 24-token block through the lane's normal
+  verify forward with the identical probability-ratio acceptance, so
+  sampling behavior is unchanged. Two-turn rewrite receipt: rewrite turn
+  87.6 tok/s vs 73.8 for the fresh build, 2,400 of 3,963 tokens from 177
+  copy rounds, zero copy rounds on novel text.
+  `MTPLX_CONTEXT_COPY_BATCHED=0` disables.
+- **Decay observability.** Receipts carry the context-copy counters and the
+  live-reset fields; `MTPLX_DROP_EVENTS=0` launches also get a per-round
+  `round_timing_ms` series. The growth-lever envs (clear-cache cadence,
+  history window and live reset, verify snapshot, family capture-commit,
+  drop-events) join the operator-beats-profile list.
 - **Reasoning effort works on Flash-Next, everywhere.** The `qwen4_exp`
   family now declares the same reasoning codec as the dense 27B (Qwen
   think-tag parser; effort levels `xhigh` / `medium` / `low`; modes
