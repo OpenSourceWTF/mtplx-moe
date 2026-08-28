@@ -1010,6 +1010,14 @@ def load(
                 config=config,
             )
             logger.info("[qwen4-whole-moe] %s", whole_moe_report)
+        from .qwen4_hyper_fusion import (
+            configure_qwen4_hyper_fusion,
+            qwen4_hyper_fusion_enabled,
+        )
+
+        if qwen4_hyper_fusion_enabled():
+            hyper_fusion_report = configure_qwen4_hyper_fusion(model)
+            logger.info("[qwen4-hyper-fusion] %s", hyper_fusion_report)
         from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
         if nax_env_enabled():

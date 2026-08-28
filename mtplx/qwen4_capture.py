@@ -137,7 +137,7 @@ def _qwen4_combine_norm(residual, value, inject, norm):
     return hidden, normed
 
 
-def _qwen4_hyper_from_normed(module, hidden, normed):
+def _qwen4_stock_hyper_from_normed(module, hidden, normed):
     weight = mx.sigmoid(
         module.input_mix_weight_up(nn.silu(module.input_mix_weight_down(normed) / 4))
     )
@@ -145,6 +145,12 @@ def _qwen4_hyper_from_normed(module, hidden, normed):
     mixed = (weight * normed.reshape(*normed.shape[:-1], 4, 2560)).mean(axis=-2)
     inject = 2 * mx.sigmoid(module.block_inject_weight(normed) / 4)
     return mixed, hidden, inject
+
+
+def _qwen4_m2_hyper_from_normed(module, hidden, normed):
+    if normed.shape == (1, 2, 10240) and hidden.shape == (1, 2, 10240):
+        return module._mtplx_m2_hyper_call(hidden, normed)
+    return _qwen4_stock_hyper_from_normed(module, hidden, normed)
 
 
 def _qwen4_stock_mlp_tail(layer, value, residual, inject):
@@ -257,6 +263,7 @@ def _qwen4_forward_with_capture(
 
     hidden = mx.tile(hidden, (1, 1, inner.hc))
     mlp_tail = inner._mtplx_capture_mlp_tail
+    hyper_from_normed = inner._mtplx_capture_hyper_from_normed
     captures: dict[int, dict[str, mx.array]] = {}
     for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         indexer_cache = (
@@ -290,7 +297,7 @@ def _qwen4_forward_with_capture(
         hidden, normed = _qwen4_combine_norm(
             residual, value, inject, layer.mlp_hyper_connection.hc_norm
         )
-        value, residual, inject = _qwen4_hyper_from_normed(
+        value, residual, inject = hyper_from_normed(
             layer.mlp_hyper_connection, hidden, normed
         )
         hidden = mlp_tail(layer, value, residual, inject)
@@ -360,6 +367,17 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
         raise Qwen4CaptureConfigError("capture residual MoE route is only partly installed")
     inner._mtplx_capture_mlp_tail = (
         _qwen4_residual_mlp_tail if all(residual_routes) else _qwen4_stock_mlp_tail
+    )
+    hyper_routes = tuple(
+        callable(getattr(layer.mlp_hyper_connection, "_mtplx_m2_hyper_call", None))
+        for layer in layers
+    )
+    if any(hyper_routes) and not all(hyper_routes):
+        raise Qwen4CaptureConfigError("capture hyper M=2 route is only partly installed")
+    inner._mtplx_capture_hyper_from_normed = (
+        _qwen4_m2_hyper_from_normed
+        if all(hyper_routes)
+        else _qwen4_stock_hyper_from_normed
     )
     if (
         _linear_gated_delta_from_conv_headquarter_kernel is None

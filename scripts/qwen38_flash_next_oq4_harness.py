@@ -63,6 +63,7 @@ _VANITY_SAMPLER = {
 _BENCHMARK_LANE_ENV_KEYS = (
     "MTPLX_FUSE_PROJ",
     "MTPLX_QWEN4_WHOLE_MOE_M2",
+    "MTPLX_QWEN4_HYPER_M2",
 )
 _DIAGNOSTIC_TIMING_FIELDS = (
     "verify_logits_eval_time_s",
@@ -97,6 +98,8 @@ def _benchmark_lane_environment(args: argparse.Namespace) -> dict[str, str]:
         environment["MTPLX_FUSE_PROJ"] = fuse_proj
     if args.whole_moe_m2:
         environment["MTPLX_QWEN4_WHOLE_MOE_M2"] = "1"
+    if args.hyper_m2:
+        environment["MTPLX_QWEN4_HYPER_M2"] = "1"
     return environment
 
 
@@ -530,6 +533,7 @@ def _outer_command(args: argparse.Namespace) -> list[str]:
         "--lock", str(args.lock),
     ]
     forwarded.append("--whole-moe-m2" if args.whole_moe_m2 else "--no-whole-moe-m2")
+    forwarded.append("--hyper-m2" if args.hyper_m2 else "--no-hyper-m2")
     if args.smoke:
         forwarded.append("--smoke")
     if args.headline:
@@ -617,6 +621,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fuse-proj", default="gdn,attn,hyper,ple")
     parser.add_argument(
         "--whole-moe-m2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--hyper-m2",
         action=argparse.BooleanOptionalAction,
         default=True,
     )

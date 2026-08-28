@@ -56,6 +56,7 @@ def test_production_workload_is_16k_1k_thinking_sampler_contract() -> None:
     assert harness._benchmark_lane_environment(args) == {
         "MTPLX_FUSE_PROJ": "gdn,attn,hyper,ple",
         "MTPLX_QWEN4_WHOLE_MOE_M2": "1",
+        "MTPLX_QWEN4_HYPER_M2": "1",
     }
     assert harness._sampler_contract(headline=False) == {
         "temperature": 1.0,
@@ -174,13 +175,20 @@ def test_headline_forwards_requested_warmup_runs() -> None:
 def test_outer_harness_forwards_explicit_stock_lane_control() -> None:
     harness = _harness()
     args = harness._parse_args(
-        ["--smoke", "--fuse-proj", "none", "--no-whole-moe-m2"]
+        [
+            "--smoke",
+            "--fuse-proj",
+            "none",
+            "--no-whole-moe-m2",
+            "--no-hyper-m2",
+        ]
     )
 
     command = harness._outer_command(args)
 
     assert command[command.index("--fuse-proj") + 1] == "none"
     assert "--no-whole-moe-m2" in command
+    assert "--no-hyper-m2" in command
     assert harness._benchmark_lane_environment(args) == {}
 
 

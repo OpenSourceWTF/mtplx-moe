@@ -75,6 +75,43 @@ def test_installer_binds_exact_qwen4_capture_route():
     assert runtime.forward_ar_capture.__func__.__name__ == "_forward_ar_capture"
 
 
+def test_installer_selects_constructed_m2_hyper_route():
+    from mtplx.qwen4_capture import install_qwen4_capture_route
+
+    runtime = _runtime()
+    inner = runtime.model.language_model.model
+    for layer in inner.layers:
+        layer.mlp_hyper_connection._mtplx_m2_hyper_call = lambda hidden, normed: (
+            hidden,
+            normed,
+            hidden,
+        )
+
+    install_qwen4_capture_route(runtime, config=_config())
+
+    assert (
+        inner._mtplx_capture_hyper_from_normed.__name__
+        == "_qwen4_m2_hyper_from_normed"
+    )
+
+
+def test_m2_hyper_route_rejects_batched_two_row_input(monkeypatch):
+    import mtplx.qwen4_capture as capture
+
+    module = SimpleNamespace(
+        _mtplx_m2_hyper_call=lambda hidden, normed: "fused"
+    )
+    hidden = SimpleNamespace(shape=(2, 2, 10240))
+    normed = SimpleNamespace(shape=(2, 2, 10240))
+    monkeypatch.setattr(
+        capture,
+        "_qwen4_stock_hyper_from_normed",
+        lambda candidate, residual, normalized: "stock",
+    )
+
+    assert capture._qwen4_m2_hyper_from_normed(module, hidden, normed) == "stock"
+
+
 def test_installer_rejects_wrong_recurrent_geometry():
     from mtplx.qwen4_capture import Qwen4CaptureConfigError, install_qwen4_capture_route
 
