@@ -133,6 +133,8 @@
  "mtp_depth": 3,
  "mtp_forward_calls": 0,
  "mtp_history_append_calls": 0,
+ "mtp_history_live_reset_threshold": 0,
+ "mtp_history_live_resets": 0,
  "mtp_history_materialize_events": 0,
  "mtp_history_materialize_every": 0,
  "mtp_history_policy": "cycle",

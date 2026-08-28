@@ -2040,6 +2040,8 @@ class GenerationStats:
     mtp_history_policy: str = "cycle"
     mtp_history_window_tokens: int = 0
     mtp_history_position_base: int = 0
+    mtp_history_live_resets: int = 0
+    mtp_history_live_reset_threshold: int = 0
     cached_tokens: int = 0
     new_prefill_tokens: int = 0
     session_cache_hit: bool = False
@@ -7962,7 +7964,59 @@ def generate_mtpk(
 
     mtp_history_tokens_since_materialize = 0
     mtp_history_materialize_events = 0
+    # Live history-cache bound (2026-08-28): in the committed-cache policies
+    # the draft head's history cache (qwen4_exp: one QSA layer's KV + indexer
+    # streams) grows one row per committed token during decode and nothing
+    # trims it — the last_window policy windows only the prompt-side seed at
+    # prefill. A 34k-token uncapped chat answer left a 34k-row draft cache
+    # whose per-round cost grew all generation (86 -> 25 tok/s within one
+    # request, receipted 2026-08-28). When the tokens APPENDED BY THIS
+    # GENERATION cross the threshold, reset the cache and let it regrow: the
+    # draft cache conditions acceptance only, so the reset is correctness-free
+    # by the verify contract, and position continuity is kept through the
+    # position base. Keyed on live appends, not absolute offset, so a
+    # bank-restored long-session seed (e.g. a 30k-row agent history) is never
+    # dropped at round 1 — only a generation that GROWS past the bound is.
+    # "Appends" counts history ROWS (each round appends committed[1:]), which
+    # runs ~tokens-minus-rounds: a 24.5k-token xhigh answer appends ~15.3k
+    # rows, so the 16384 default engages around 26k generated tokens on a
+    # 2.6-commit round mix. 0 disables. Default matches the last_window
+    # engage threshold.
+    mtp_history_live_reset_threshold = max(
+        0,
+        _env_int(
+            "MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD",
+            _env_int("MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD", 16384),
+        ),
+    )
+    mtp_history_live_resets = 0
+    mtp_history_live_appended = 0
     clear_cache_every = _clear_cache_every()
+    # Live-context latch (2026-08-28): _clear_cache_every() keys off the
+    # PREFILL context var, so a short-prompt request that generates its way
+    # past the threshold (uncapped chat: a 66-token prompt with a 34k-token
+    # answer) never fired a single clear_cache — the MLX allocator cache grew
+    # to 8.6G inside one request while per-round eval cost grew with it
+    # (receipted 2026-08-28, Flash-Next chat lane). When auto mode resolved
+    # to 0 at prefill, arm the long-context cadence the moment the LIVE
+    # total (prompt + generated) crosses the same threshold.
+    _clear_cache_prompt_tokens = len(prompt_state.token_prefix)
+    _clear_cache_env_raw = (
+        (os.environ.get("MTPLX_CLEAR_CACHE_EVERY") or "auto").strip().lower()
+    )
+    clear_cache_live_threshold = 0
+    clear_cache_live_every = 0
+    if (
+        clear_cache_every <= 0
+        and _clear_cache_env_raw == "auto"
+        and _contiguous_dense_decode_prefill_enabled()
+    ):
+        clear_cache_live_threshold = max(
+            1, _env_int("MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD", 16384)
+        )
+        clear_cache_live_every = max(
+            0, _env_int("MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT", 1024)
+        )
     clear_cache_tokens_since = 0
     clear_cache_observed_tokens = 0
     clear_cache_events = 0
@@ -8172,8 +8226,11 @@ def generate_mtpk(
     ) -> float:
         nonlocal mtp_history_tokens_since_materialize, mtp_history_materialize_events
         nonlocal trace_mtp_history_append_nbytes, trace_accounting_time_s
+        nonlocal mtp_history_live_appended
         if not token_ids:
             return 0.0
+        if mtp_cache is mtp_history_cache:
+            mtp_history_live_appended += len(token_ids)
         if trace.enabled:
             trace_accounting_started = time.perf_counter()
             trace_mtp_history_append_nbytes += _tree_nbytes(hidden_states) + (
@@ -8296,9 +8353,22 @@ def generate_mtpk(
         # state_rebase_time_s (captured above); draft_time_s is decode-only.
 
     def maybe_clear_mlx_cache() -> None:
+        nonlocal clear_cache_every, clear_cache_live_threshold
         nonlocal clear_cache_tokens_since, clear_cache_observed_tokens
         nonlocal clear_cache_events, clear_cache_time_s
         if clear_cache_every <= 0:
+            if (
+                clear_cache_live_threshold <= 0
+                or clear_cache_live_every <= 0
+                or _clear_cache_prompt_tokens + len(tokens)
+                < clear_cache_live_threshold
+            ):
+                return
+            # Live total crossed the auto threshold mid-generation: arm the
+            # long-context cadence from here on (one-way latch).
+            clear_cache_every = clear_cache_live_every
+            clear_cache_live_threshold = 0
+            clear_cache_observed_tokens = len(tokens)
             return
         current_tokens = len(tokens)
         if current_tokens < clear_cache_observed_tokens:
@@ -8574,7 +8644,9 @@ def generate_mtpk(
     # ---- context-copy (prompt-lookup) drafting: always on (kill switch
     # MTPLX_CONTEXT_COPY=0); any temperature, no repetition penalties, on
     # capture-commit verify strategies ----
-    from .context_copy import (NgramIndex, block_for_ext, context_copy_block_k,
+    from .context_copy import (NgramIndex, block_for_ext,
+                               context_copy_batched_enabled,
+                               context_copy_block_k,
                                context_copy_enabled, context_copy_min_ext,
                                context_copy_ng_max, context_copy_ng_min,
                                context_copy_target_prefix_enabled)
@@ -8597,10 +8669,25 @@ def generate_mtpk(
     _ccopy_whole_moe_conflict = _ccopy_tp_requested and bool(
         getattr(rt, "a3b_whole_moe_installed", False)
     )
+    # Batched-lane block rounds (2026-08-28): the copy mechanic for the
+    # qwen4_exp family. Partial accepts commit through the family
+    # capture-commit when the model carries it (the lane's live path), and
+    # otherwise through the pre-verify snapshot rollback + re-forward — so a
+    # snapshot is required either way and the lane is gated on being able to
+    # take one.
+    _ccopy_batched_lane = (
+        verify_strategy == "batched"
+        and context_copy_batched_enabled()
+        and rt.mtp_enabled
+    )
     ccopy_active = (
         context_copy_enabled()
         and not _penalties_active
-        and (_ccopy_capture_lane or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict))
+        and (
+            _ccopy_capture_lane
+            or _ccopy_batched_lane
+            or (_ccopy_tp_requested and not _ccopy_whole_moe_conflict)
+        )
     )
     ccopy_rounds = ccopy_drafted = ccopy_accepted = 0
     ccopy_probes = ccopy_blocks_accepted = ccopy_suspensions = 0
@@ -8928,6 +9015,20 @@ def generate_mtpk(
         draft_hidden_for_update: list[mx.array] = []
         draft_hidden_update_keys: list[object] = []
         if _mtp_history_uses_committed_cache(mtp_history_policy):
+            if (
+                mtp_history_live_reset_threshold > 0
+                and mtp_history_cache is not None
+                and mtp_history_live_appended >= mtp_history_live_reset_threshold
+            ):
+                # This generation grew the draft-history cache past the live
+                # bound: reset and regrow. The base keeps append positions
+                # continuous.
+                mtp_history_position_base += (
+                    _mtp_cache_offset(mtp_history_cache) or 0
+                )
+                mtp_history_cache = rt.make_mtp_cache()
+                mtp_history_live_resets += 1
+                mtp_history_live_appended = 0
             mtp_cache = mtp_history_cache
             cycle_mtp_offset = _mtp_cache_offset(mtp_cache)
         else:
@@ -9325,6 +9426,223 @@ def generate_mtpk(
                 append_event(event)
                 emit_new_tokens()
                 if _cc_finished:
+                    break
+                continue
+        # ---- context-copy block rounds, BATCHED lane (2026-08-28) ----------
+        # The qwen4_exp family runs verify_strategy="batched", which the copy
+        # gate above never covered: grounded re-emission (file rewrites, code
+        # edits) decoded at plain MTP depth. A block round here forwards
+        # [primary]+block through the lane's normal verify forward (family
+        # capture scope armed) and commits the accepted prefix through the
+        # family capture-commit — row-count generic — with the capture-lane's
+        # rollback + primary re-forward as the refusal fallback. Acceptance is
+        # the identical point-mass probability-ratio contract, so the emitted
+        # stream follows the target sampling law exactly at any temperature.
+        if (
+            ccopy_active
+            and _ccopy_batched_lane
+            and cycle_depth >= 1
+            and len(tokens) >= ccopy_suspend_until
+        ):
+            _cb_hist = prompt_ids + tokens
+            ccopy_probes += 1
+            _cb_pos, _cb_ext = ccopy_index.find(_cb_hist, max_pos=len(prompt_ids))
+            _cb_block: list[int] = []
+            if _cb_pos is not None and _cb_ext >= ccopy_min_ext:
+                _cb_klen = block_for_ext(_cb_ext, ccopy_k)
+                _cb_block = [int(t) for t in prompt_ids[_cb_pos:_cb_pos + _cb_klen]]
+                _cb_block = _cb_block[: max(1, max_tokens - len(tokens))]
+                if constraint is not None:
+                    _cb_block = _cb_block[: constraint.validate_prefix(_cb_block)]
+            if _cb_block:
+                _cb_T = 1 + len(_cb_block)
+                # The commit path (family replay or rollback) needs the
+                # pre-verify snapshot regardless of MTPLX_SKIP_VERIFY_SNAPSHOT:
+                # a block round without one cannot repair a partial accept.
+                started = time.perf_counter()
+                _cb_before = (
+                    snapshot_untrimmable_cache_lazy(cache)
+                    if family_capture_commit_active
+                    else snapshot_untrimmable_cache(cache)
+                )
+                snapshot_time += time.perf_counter() - started
+                _cb_scope = (
+                    rt.model.verify_capture_scope()
+                    if family_capture_commit_active
+                    else contextlib.nullcontext()
+                )
+                started_forward = time.perf_counter()
+                with (
+                    attention_phase("decode_verify"),
+                    model_forward_kind("target_verify"),
+                    _cb_scope,
+                ):
+                    _cb_logits, _cb_hidden = rt.forward_ar(
+                        mx.array([[int(primary), *_cb_block]]),
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                    )
+                if sampler.temperature <= 0:
+                    _cb_g = [int(x) for x in mx.argmax(_cb_logits[0], axis=-1).tolist()]
+                else:
+                    mx.eval(_cb_logits)
+                elapsed_verify = time.perf_counter() - started_forward
+                verify_forward_time += elapsed_verify
+                verify_time += elapsed_verify
+                target_time += elapsed_verify
+                verify_calls += 1
+                _cb_correction: int | None = None
+                if sampler.temperature <= 0:
+                    _cb_nacc = 0
+                    for _cb_d, _cb_t in zip(_cb_block, _cb_g):
+                        if _cb_d == _cb_t:
+                            _cb_nacc += 1
+                        else:
+                            break
+                else:
+                    _cb_nacc = 0
+                    _cb_vocab = int(_cb_logits.shape[-1])
+                    for _cb_i, _cb_d in enumerate(_cb_block):
+                        _cb_target_p = _distribution_from_mlx_logits(
+                            _cb_logits[0, _cb_i],
+                            sampler,
+                            token_counts=None,
+                        )
+                        _cb_draft_q = SparseDistribution(
+                            np.array([int(_cb_d)], dtype=np.int64),
+                            np.array([1.0], dtype=np.float64),
+                            _cb_vocab,
+                        )
+                        _cb_accept_prob = compute_acceptance_probability(
+                            _cb_target_p, _cb_draft_q, int(_cb_d)
+                        )
+                        if float(rng.random()) <= _cb_accept_prob:
+                            _cb_nacc += 1
+                            continue
+                        _cb_correction = int(
+                            sample_from_distribution(
+                                residual_distribution(_cb_target_p, _cb_draft_q),
+                                rng,
+                            )
+                        )
+                        break
+                for _cb_i in range(_cb_nacc):
+                    if _is_stop(int(_cb_block[_cb_i]), stop_token_ids):
+                        _cb_nacc = _cb_i + 1
+                        _cb_correction = None
+                        break
+                _cb_m = _cb_nacc + 1
+                _cb_ok = True
+                if family_capture_commit_active:
+                    started_commit = time.perf_counter()
+                    _cb_ok = rt.model.commit_verified_window(
+                        cache,
+                        _cb_before.states if _cb_before is not None else None,
+                        keep_tokens=_cb_m,
+                        verified_tokens=_cb_T,
+                    )
+                    elapsed_commit = time.perf_counter() - started_commit
+                    if _cb_ok:
+                        capture_commit_time += elapsed_commit
+                        _add_timing(event, "family_capture_commit", elapsed_commit)
+                elif _cb_nacc < len(_cb_block):
+                    started_trim_commit = time.perf_counter()
+                    _cb_ok = trim_verified_window_to_prefix(
+                        cache,
+                        _cb_before,
+                        verified_tokens=_cb_T,
+                        keep_tokens=_cb_m,
+                    )
+                    if _cb_ok:
+                        commit_time += time.perf_counter() - started_trim_commit
+                if not _cb_ok:
+                    # Cannot commit a per-position prefix on this cache stack:
+                    # roll the whole block back, restore the primary's row,
+                    # and stop proposing copies (mirrors the capture lane).
+                    started_rollback = time.perf_counter()
+                    rollback_after_verify(cache, _cb_before, verified_tokens=_cb_T)
+                    rollback_time += time.perf_counter() - started_rollback
+                    started = time.perf_counter()
+                    with attention_phase("decode_verify"):
+                        _cb_l2, _cb_h2 = rt.forward_ar(
+                            mx.array([[primary]]),
+                            cache=cache,
+                            return_hidden=True,
+                            hidden_variant=base_hidden_variant,
+                        )
+                    _eval(_cb_l2, _cb_h2)
+                    repair_time += time.perf_counter() - started
+                    logits = _cb_l2[:, -1, :]
+                    hidden = _cb_h2[:, -1:, :]
+                    ccopy_active = False
+                    ccopy_disabled_reason = "no_per_position_commit"
+                    event["context_copy"] = {"disabled": "no_per_position_commit"}
+                    append_event(event)
+                    continue
+                _cb_round_pos = len(tokens)
+                _cb_acc = _cb_block[:_cb_nacc]
+                _cb_stop_idx = next(
+                    (
+                        i
+                        for i, t in enumerate(_cb_acc)
+                        if _is_stop(int(t), stop_token_ids)
+                    ),
+                    None,
+                )
+                if _cb_stop_idx is not None:
+                    _cb_acc = _cb_acc[: _cb_stop_idx + 1]
+                tokens.extend(_cb_acc)
+                _cb_finished = _cb_stop_idx is not None
+                if constraint is not None and _cb_correction is not None and (
+                    constraint.validate_prefix([*_cb_acc, int(_cb_correction)])
+                    != len(_cb_acc) + 1
+                ):
+                    _cb_correction = None
+                if _cb_correction is not None and not _cb_finished:
+                    tokens.append(int(_cb_correction))
+                    correction_tokens += 1
+                    pending_primary = int(_cb_correction)
+                    if _is_stop(int(_cb_correction), stop_token_ids):
+                        _cb_finished = True
+                ccopy_rounds += 1
+                ccopy_drafted += len(_cb_block)
+                ccopy_accepted += _cb_nacc
+                if _cb_nacc:
+                    ccopy_blocks_accepted += 1
+                ccopy_ema = 0.7 * ccopy_ema + 0.3 * (_cb_nacc / len(_cb_block))
+                ccopy_seen += 1
+                if _cb_nacc / len(_cb_block) >= 0.5:
+                    ccopy_backoff = 64
+                if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                    ccopy_suspend_until = len(tokens) + ccopy_backoff
+                    ccopy_backoff = min(ccopy_backoff * 2, 4096)
+                    ccopy_ema, ccopy_seen = 0.5, 0
+                    ccopy_suspensions += 1
+                event["context_copy"] = {
+                    "lane": "batched",
+                    "block": len(_cb_block),
+                    "accepted": _cb_nacc,
+                    "extension": int(_cb_ext),
+                    "time_s": float(elapsed_verify),
+                    "correction": (
+                        int(_cb_correction) if _cb_correction is not None else None
+                    ),
+                    "at_tokens": int(_cb_round_pos),
+                }
+                if _mtp_history_uses_committed_cache(mtp_history_policy) and mtp_cache is not None:
+                    _cb_committed_toks = [primary] + _cb_acc
+                    _cb_hiddens = mx.concatenate(
+                        [hidden, _cb_hidden[:, : len(_cb_acc), :]], axis=1
+                    )
+                    draft_time += append_mtp_history(
+                        mtp_cache, _cb_hiddens, _cb_committed_toks
+                    )
+                logits = _cb_logits[:, _cb_m - 1, :]
+                hidden = _cb_hidden[:, _cb_m - 1 : _cb_m, :]
+                append_event(event)
+                emit_new_tokens()
+                if _cb_finished:
                     break
                 continue
         draft_hidden = hidden
@@ -11533,7 +11851,10 @@ def generate_mtpk(
             finish_reason=finish_reason,
             mtp_history_policy=mtp_history_policy,
             mtp_history_window_tokens=int(prompt_state.mtp_history_window_tokens),
-            mtp_history_position_base=int(prompt_state.mtp_history_position_base),
+            # The LIVE base, not the prompt-state one: live resets advance it,
+            # and the bank must hand the next turn a base that matches the
+            # committed cache it stores.
+            mtp_history_position_base=int(mtp_history_position_base),
         )
     reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
     _forkev_snapshot: dict[str, object] = {}
@@ -11615,7 +11936,9 @@ def generate_mtpk(
         ),
         mtp_history_policy=mtp_history_policy,
         mtp_history_window_tokens=int(prompt_state.mtp_history_window_tokens),
-        mtp_history_position_base=int(prompt_state.mtp_history_position_base),
+        mtp_history_position_base=int(mtp_history_position_base),
+        mtp_history_live_resets=int(mtp_history_live_resets),
+        mtp_history_live_reset_threshold=int(mtp_history_live_reset_threshold),
         cached_tokens=prompt_state.cached_tokens,
         new_prefill_tokens=prompt_state.suffix_tokens,
         session_cache_hit=prompt_state.cache_hit,

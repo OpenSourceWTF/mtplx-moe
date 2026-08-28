@@ -73,6 +73,18 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         # rung list per machine/benchmark; an explicit env must beat the
         # turbo default below, same precedent as the chunk-size knobs.
         "MTPLX_WARMUP_LADDER",
+        # Long-generation decay levers (2026-08-28): the uncapped-chat decay
+        # investigation sweeps these against the shipping turbo profile, and
+        # per-round event capture is how the growth term is attributed.
+        # Same operator-A/B precedent as DONATION/LAZY above.
+        "MTPLX_CLEAR_CACHE_EVERY",
+        "MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD",
+        "MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT",
+        "MTPLX_MTP_HISTORY_LAST_WINDOW",
+        "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD",
+        "MTPLX_DROP_EVENTS",
+        "MTPLX_SKIP_VERIFY_SNAPSHOT",
+        "MTPLX_FAMILY_CAPTURE_COMMIT",
     }
 )
 

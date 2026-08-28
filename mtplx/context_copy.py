@@ -26,6 +26,31 @@ def context_copy_enabled() -> bool:
     return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() not in {"0", "false", "off"}
 
 
+def context_copy_batched_enabled() -> bool:
+    """Context-copy block rounds on the BATCHED verify lane (default ON;
+    MTPLX_CONTEXT_COPY_BATCHED=0 disables).
+
+    The batched lane (qwen4_exp / Flash-Next) never had the copy mechanic:
+    the gate below predates the family and only knew the capture-commit and
+    target_prefix lanes, so grounded re-emission (code edits, file rewrites)
+    decoded at plain MTP depth while the 27B's capture lane copied 24-token
+    blocks (receipted 2026-08-28: a 33.5k-token full-file rewrite ran at
+    29.8 tok/s with MTP acceptance 0.89/0.78/0.69 — every token of it
+    already sat in the prompt).
+
+    On this lane a block round forwards [primary]+block through the normal
+    batched verify forward and commits through the family capture-commit
+    (row-count generic) or the rollback+re-forward fallback, so the lane's
+    exactness contract is unchanged: acceptance is the same point-mass
+    probability-ratio rule the MTP path uses, at any temperature.
+    """
+    return (os.environ.get("MTPLX_CONTEXT_COPY_BATCHED") or "").strip() not in {
+        "0",
+        "false",
+        "off",
+    }
+
+
 def context_copy_target_prefix_enabled() -> bool:
     """Opt-in: run context-copy on the target_prefix lane (default OFF, so the
     shipped/PR behaviour is byte-unchanged).

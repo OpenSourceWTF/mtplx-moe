@@ -14212,6 +14212,8 @@ def _token_window_rate_first(token_times: list[float], window: int) -> float | N
 MAINTENANCE_TIMING_STATS_KEYS = (
     "mtp_history_materialize_every",
     "mtp_history_materialize_events",
+    "mtp_history_live_resets",
+    "mtp_history_live_reset_threshold",
     "clear_cache_every",
     "clear_cache_events",
     "clear_cache_time_s",
@@ -14255,6 +14257,32 @@ MAINTENANCE_TIMING_STATS_KEYS = (
 
 def _maintenance_timing_stats(stats: dict[str, Any]) -> dict[str, Any]:
     return {key: stats[key] for key in MAINTENANCE_TIMING_STATS_KEYS if key in stats}
+
+
+def _round_timing_series(stats: dict[str, Any]) -> list[dict[str, float]]:
+    """Per-round timing_s rows (milliseconds) for decode-decay attribution.
+
+    Non-empty only when the engine kept per-round events (MTPLX_DROP_EVENTS=0,
+    an operator/debug launch); product launches drop events and this stays [].
+    """
+    events = stats.get("events")
+    if not isinstance(events, list):
+        return []
+    series: list[dict[str, float]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        timing = event.get("timing_s")
+        if not isinstance(timing, dict) or not timing:
+            continue
+        row = {
+            key: round(float(value) * 1000.0, 3)
+            for key, value in timing.items()
+            if isinstance(value, (int, float))
+        }
+        if row:
+            series.append(row)
+    return series
 
 
 def _metrics_envelope(
@@ -14366,6 +14394,21 @@ def _metrics_envelope(
         "verify_hidden_eval_time_s": float(
             stats.get("verify_hidden_eval_time_s") or 0.0
         ),
+        "round_timing_ms": _round_timing_series(stats),
+        "context_copy_active": bool(stats.get("context_copy_active") or False),
+        "context_copy_probes": int(stats.get("context_copy_probes") or 0),
+        "context_copy_rounds": int(stats.get("context_copy_rounds") or 0),
+        "context_copy_drafted_tokens": int(
+            stats.get("context_copy_drafted_tokens") or 0
+        ),
+        "context_copy_accepted_blocks": int(
+            stats.get("context_copy_accepted_blocks") or 0
+        ),
+        "context_copy_accepted_tokens": int(
+            stats.get("context_copy_accepted_tokens") or 0
+        ),
+        "context_copy_suspensions": int(stats.get("context_copy_suspensions") or 0),
+        "context_copy_disabled_reason": stats.get("context_copy_disabled_reason"),
         "verify_joint_eval_time_s": float(stats.get("verify_joint_eval_time_s") or 0.0),
         "verify_target_distribution_time_s": float(
             stats.get("verify_target_distribution_time_s") or 0.0
