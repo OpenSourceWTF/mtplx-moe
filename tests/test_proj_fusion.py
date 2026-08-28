@@ -70,6 +70,13 @@ class _Hyper(nn.Module):
         self.block_inject_weight = _qlinear(4, 11)
 
 
+class _Ple(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.key_proj = _qlinear(96, 12)
+        self.value_proj = _qlinear(32, 13)
+
+
 class _Model(nn.Module):
     def __init__(self):
         super().__init__()
@@ -77,6 +84,7 @@ class _Model(nn.Module):
         self.attn = _Attn()
         self.mlp = _Mlp()
         self.hyper = _Hyper()
+        self.ple = _Ple()
 
 
 _GROUPS = {
@@ -84,6 +92,7 @@ _GROUPS = {
     "attn": ("q_proj", "k_proj", "v_proj"),
     "mlp": ("gate_proj", "up_proj"),
     "hyper": ("input_mix_weight_down", "block_inject_weight"),
+    "ple": ("key_proj", "value_proj"),
 }
 
 
@@ -97,6 +106,26 @@ def _originals(model: _Model) -> dict[str, list[nn.QuantizedLinear]]:
 def test_env_parsing(monkeypatch):
     monkeypatch.delenv(FUSE_ENV, raising=False)
     assert requested_groups() == set()
+    monkeypatch.setenv(FUSE_ENV, "gdn,attn,hyper,ple")
+    assert requested_groups() == {"gdn", "attn", "hyper", "ple"}
+
+
+def test_ple_key_value_projection_fuses_one_shared_input(monkeypatch):
+    monkeypatch.setenv(FUSE_ENV, "ple")
+    monkeypatch.delenv("MTPLX_PACKED_PROJ_CONCATS", raising=False)
+    model = _Model()
+
+    stats = configure_fused_projections(model)
+    x = mx.random.normal((2, K))
+    key = model.ple.key_proj(x)
+    value = model.ple.value_proj(x)
+
+    assert stats["ple"] == 1
+    assert isinstance(model.ple.key_proj, FusedProjectionMember)
+    assert isinstance(model.ple.value_proj, FusedProjectionMember)
+    assert key.shape == (2, 96)
+    assert value.shape == (2, 32)
+    assert fused_projection_stats()["fused_dispatches"] == 1
 
 
 def test_hyper_fusion_serves_split_views_without_contiguous_copies(monkeypatch):
@@ -122,7 +151,7 @@ def test_hyper_fusion_serves_split_views_without_contiguous_copies(monkeypatch):
     monkeypatch.setenv(FUSE_ENV, "1")
     assert requested_groups() == {"gdn", "attn"}
     monkeypatch.setenv(FUSE_ENV, "all")
-    assert requested_groups() == {"gdn", "attn", "mlp", "hyper"}
+    assert requested_groups() == {"gdn", "attn", "mlp", "hyper", "ple"}
     monkeypatch.setenv(FUSE_ENV, "hyper")
     assert requested_groups() == {"hyper"}
     monkeypatch.setenv(FUSE_ENV, "mlp, attn")
@@ -136,7 +165,14 @@ def test_all_groups_fuse_and_members_stay_quantized_linear(monkeypatch):
     monkeypatch.delenv("MTPLX_PACKED_PROJ_CONCATS", raising=False)
     model = _Model()
     stats = configure_fused_projections(model)
-    assert (stats["gdn"], stats["attn"], stats["mlp"], stats["hyper"]) == (
+    assert (
+        stats["gdn"],
+        stats["attn"],
+        stats["mlp"],
+        stats["hyper"],
+        stats["ple"],
+    ) == (
+        1,
         1,
         1,
         1,

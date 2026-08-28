@@ -9,7 +9,8 @@ patches on ``nn.QuantizedLinear.__call__`` still route it. Members fall back to 
 unfused computation outside the row window where fusion is bitwise exact.
 
 Default off. ``MTPLX_FUSE_PROJ`` selects families: ``gdn``, ``attn``, ``mlp``,
-``hyper``; ``1``/``on``/``yes`` == ``gdn,attn``, and ``all`` selects every family.
+``hyper``, ``ple``; ``1``/``on``/``yes`` == ``gdn,attn``, and ``all`` selects
+every family.
 ``MTPLX_FUSE_PROJ_MAX_ROWS`` overrides the row window ceiling.
 
 Unlike packed_concats (which calls mx.quantized_matmul directly and therefore
@@ -37,6 +38,7 @@ _GDN_NAMES = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 _ATTN_NAMES = ("q_proj", "k_proj", "v_proj")
 _MLP_NAMES = ("gate_proj", "up_proj")
 _HYPER_NAMES = ("input_mix_weight_down", "block_inject_weight")
+_PLE_NAMES = ("key_proj", "value_proj")
 
 _STATS: dict[str, Any] = {
     "enabled": False,
@@ -45,6 +47,7 @@ _STATS: dict[str, Any] = {
     "attn": 0,
     "mlp": 0,
     "hyper": 0,
+    "ple": 0,
     "skipped": 0,
     "skip_reasons": [],
     "max_fused_rows": 0,
@@ -65,9 +68,9 @@ def requested_groups() -> set[str]:
     if raw in {"1", "true", "yes", "on"}:
         return {"gdn", "attn"}
     if raw == "all":
-        return {"gdn", "attn", "mlp", "hyper"}
+        return {"gdn", "attn", "mlp", "hyper", "ple"}
     parts = {p.strip() for p in raw.replace(";", ",").split(",")}
-    return {p for p in parts if p in {"gdn", "attn", "mlp", "hyper"}}
+    return {p for p in parts if p in {"gdn", "attn", "mlp", "hyper", "ple"}}
 
 
 def fuse_projections_enabled() -> bool:
@@ -404,6 +407,7 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
     _STATS["attn"] = 0
     _STATS["mlp"] = 0
     _STATS["hyper"] = 0
+    _STATS["ple"] = 0
     _STATS["skipped"] = 0
     _STATS["skip_reasons"] = []
     _STATS["freed_bytes"] = 0
@@ -501,14 +505,27 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
                 since_release = _maybe_release(since_release + 1)
             else:
                 _note_skip("hyper", reason)
+        if "ple" in groups and all(hasattr(module, n) for n in _PLE_NAMES):
+            reason = _fuse_group(
+                module,
+                _PLE_NAMES,
+                "_mtplx_fused_ple_kv_proj",
+                max_rows,
+            )
+            if reason is None:
+                _STATS["ple"] += 1
+                since_release = _maybe_release(since_release + 1)
+            else:
+                _note_skip("ple", reason)
 
-    if _STATS["gdn"] or _STATS["attn"] or _STATS["mlp"] or _STATS["hyper"]:
+    if any(_STATS[group] for group in ("gdn", "attn", "mlp", "hyper", "ple")):
         mx.clear_cache()
     reset_fused_projection_counters()
     # logger.info does not reach the serve console.
     print(
         f"[proj-fusion] groups={_STATS['groups']} gdn={_STATS['gdn']} "
         f"attn={_STATS['attn']} mlp={_STATS['mlp']} hyper={_STATS['hyper']} "
+        f"ple={_STATS['ple']} "
         f"skipped={_STATS['skipped']} "
         f"max_fused_rows={_STATS['max_fused_rows']} "
         f"freed={_STATS['freed_bytes'] / 2 ** 30:.2f}GiB "
