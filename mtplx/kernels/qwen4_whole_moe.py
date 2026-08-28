@@ -12,20 +12,28 @@ EXPERTS = 512
 TOP_K = 10
 INTERMEDIATE = 640
 ACTIVATION_SLOTS = 11
-ROWS = 2
+SUPPORTED_ROWS = (2, 3)
 THREADS = 128
 STAGE1_THREADS = 32
 STAGE1_EXPERTS_PER_GROUP = 4
 STAGE1_GROUPS = EXPERTS // STAGE1_EXPERTS_PER_GROUP
 STAGE2_GROUPS = ACTIVATION_SLOTS * (INTERMEDIATE // 16)
-STAGE3_GROUPS = ROWS * (HIDDEN // 16)
 ROUTE_THREADS = 256
 ROUTE_SIMD_GROUPS = ROUTE_THREADS // 32
 
-_KERNELS: dict[str, Any] = {}
+_KERNELS: dict[tuple[int, str], Any] = {}
 
 
-def _preamble() -> str:
+def _require_rows(rows: int) -> int:
+    rows = int(rows)
+    if rows not in SUPPORTED_ROWS:
+        raise ValueError(
+            f"Qwen4 whole-MoE rows must be one of {SUPPORTED_ROWS}: {rows}"
+        )
+    return rows
+
+
+def _preamble(rows: int) -> str:
     return f"""
         using namespace metal;
         constexpr uint HIDDEN = {HIDDEN};
@@ -33,12 +41,12 @@ def _preamble() -> str:
         constexpr uint TOP_K = {TOP_K};
         constexpr uint INTERMEDIATE = {INTERMEDIATE};
         constexpr uint ACTIVATION_SLOTS = {ACTIVATION_SLOTS};
-        constexpr uint ROWS = {ROWS};
+        constexpr uint ROWS = {rows};
     """
 
 
-def _stage1_source() -> str:
-    return _preamble() + r"""
+def _stage1_source(rows: int) -> str:
+    return _preamble(rows) + r"""
         constexpr uint EXPERTS_PER_GROUP = 4;
         constexpr uint VALUES_PER_LANE = 16;
         constexpr uint K_BLOCK = VALUES_PER_LANE * 32;
@@ -113,8 +121,8 @@ def _stage1_source() -> str:
     """
 
 
-def _route_source() -> str:
-    return _preamble() + r"""
+def _route_source(rows: int) -> str:
+    return _preamble(rows) + r"""
         constexpr uint SIMD_GROUPS = 8;
         constexpr uint LOCAL_CANDIDATES = SIMD_GROUPS * TOP_K;
 
@@ -208,8 +216,8 @@ def _route_source() -> str:
     """
 
 
-def _stage2_source() -> str:
-    return _preamble() + r"""
+def _stage2_source(rows: int) -> str:
+    return _preamble(rows) + r"""
         constexpr uint OUTPUT_TILES = INTERMEDIATE / 16;
         constexpr uint Q4_GROUP = 32;
         constexpr uint Q4_VALUES_PER_LANE = 16;
@@ -372,8 +380,8 @@ def _stage2_source() -> str:
     """
 
 
-def _stage3_source() -> str:
-    return _preamble() + r"""
+def _stage3_source(rows: int) -> str:
+    return _preamble(rows) + r"""
         constexpr uint OUTPUT_TILES = HIDDEN / 16;
         constexpr uint Q4_GROUP = 32;
         constexpr uint Q4_VALUES_PER_LANE = 16;
@@ -503,45 +511,54 @@ def _stage3_source() -> str:
     """
 
 
-def sources() -> dict[str, str]:
+def sources(rows: int = 2) -> dict[str, str]:
+    rows = _require_rows(rows)
     return {
-        "stage1": _stage1_source(),
-        "route": _route_source(),
-        "stage2": _stage2_source(),
-        "stage3": _stage3_source(),
+        "stage1": _stage1_source(rows),
+        "route": _route_source(rows),
+        "stage2": _stage2_source(rows),
+        "stage3": _stage3_source(rows),
     }
 
 
-def launch_geometry() -> dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]]:
+def launch_geometry(
+    rows: int = 2,
+) -> dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]]:
+    rows = _require_rows(rows)
     return {
         "stage1": (
             (STAGE1_GROUPS * STAGE1_THREADS, 1, 1),
             (STAGE1_THREADS, 1, 1),
         ),
         "stage2": ((STAGE2_GROUPS * THREADS, 1, 1), (THREADS, 1, 1)),
-        "stage3": ((STAGE3_GROUPS * THREADS, 1, 1), (THREADS, 1, 1)),
+        "stage3": (
+            (rows * (HIDDEN // 16) * THREADS, 1, 1),
+            (THREADS, 1, 1),
+        ),
     }
 
 
-def _kernel(key: str, input_names: list[str], output_name: str):
-    kernel = _KERNELS.get(key)
+def _kernel(rows: int, key: str, input_names: list[str], output_name: str):
+    cache_key = (rows, key)
+    kernel = _KERNELS.get(cache_key)
     if kernel is None:
         kernel = mx.fast.metal_kernel(
-            name=f"mtplx_qwen4_whole_moe_{key}",
+            name=f"mtplx_qwen4_whole_moe_{key}_m{rows}",
             input_names=input_names,
             output_names=[output_name],
-            source=sources()[key],
+            source=sources(rows)[key],
             ensure_row_contiguous=True,
         )
-        _KERNELS[key] = kernel
+        _KERNELS[cache_key] = kernel
     return kernel
 
 
-def _stage1_kernel():
-    kernel = _KERNELS.get("stage1")
+def _stage1_kernel(rows: int):
+    cache_key = (rows, "stage1")
+    kernel = _KERNELS.get(cache_key)
     if kernel is None:
         kernel = mx.fast.metal_kernel(
-            name="mtplx_qwen4_whole_moe_stage1",
+            name=f"mtplx_qwen4_whole_moe_stage1_m{rows}",
             input_names=[
                 "value",
                 "router_weight",
@@ -550,16 +567,40 @@ def _stage1_kernel():
                 "shared_gate_biases",
             ],
             output_names=["router_logits", "shared_gate"],
-            source=sources()["stage1"],
+            source=sources(rows)["stage1"],
             ensure_row_contiguous=True,
         )
-        _KERNELS["stage1"] = kernel
+        _KERNELS[cache_key] = kernel
     return kernel
 
 
-def bind_stages(*, router: Any, routed: Any, shared: Any, shared_gate: Any):
-    """Bind invariant kernels and weight arrays once for the installed M=2 lane."""
-    stage1_kernel = _stage1_kernel()
+def _route_kernel(rows: int):
+    cache_key = (rows, "route")
+    kernel = _KERNELS.get(cache_key)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name=f"mtplx_qwen4_whole_moe_route_top10_m{rows}",
+            input_names=["router_logits"],
+            output_names=["expert_ids", "selected_logits"],
+            source=sources(rows)["route"],
+            ensure_row_contiguous=True,
+        )
+        _KERNELS[cache_key] = kernel
+    return kernel
+
+
+def bind_stages(
+    *,
+    rows: int,
+    router: Any,
+    routed: Any,
+    shared: Any,
+    shared_gate: Any,
+):
+    """Bind invariant kernels and weight arrays for one exact row count."""
+    rows = _require_rows(rows)
+    stage1_kernel = _stage1_kernel(rows)
+    route_kernel = _route_kernel(rows)
     stage1_static = (
         router.weight,
         shared_gate.weight,
@@ -567,6 +608,7 @@ def bind_stages(*, router: Any, routed: Any, shared: Any, shared_gate: Any):
         shared_gate.biases,
     )
     stage2_kernel = _kernel(
+        rows,
         "stage2",
         [
             "value", "expert_ids",
@@ -588,6 +630,7 @@ def bind_stages(*, router: Any, routed: Any, shared: Any, shared_gate: Any):
         for array in (projection.weight, projection.scales, projection.biases)
     )
     stage3_kernel = _kernel(
+        rows,
         "stage3",
         [
             "activations", "expert_ids", "route_scores", "shared_gate",
@@ -610,16 +653,26 @@ def bind_stages(*, router: Any, routed: Any, shared: Any, shared_gate: Any):
             inputs=[value, *stage1_static],
             grid=(STAGE1_GROUPS * STAGE1_THREADS, 1, 1),
             threadgroup=(STAGE1_THREADS, 1, 1),
-            output_shapes=[(ROWS, EXPERTS), (ROWS,)],
+            output_shapes=[(rows, EXPERTS), (rows,)],
             output_dtypes=[mx.float32, mx.bfloat16],
         )
+
+    def route_top10(router_logits: Any):
+        expert_ids, selected_logits = route_kernel(
+            inputs=[router_logits],
+            grid=(rows * ROUTE_THREADS, 1, 1),
+            threadgroup=(ROUTE_THREADS, 1, 1),
+            output_shapes=[(rows, TOP_K), (rows, TOP_K)],
+            output_dtypes=[mx.uint32, mx.float32],
+        )
+        return expert_ids, selected_logits
 
     def stage2(value: Any, expert_ids: Any):
         (activations,) = stage2_kernel(
             inputs=[value, expert_ids, *stage2_static],
             grid=(STAGE2_GROUPS * THREADS, 1, 1),
             threadgroup=(THREADS, 1, 1),
-            output_shapes=[(ROWS, ACTIVATION_SLOTS, INTERMEDIATE)],
+            output_shapes=[(rows, ACTIVATION_SLOTS, INTERMEDIATE)],
             output_dtypes=[mx.bfloat16],
         )
         return activations
@@ -638,19 +691,20 @@ def bind_stages(*, router: Any, routed: Any, shared: Any, shared_gate: Any):
                 shared_gate_values,
                 *stage3_static,
             ],
-            grid=(STAGE3_GROUPS * THREADS, 1, 1),
+            grid=(rows * (HIDDEN // 16) * THREADS, 1, 1),
             threadgroup=(THREADS, 1, 1),
-            output_shapes=[(ROWS, HIDDEN)],
+            output_shapes=[(rows, HIDDEN)],
             output_dtypes=[mx.bfloat16],
         )
         return output
 
-    return stage1, stage2, stage3
+    return stage1, route_top10, stage2, stage3
 
 
-def stage1(value: Any, binding: Any):
+def stage1(value: Any, binding: Any, *, rows: int = 2):
+    rows = _require_rows(rows)
     shared_gate = binding.shared_gate
-    kernel = _stage1_kernel()
+    kernel = _stage1_kernel(rows)
     router = binding.router
     router_weight = router.weight
     (router_logits, shared_gate_values) = kernel(
@@ -663,37 +717,31 @@ def stage1(value: Any, binding: Any):
         ],
         grid=(STAGE1_GROUPS * STAGE1_THREADS, 1, 1),
         threadgroup=(STAGE1_THREADS, 1, 1),
-        output_shapes=[(ROWS, EXPERTS), (ROWS,)],
+        output_shapes=[(rows, EXPERTS), (rows,)],
         output_dtypes=[mx.float32, mx.bfloat16],
     )
     return router_logits, shared_gate_values
 
 
-def route_top10(router_logits: Any):
-    kernel = _KERNELS.get("route")
-    if kernel is None:
-        kernel = mx.fast.metal_kernel(
-            name="mtplx_qwen4_whole_moe_route_top10",
-            input_names=["router_logits"],
-            output_names=["expert_ids", "selected_logits"],
-            source=sources()["route"],
-            ensure_row_contiguous=True,
-        )
-        _KERNELS["route"] = kernel
+def route_top10(router_logits: Any, *, rows: int = 2):
+    rows = _require_rows(rows)
+    kernel = _route_kernel(rows)
     expert_ids, selected_logits = kernel(
         inputs=[router_logits],
-        grid=(ROWS * ROUTE_THREADS, 1, 1),
+        grid=(rows * ROUTE_THREADS, 1, 1),
         threadgroup=(ROUTE_THREADS, 1, 1),
-        output_shapes=[(ROWS, TOP_K), (ROWS, TOP_K)],
+        output_shapes=[(rows, TOP_K), (rows, TOP_K)],
         output_dtypes=[mx.uint32, mx.float32],
     )
     return expert_ids, selected_logits
 
 
-def stage2(value: Any, expert_ids: Any, binding: Any):
+def stage2(value: Any, expert_ids: Any, binding: Any, *, rows: int = 2):
+    rows = _require_rows(rows)
     routed = binding.routed
     shared = binding.shared
     kernel = _kernel(
+        rows,
         "stage2",
         [
             "value", "expert_ids",
@@ -711,7 +759,7 @@ def stage2(value: Any, expert_ids: Any, binding: Any):
         inputs=inputs,
         grid=(STAGE2_GROUPS * THREADS, 1, 1),
         threadgroup=(THREADS, 1, 1),
-        output_shapes=[(ROWS, ACTIVATION_SLOTS, INTERMEDIATE)],
+        output_shapes=[(rows, ACTIVATION_SLOTS, INTERMEDIATE)],
         output_dtypes=[mx.bfloat16],
     )
     return activations
@@ -723,10 +771,14 @@ def stage3(
     route_scores: Any,
     shared_gate: Any,
     binding: Any,
+    *,
+    rows: int = 2,
 ):
+    rows = _require_rows(rows)
     routed_down = binding.routed.down_proj
     shared_down = binding.shared.down_proj
     kernel = _kernel(
+        rows,
         "stage3",
         [
             "activations", "expert_ids", "route_scores", "shared_gate",
@@ -741,9 +793,9 @@ def stage3(
             routed_down.weight, routed_down.scales, routed_down.biases,
             shared_down.weight, shared_down.scales, shared_down.biases,
         ],
-        grid=(STAGE3_GROUPS * THREADS, 1, 1),
+        grid=(rows * (HIDDEN // 16) * THREADS, 1, 1),
         threadgroup=(THREADS, 1, 1),
-        output_shapes=[(ROWS, HIDDEN)],
+        output_shapes=[(rows, HIDDEN)],
         output_dtypes=[mx.bfloat16],
     )
     return output

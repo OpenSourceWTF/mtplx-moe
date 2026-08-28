@@ -1,4 +1,4 @@
-"""Construction-installed exact Qwen4 two-row whole-MoE route."""
+"""Construction-installed exact Qwen4 M=2 and M=3 whole-MoE routes."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ class Qwen4WholeMoeConfigError(RuntimeError):
 @dataclass(frozen=True)
 class _Binding:
     stage1: Callable[[Any], tuple[Any, Any]]
+    route_top10: Callable[[Any], tuple[Any, Any]]
     stage2: Callable[[Any, Any], Any]
     stage3: Callable[[Any, Any, Any, Any], Any]
 
@@ -29,6 +30,7 @@ class _Binding:
 class _Route:
     accepted_call: Callable[[Any, Any], Any]
     m2_call: Callable[[Any], Any]
+    m3_call: Callable[[Any], Any]
 
 
 _STATS: dict[str, Any] = {
@@ -163,9 +165,9 @@ def _validate_block(block: Any, index: int) -> None:
     )
 
 
-def _m2_call(block: Any, binding: _Binding, value: Any) -> Any:
+def _whole_call(block: Any, binding: _Binding, value: Any) -> Any:
     logits, shared_gate = binding.stage1(value)
-    expert_ids, selected_logits = kernels.route_top10(logits)
+    expert_ids, selected_logits = binding.route_top10(logits)
     route_scores = mx.softmax(
         selected_logits,
         axis=-1,
@@ -188,29 +190,41 @@ def _installed_call(self: Any, value: Any) -> Any:
     route = type(self)._mtplx_qwen4_whole_moe_route
     if rows == 2:
         return route.m2_call(value)
+    if rows == 3:
+        return route.m3_call(value)
     return route.accepted_call(self, value)
 
 
-def _bind(block: Any) -> _Binding:
-    stage1, stage2, stage3 = kernels.bind_stages(
+def _bind(block: Any, rows: int) -> _Binding:
+    stage1, route_top10, stage2, stage3 = kernels.bind_stages(
+        rows=rows,
         router=block.gate,
         routed=block.switch_mlp,
         shared=block.shared_expert,
         shared_gate=block.shared_expert_gate,
     )
-    return _Binding(stage1=stage1, stage2=stage2, stage3=stage3)
+    return _Binding(
+        stage1=stage1,
+        route_top10=route_top10,
+        stage2=stage2,
+        stage3=stage3,
+    )
 
 
-def _selfcheck(block: Any, accepted_call: Callable[[Any, Any], Any]) -> float:
-    values = mx.sin(mx.arange(2 * 2560, dtype=mx.float32) / 97.0)
-    values = values.reshape(1, 2, 2560).astype(mx.bfloat16)
+def _selfcheck(
+    block: Any,
+    accepted_call: Callable[[Any, Any], Any],
+    rows: int,
+) -> float:
+    values = mx.sin(mx.arange(rows * 2560, dtype=mx.float32) / 97.0)
+    values = values.reshape(1, rows, 2560).astype(mx.bfloat16)
     expected = accepted_call(block, values)
-    actual = _m2_call(block, _bind(block), values)
+    actual = _whole_call(block, _bind(block, rows), values)
     mx.eval(expected, actual)
     dmax = float(mx.max(mx.abs(expected.astype(mx.float32) - actual.astype(mx.float32))))
     if dmax > 0.5:
         raise Qwen4WholeMoeConfigError(
-            f"whole-MoE M=2 self-check exceeded 0.5 BF16 tolerance: {dmax}"
+            f"whole-MoE M={rows} self-check exceeded 0.5 BF16 tolerance: {dmax}"
         )
     return dmax
 
@@ -222,7 +236,7 @@ def configure_qwen4_whole_moe(
     validate_storage: bool = True,
     run_selfcheck: bool = True,
 ) -> dict[str, Any]:
-    """Validate once, self-check once, then install the direct M=2 route."""
+    """Validate once, self-check once, then install direct M=2/M=3 routes."""
 
     enabled = qwen4_whole_moe_enabled()
     _STATS.update(
@@ -249,15 +263,30 @@ def configure_qwen4_whole_moe(
             _validate_block(block, index)
 
     accepted_call = type(blocks[0]).__call__
-    dmax = _selfcheck(blocks[0], accepted_call) if run_selfcheck else None
+    dmax = (
+        {
+            "m2": _selfcheck(blocks[0], accepted_call, 2),
+            "m3": _selfcheck(blocks[0], accepted_call, 3),
+        }
+        if run_selfcheck
+        else {"m2": None, "m3": None}
+    )
     for index, block in enumerate(blocks):
         accepted_call = type(block).__call__
-        binding = _bind(block)
+        m2_binding = _bind(block, 2)
+        m3_binding = _bind(block, 3)
 
-        def m2_call(value: Any, *, _block=block, _binding=binding):
-            return _m2_call(_block, _binding, value)
+        def m2_call(value: Any, *, _block=block, _binding=m2_binding):
+            return _whole_call(_block, _binding, value)
 
-        route = _Route(accepted_call=accepted_call, m2_call=m2_call)
+        def m3_call(value: Any, *, _block=block, _binding=m3_binding):
+            return _whole_call(_block, _binding, value)
+
+        route = _Route(
+            accepted_call=accepted_call,
+            m2_call=m2_call,
+            m3_call=m3_call,
+        )
         installed_type = type(
             f"Qwen4WholeM2MoE_{index}_{type(block).__name__}",
             (type(block),),
@@ -274,7 +303,7 @@ def configure_qwen4_whole_moe(
             "installed_blocks": 48,
             "selfcheck_dmax": dmax,
             "geometry": {
-                "rows": 2,
+                "rows": (2, 3),
                 "hidden": 2560,
                 "intermediate": 640,
                 "experts": 512,
