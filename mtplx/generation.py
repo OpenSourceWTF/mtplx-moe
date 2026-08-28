@@ -7587,7 +7587,26 @@ def generate_mtpk(
     ).strip().lower() not in {"0", "false", "no", "off"}
     defer_verify_hidden_eval = _defer_verify_hidden_eval_enabled()
     verify_hidden_mode = _verify_hidden_mode()
-    lazy_target_distributions = _lazy_target_distributions_enabled()
+    batch_target_arrays = _batch_target_arrays_enabled()
+    batch_target_distributions = _batch_target_distributions_enabled()
+    # Qwen4 K=1 always verifies the fixed [primary, draft] M=2 shape. Its
+    # construction-installed route is faster when both target rows share one
+    # materialization boundary; deeper widths retain the measured lazy route.
+    qwen4_depth1_batched_target_arrays = (
+        bool(getattr(rt, "qwen4_depth1_batched_target_arrays", False))
+        and speculative_depth == 1
+        and verify_strategy == "capture_commit"
+        and defer_verify_hidden_eval
+        and sampler.temperature > 0
+        and int(sampler.top_k) > 0
+        and not _penalties_active
+    )
+    if qwen4_depth1_batched_target_arrays:
+        batch_target_arrays = True
+    lazy_target_distributions = (
+        _lazy_target_distributions_enabled()
+        and not qwen4_depth1_batched_target_arrays
+    )
     state_root_eval_events = 0
     state_root_eval_time_s = 0.0
     state_root_eval_arrays = 0
@@ -9760,7 +9779,7 @@ def generate_mtpk(
             and not lazy_target_distributions
             and not _steer_active
             and (
-                _batch_target_arrays_enabled() or _batch_target_distributions_enabled()
+                batch_target_arrays or batch_target_distributions
             )
         ):
             target_distribution_rows = min(
@@ -9769,7 +9788,7 @@ def generate_mtpk(
             )
             target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
             started_distribution = time.perf_counter()
-            if _batch_target_arrays_enabled():
+            if batch_target_arrays:
                 target_distribution_batch = _batched_distributions_from_mlx_logits(
                     target_distribution_logits,
                     sampler,
@@ -9794,10 +9813,8 @@ def generate_mtpk(
             event["defer_verify_hidden_eval"] = {
                 "mode": "target_distribution_first",
                 "verify_hidden_mode": verify_hidden_mode,
-                "batch_target_arrays": bool(_batch_target_arrays_enabled()),
-                "batch_target_distributions": bool(
-                    _batch_target_distributions_enabled()
-                ),
+                "batch_target_arrays": batch_target_arrays,
+                "batch_target_distributions": batch_target_distributions,
                 "rows": int(target_distribution_rows),
                 "time_s": float(elapsed_target_distribution_eval),
             }
@@ -9870,12 +9887,12 @@ def generate_mtpk(
                 target_distribution_rows_needed,
             )
             target_distribution_logits = verify_logits[:, :target_distribution_rows, :]
-            if _batch_target_arrays_enabled():
+            if batch_target_arrays:
                 target_distribution_batch = _batched_distributions_from_mlx_logits(
                     target_distribution_logits,
                     sampler,
                 )
-            elif _batch_target_distributions_enabled():
+            elif batch_target_distributions:
                 target_distributions = _distributions_from_mlx_logits(
                     target_distribution_logits,
                     sampler,
@@ -9886,10 +9903,8 @@ def generate_mtpk(
                 event["target_distribution_materialized"] = {
                     "mode": "accept_path",
                     "rows": int(target_distribution_rows),
-                    "batch_target_arrays": bool(_batch_target_arrays_enabled()),
-                    "batch_target_distributions": bool(
-                        _batch_target_distributions_enabled()
-                    ),
+                    "batch_target_arrays": batch_target_arrays,
+                    "batch_target_distributions": batch_target_distributions,
                 }
         lazy_target_distribution_rows = 0
         lazy_target_distribution_time = 0.0

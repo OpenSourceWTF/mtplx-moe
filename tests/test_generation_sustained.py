@@ -747,6 +747,33 @@ def test_lazy_target_distributions_inline_bonus_avoids_bonus_reforward(monkeypat
     )
 
 
+def test_qwen4_depth1_batches_target_rows_under_lazy_profile(monkeypatch):
+    monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "0")
+    monkeypatch.setenv("MTPLX_DEFER_VERIFY_HIDDEN_EVAL", "1")
+    monkeypatch.setenv("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "1")
+    runtime = _runtime(AcceptingTinyMTPModel(), mtp_enabled=True)
+    runtime.qwen4_depth1_batched_target_arrays = True
+
+    out = generate_mtpk(
+        runtime,
+        [0],
+        max_tokens=3,
+        sampler=SamplerConfig(temperature=0.6, top_p=1.0, top_k=1),
+        speculative_depth=1,
+        mtp_history_policy="committed",
+        verify_strategy="capture_commit",
+        stop_token_ids=set(),
+    )
+
+    event = out.stats.events[0]
+    materialized = event["defer_verify_hidden_eval"]
+    assert materialized["mode"] == "target_distribution_first"
+    assert materialized["batch_target_arrays"] is True
+    assert materialized["batch_target_distributions"] is False
+    assert materialized["rows"] == 2
+    assert out.stats.target_distribution_materialized_rows == 2
+
+
 def test_lazy_target_distributions_stop_after_first_rejection(monkeypatch):
     monkeypatch.setenv("MTPLX_BATCH_TARGET_ARRAYS", "1")
     monkeypatch.setenv("MTPLX_DEFER_VERIFY_HIDDEN_EVAL", "1")

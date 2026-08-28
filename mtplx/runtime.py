@@ -230,6 +230,7 @@ class MTPLXRuntime:
     ngram_cache_limit_restore: Callable[[], Any] | None = None
     ngram_memory_report: dict[str, Any] | None = None
     ngram_preflight_report: dict[str, Any] | None = None
+    qwen4_depth1_batched_target_arrays: bool = field(default=False, init=False)
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
         init=False,
@@ -1205,6 +1206,7 @@ def load(
         if ngram_resources is not None:
             runtime.ngram_cache = ngram_resources.cache
             runtime.ngram_artifact = ngram_resources.artifact
+            runtime.qwen4_depth1_batched_target_arrays = True
             runtime.ngram_cache_limit_restore = (
                 ngram_resources.restore_cache_limit
             )
