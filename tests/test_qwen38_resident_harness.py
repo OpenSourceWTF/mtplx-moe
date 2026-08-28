@@ -53,6 +53,10 @@ def test_production_workload_is_16k_1k_thinking_sampler_contract() -> None:
 
     assert (args.prompt_tokens, args.max_tokens) == (16_384, 1_024)
     assert args.ngram_cache_gib == 1
+    assert harness._benchmark_lane_environment(args) == {
+        "MTPLX_FUSE_PROJ": "gdn,attn,hyper,ple",
+        "MTPLX_QWEN4_WHOLE_MOE_M2": "1",
+    }
     assert harness._sampler_contract(headline=False) == {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -165,6 +169,19 @@ def test_headline_forwards_requested_warmup_runs() -> None:
     assert args.warmup_runs == 1
     warmup_index = command.index("--warmup-runs")
     assert command[warmup_index + 1] == "1"
+
+
+def test_outer_harness_forwards_explicit_stock_lane_control() -> None:
+    harness = _harness()
+    args = harness._parse_args(
+        ["--smoke", "--fuse-proj", "none", "--no-whole-moe-m2"]
+    )
+
+    command = harness._outer_command(args)
+
+    assert command[command.index("--fuse-proj") + 1] == "none"
+    assert "--no-whole-moe-m2" in command
+    assert harness._benchmark_lane_environment(args) == {}
 
 
 def test_receipt_includes_existing_generation_timing_breakdown() -> None:

@@ -60,6 +60,10 @@ _VANITY_SAMPLER = {
     "presence_penalty": 0.0,
     "repetition_penalty": 1.0,
 }
+_BENCHMARK_LANE_ENV_KEYS = (
+    "MTPLX_FUSE_PROJ",
+    "MTPLX_QWEN4_WHOLE_MOE_M2",
+)
 _DIAGNOSTIC_TIMING_FIELDS = (
     "verify_logits_eval_time_s",
     "verify_hidden_eval_time_s",
@@ -82,6 +86,28 @@ def _sampler_contract(*, headline: bool) -> dict[str, float | int]:
     """Return the exact benchmark sampler, including neutral identity knobs."""
 
     return dict(_VANITY_SAMPLER if headline else _PRODUCTION_SAMPLER)
+
+
+def _benchmark_lane_environment(args: argparse.Namespace) -> dict[str, str]:
+    """Resolve the construction-time lanes for this benchmark process."""
+
+    environment: dict[str, str] = {}
+    fuse_proj = str(args.fuse_proj).strip()
+    if fuse_proj and fuse_proj.lower() != "none":
+        environment["MTPLX_FUSE_PROJ"] = fuse_proj
+    if args.whole_moe_m2:
+        environment["MTPLX_QWEN4_WHOLE_MOE_M2"] = "1"
+    return environment
+
+
+def _install_benchmark_lanes(args: argparse.Namespace) -> dict[str, str]:
+    """Install the resolved lanes before runtime construction and imports."""
+
+    for name in _BENCHMARK_LANE_ENV_KEYS:
+        os.environ.pop(name, None)
+    environment = _benchmark_lane_environment(args)
+    os.environ.update(environment)
+    return environment
 
 
 def _diagnostic_timing_receipt(stats: Any) -> dict[str, float]:
@@ -314,6 +340,7 @@ def _wait_for_resident_target_memory(
 
 def _run_guarded_child(args: argparse.Namespace) -> int:
     guard = _consume_guard_attestation(os.environ, expected_lock=args.lock)
+    optimization_lanes = _install_benchmark_lanes(args)
     if args.inner_started_marker is not None:
         with args.inner_started_marker.open("x", encoding="utf-8") as handle:
             handle.write(f"{os.getpid()}\n")
@@ -415,6 +442,7 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
             "workload": "vanity-palindrome" if args.headline else "production-python",
             "thinking_mode": not args.headline,
             "sampler": sampler_contract,
+            "optimization_lanes": optimization_lanes,
             "source_revision": _source_revision(model),
             "prompt_tokens": len(prompt_ids),
             "prompt_token_sha256": _token_sha256(prompt_ids),
@@ -498,8 +526,10 @@ def _outer_command(args: argparse.Namespace) -> list[str]:
         "--warmup-runs", str(args.warmup_runs),
         "--ngram-cache-gib", str(args.ngram_cache_gib),
         "--runtime-target-gib", str(args.runtime_target_gib),
+        "--fuse-proj", args.fuse_proj,
         "--lock", str(args.lock),
     ]
+    forwarded.append("--whole-moe-m2" if args.whole_moe_m2 else "--no-whole-moe-m2")
     if args.smoke:
         forwarded.append("--smoke")
     if args.headline:
@@ -584,6 +614,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--ngram-cache-gib", type=int, default=1)
     parser.add_argument("--runtime-target-gib", type=int, default=82)
+    parser.add_argument("--fuse-proj", default="gdn,attn,hyper,ple")
+    parser.add_argument(
+        "--whole-moe-m2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--headline", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
