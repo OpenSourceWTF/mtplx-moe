@@ -458,6 +458,25 @@ QWEN3_8_REASONING_CODEC = ReasoningCodec(
     effort_levels=("xhigh", "medium", "low"),
     default_effort="medium",
 )
+# Families whose reasoning codec overrides a shared/generic lane
+# descriptor, keyed to the ONLY lanes they ride. Both conditions must
+# hold — family AND active backend — because the family sniff falls back
+# to a default family for empty/unrecognized refs (the daemon's default
+# --model is the 27B HF id), and a ref-only override stamped qwen3 onto
+# an explicitly chosen Laguna lane (caught 2026-08-28).
+REASONING_FAMILY_OVERRIDE_LANES: dict[str, frozenset[str]] = {
+    "qwen3_8": frozenset({"qwen3_next"}),
+    "qwen4_exp": frozenset({"qwen4_exp", "native_mtp"}),
+    "lfm2": frozenset({"mlx_lm_ar"}),
+}
+
+
+def reasoning_family_override_applies(
+    family: str | None, backend_id: str | None
+) -> bool:
+    lanes = REASONING_FAMILY_OVERRIDE_LANES.get(str(family or ""))
+    return lanes is not None and str(backend_id or "") in lanes
+
 # Flash-Next ships a byte-identical Qwen think-tag chat template to the dense
 # 27B (diff-verified 2026-08-28), including the template-enforced effort
 # triple (it raise_exceptions outside xhigh/medium/low — "high" would crash
@@ -1533,13 +1552,18 @@ def descriptor_from_runtime(runtime: Any, args: Any | None = None) -> BackendDes
     ref_text = str(model_ref or "")
     family_semantics = draft_semantics_for_model(ref_text, None, descriptor)
     family_sampler = sampler_defaults_for_model(ref_text, None, descriptor)
-    # Reasoning follows the same rebind, but only UP: a family with a
-    # declared codec (qwen3_8, qwen4_exp) overrides the generic backend
-    # codec; the unsupported fallback for unrecognized families must never
-    # strip a backend's own codec from custom models.
-    family_reasoning = reasoning_policy_for_model(ref_text, None, descriptor)
-    if not family_reasoning.supported:
-        family_reasoning = descriptor.reasoning_codec
+    # Reasoning follows the same rebind, but only when family AND lane
+    # agree (see REASONING_FAMILY_OVERRIDE_LANES): the family sniff's
+    # default-fallback must never strip or replace a lane's own codec
+    # (Laguna, custom models).
+    ref_family = model_family_from_inspection(
+        model_ref=ref_text, descriptor=descriptor
+    )
+    family_reasoning = (
+        reasoning_policy_for_model(ref_text, None, descriptor)
+        if reasoning_family_override_applies(ref_family, descriptor.backend_id)
+        else descriptor.reasoning_codec
+    )
     if (
         family_semantics != descriptor.draft_semantics
         or family_sampler != descriptor.sampler_defaults

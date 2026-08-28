@@ -603,14 +603,23 @@ def test_server_defaults_stamp_flash_next_reasoning() -> None:
     from mtplx.server import openai as srv
 
     args = srv.parse_args(["--model", FLASH_NEXT_BARE_SPEED_HF_MODEL_ID])
-    srv._apply_backend_server_defaults(args, explicit_flags=set())
+    srv._apply_backend_server_defaults(args, explicit_flags={"model"})
     assert args.reasoning_parser == "qwen3"
     assert args.reasoning_effort == "xhigh"
 
     args27 = srv.parse_args(["--model", BARE_SPEED])
-    srv._apply_backend_server_defaults(args27, explicit_flags=set())
+    srv._apply_backend_server_defaults(args27, explicit_flags={"model"})
     assert args27.reasoning_parser == "qwen3"
     assert args27.reasoning_effort == "medium"  # 27B keeps its own receipt
+
+    # A DEFAULT model ref must never override an explicitly chosen lane:
+    # the daemon's default --model is the 27B HF id, and a ref-only
+    # override stamped qwen3 onto the Laguna lane (2026-08-28).
+    laguna = srv.parse_args(["--backend-id", "laguna_ar", "--no-load-mtp"])
+    srv._apply_backend_server_defaults(
+        laguna, explicit_flags={"backend-id", "no-load-mtp"}
+    )
+    assert laguna.reasoning_parser == "poolside_v1"
 
 
 def test_one_shot_cli_reasoning_effort_matches_server_semantics() -> None:

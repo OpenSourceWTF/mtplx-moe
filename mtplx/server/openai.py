@@ -91,6 +91,8 @@ from mtplx.backends.descriptors import (
     descriptor_from_runtime,
     model_controls_for_descriptor,
     model_family_from_inspection,
+    REASONING_FAMILY_OVERRIDE_LANES,
+    reasoning_family_override_applies,
     reasoning_policy_for_model,
     set_draft_control_arg,
     sync_backend_arg_aliases,
@@ -33022,12 +33024,25 @@ def _apply_backend_server_defaults(
     # carries its own verified codec, and stamping the lane's parser here
     # read as an operator override downstream — the child daemon served
     # Flash-Next with parser "none" and no default effort (2026-08-28).
-    # Families without a declared codec keep the lane's own codec.
-    reasoning = reasoning_policy_for_model(
-        model_ref=str(getattr(args, "model", "") or ""),
-        descriptor=backend,
+    # The override applies when an explicitly passed --model names an
+    # override family (model intent wins; the runtime re-resolves the
+    # lane from the loaded model anyway), or when family and lane agree
+    # (REASONING_FAMILY_OVERRIDE_LANES). A DEFAULT model ref alone must
+    # never override an explicitly chosen lane — the daemon's default
+    # --model is the 27B HF id, and a ref-only override stamped qwen3
+    # onto the Laguna lane.
+    _model_ref = str(getattr(args, "model", "") or "")
+    _family = model_family_from_inspection(
+        model_ref=_model_ref, descriptor=backend
     )
-    if not reasoning.supported:
+    if _family in REASONING_FAMILY_OVERRIDE_LANES and (
+        _server_flag_present(explicit_flags, "model")
+        or reasoning_family_override_applies(_family, backend.backend_id)
+    ):
+        reasoning = reasoning_policy_for_model(
+            model_ref=_model_ref, descriptor=backend
+        )
+    else:
         reasoning = backend.reasoning_codec
     if not _server_flag_present(explicit_flags, "reasoning-parser"):
         args.reasoning_parser = reasoning.parser
