@@ -183,13 +183,25 @@ def model_weights_bytes(model_path: Any) -> int | None:
     MTP sidecar lives at ``mtp/weights.safetensors`` (artifacts.py) and
     wrapper dirs keep shards under a subdirectory. The old top-level-only
     scan undercounted those (or returned None outright), silently skewing
-    the RAM-aware session-bank budget this number feeds."""
+    the RAM-aware session-bank budget this number feeds.
+
+    The Flash-Next n-gram sidecar (~30 GiB) is excluded by name: in its
+    default streamed mode only touched pages become resident and they are
+    reclaimable file-backed pages, not wired weight. Counting it here was
+    the 2026-08-28 defect chain (false MODEL DOES NOT FIT, 30G-pessimistic
+    window and bank on 128G Macs). When the resident policy arms, the
+    caller adds ``ngram_table_bytes`` back explicitly — see
+    ``memory_plan.ngram_table_resident_policy``."""
+    from mtplx.memory_plan import NGRAM_TABLE_FILENAME
+
     try:
         root = Path(str(model_path))
         if not root.is_dir():
             return None
         total = 0
         for shard in root.rglob("*.safetensors"):
+            if shard.name == NGRAM_TABLE_FILENAME:
+                continue
             try:
                 total += shard.stat().st_size
             except OSError:
@@ -197,6 +209,19 @@ def model_weights_bytes(model_path: Any) -> int | None:
         return total if total > 0 else None
     except Exception:
         return None
+
+
+def ngram_table_bytes(model_path: Any) -> int:
+    """Size of the Flash-Next n-gram sidecar next to the weights (0 when
+    absent). Kept separate from ``model_weights_bytes`` so callers count it
+    as a commitment exactly when the resident policy says it will be one."""
+    from mtplx.memory_plan import NGRAM_TABLE_FILENAME
+
+    try:
+        table = Path(str(model_path)) / NGRAM_TABLE_FILENAME
+        return table.stat().st_size if table.is_file() else 0
+    except Exception:
+        return 0
 
 
 def _memory_budget_bytes_env() -> int | None:

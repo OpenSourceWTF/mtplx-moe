@@ -2213,7 +2213,10 @@ class ServerState:
             # (2026-08-27 battery receipt). Floor = pack weight files
             # (+ the table when the resident policy arms) + working margin.
             try:
-                from mtplx.models.qwen4_exp import _ngram_resident_policy
+                from mtplx.memory_plan import (
+                    NGRAM_TABLE_FILENAME,
+                    ngram_table_resident_policy,
+                )
 
                 model_dir = Path(str(getattr(args, "model", "") or ""))
                 floor = 0
@@ -2222,8 +2225,8 @@ class ServerState:
                 mtp_f = model_dir / "mtp.safetensors"
                 if mtp_f.exists():
                     floor += mtp_f.stat().st_size
-                table_f = model_dir / "ngram-table.safetensors"
-                if table_f.exists() and _ngram_resident_policy():
+                table_f = model_dir / NGRAM_TABLE_FILENAME
+                if table_f.exists() and ngram_table_resident_policy():
                     floor += table_f.stat().st_size
                 if floor:
                     minimum_resident_bytes = floor + 6 * 1024**3
@@ -2525,6 +2528,25 @@ class ServerState:
         _plan_weights_bytes = _model_weights_bytes(
             getattr(self.runtime, "model_path", None)
         )
+        # Flash-Next n-gram sidecar: a commitment ONLY when the resident
+        # policy arms (it is then materialized into MLX memory at load);
+        # streamed mode reads reclaimable file-backed pages, so the plan
+        # carries it as a note instead of shrinking the window and the
+        # bank by 30G (the false MODEL-DOES-NOT-FIT chain, 2026-08-28).
+        from mtplx.engine_session import ngram_table_bytes as _ngram_table_bytes
+        from mtplx.memory_plan import (
+            ngram_table_resident_policy as _ngram_table_resident,
+        )
+
+        _plan_table_bytes = _ngram_table_bytes(
+            getattr(self.runtime, "model_path", None)
+        )
+        _plan_table_streamed_bytes = 0
+        if _plan_table_bytes:
+            if _ngram_table_resident():
+                _plan_weights_bytes = (_plan_weights_bytes or 0) + _plan_table_bytes
+            else:
+                _plan_table_streamed_bytes = _plan_table_bytes
         # env override > model-config-derived geometry > flagship default
         _plan_kv_bytes_per_token = 0
         try:
@@ -2559,6 +2581,7 @@ class ServerState:
         _plan_inputs: dict[str, Any] = {
             "total_ram_bytes": _plan_detect_total_ram(),
             "model_weights_bytes": _plan_weights_bytes,
+            "ngram_table_streamed_bytes": _plan_table_streamed_bytes,
             "kv_bytes_per_token": _plan_kv_bytes_per_token,
             "kv_quantization": _effective_paged_kv_quantization(),
             "model_max_context": int(self.model_context_window_max),

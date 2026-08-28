@@ -1012,6 +1012,10 @@ public struct MemoryPlanStatus: Codable, Equatable, Sendable {
     public var totalRamBytes: Int?
     public var usableBytes: Int?
     public var modelWeightsBytes: Int?
+    /// Flash-Next n-gram table bytes when it streams from SSD (file-backed,
+    /// reclaimable — deliberately NOT in weights or Active). Nil/0 for
+    /// every other model and when the table is RAM-resident.
+    public var ngramTableStreamedBytes: Int?
     public var contextWindowFit: Int?
     public var contextWindowResolved: Int?
     public var contextMachineBound: Bool?
@@ -1028,6 +1032,7 @@ public struct MemoryPlanStatus: Codable, Equatable, Sendable {
         case totalRamBytes = "total_ram_bytes"
         case usableBytes = "usable_bytes"
         case modelWeightsBytes = "model_weights_bytes"
+        case ngramTableStreamedBytes = "ngram_table_streamed_bytes"
         case contextWindowFit = "context_window_fit"
         case contextWindowResolved = "context_window_resolved"
         case contextMachineBound = "context_machine_bound"

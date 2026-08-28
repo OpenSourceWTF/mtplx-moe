@@ -306,6 +306,10 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # QSA block-sparse flash-skip attention (2026-08-27 candidate):
         # selected blocks iterated inside the kernel, no staging/copies.
         "MTPLX_QSA_FLASH",
+        # n-gram hot-row LRU size in MB for the streamed sidecar
+        # (2026-08-28, default 1024; 0 disables) — registered ahead per the
+        # boot-trap law so packs/profiles may stamp it.
+        "MTPLX_NGRAM_HOT_MB",
         # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
         # NAX verify patch OFF under turbo until it earns a family receipt.
         "MTPLX_NAX_VERIFY",

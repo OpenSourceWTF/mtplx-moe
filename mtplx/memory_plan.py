@@ -68,6 +68,45 @@ BANK_CAP_BYTES = 48 * GIB
 CONTEXT_ALIGN_TOKENS = 4096
 CONTEXT_FLOOR_TOKENS = 4096
 
+# The Qwen3.8-Flash-Next n-gram sidecar (ngram-table.safetensors, ~30 GiB)
+# serves in one of two modes, and the plan must count it exactly one way:
+#
+# * streamed (the default): row gathers read numpy memmaps over the file, so
+#   only touched pages ever become resident, they are clean file-backed
+#   pages, and macOS reclaims them under pressure. NOT a commitment.
+#   Counting it as weights anyway was a real shipped-defect chain
+#   (2026-08-28): a 128G Mac planned ~99G of "weights", printed MODEL DOES
+#   NOT FIT, and shrank both the context window and the session bank by
+#   30G — while the engine actually served fine at ~69G resident.
+# * resident (pinned, or auto on >=160 GiB machines): the table is
+#   materialized into MLX allocator memory once at load so the pipelined-AR
+#   lane can gather in-graph. A true commitment; counts as weights.
+NGRAM_TABLE_FILENAME = "ngram-table.safetensors"
+NGRAM_RESIDENT_AUTO_MIN_RAM_BYTES = 160 * GIB
+
+
+def ngram_table_resident_policy() -> bool:
+    """Single source of the table's resident-vs-streamed decision.
+
+    The model backend (gather lanes), the server's Metal floor, and the
+    memory plan all consult THIS function, so behavior and accounting can
+    never disagree. MTPLX_NGRAM_RESIDENT=1/0 pins it; the "auto" default
+    arms residency only at >=160 GiB RAM: on a 128 GiB M5 Max the resident
+    set (~99G pack + table) left no headroom over the user's own apps —
+    two Jetsam events and a watchdogd-starved kernel panic (2026-08-26
+    receipts). 128G-class machines stream the table from SSD.
+    """
+    raw = (os.environ.get("MTPLX_NGRAM_RESIDENT") or "auto").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError):
+        return False
+    return total >= NGRAM_RESIDENT_AUTO_MIN_RAM_BYTES
+
 # Dense-attention KV bytes per token for the flagship geometry
 # (16 full-attention layers x K+V x 4 KV heads x head_dim 256 x bf16
 # = 65,536). generation._dense_decode_max_context reads the same default
@@ -188,6 +227,11 @@ class MemoryPlan:
     memory_budget_bytes: int | None = None
     usable_bytes: int = 0
     model_weights_bytes: int = 0
+    # Flash-Next n-gram sidecar bytes when it STREAMS from SSD (0 for every
+    # other model, and 0 when the resident policy folds it into weights).
+    # Carried so the banner/app can say where the other ~30G of the pack
+    # lives instead of the number silently not adding up to the disk size.
+    ngram_table_streamed_bytes: int = 0
     kv_bytes_per_token: int = DEFAULT_DENSE_KV_BYTES_PER_TOKEN
     kv_quantization: str = "off"
     kv_bytes_per_token_effective: int = DEFAULT_DENSE_KV_BYTES_PER_TOKEN
@@ -232,6 +276,7 @@ class MemoryPlan:
             ),
             "usable_bytes": int(self.usable_bytes),
             "model_weights_bytes": int(self.model_weights_bytes),
+            "ngram_table_streamed_bytes": int(self.ngram_table_streamed_bytes),
             "kv_bytes_per_token": int(self.kv_bytes_per_token),
             "kv_quantization": self.kv_quantization,
             "kv_bytes_per_token_effective": int(self.kv_bytes_per_token_effective),
@@ -265,6 +310,7 @@ def plan_memory(
     dense_decode_ceiling: int | None = None,
     memory_budget_bytes: int | None = None,
     usable_bytes_override: int | None = None,
+    ngram_table_streamed_bytes: int = 0,
 ) -> MemoryPlan:
     """Solve the machine's memory geometry.
 
@@ -362,6 +408,7 @@ def plan_memory(
         memory_budget_bytes=budget,
         usable_bytes=usable,
         model_weights_bytes=weights,
+        ngram_table_streamed_bytes=max(0, int(ngram_table_streamed_bytes)),
         kv_bytes_per_token=kv_per_token,
         kv_quantization=quant,
         kv_bytes_per_token_effective=kv_effective,
@@ -425,6 +472,11 @@ def describe_plan(plan: MemoryPlan) -> str:
         line += (
             f" (yields to {plan.bank_steady_bytes / GIB:.1f}G under "
             "long-context load)"
+        )
+    if plan.ngram_table_streamed_bytes > 0:
+        line += (
+            f", n-gram table {plan.ngram_table_streamed_bytes / GIB:.1f}G "
+            "streamed from SSD (not wired)"
         )
     if not plan.model_fits:
         line += " — MODEL DOES NOT FIT"

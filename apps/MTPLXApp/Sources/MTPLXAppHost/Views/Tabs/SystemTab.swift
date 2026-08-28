@@ -229,6 +229,18 @@ struct SystemTab: View {
                     MetricRow(label: "Session cache (RAM)", value: Format.bytes(mem?.sessionBankBytes ?? 0))
                     MetricRow(label: "Generation working set", value: Format.bytes(mem?.generationWorkingBytes ?? 0))
                 }
+                // Flash-Next n-gram table in streamed mode: ~30 GB of the
+                // pack that reads from SSD as reclaimable file-backed pages
+                // — deliberately not wired, so it never appears in Active
+                // and the pack's disk size would otherwise not add up.
+                if let table = backend.memoryPlan?.ngramTableStreamedBytes,
+                   table > 0
+                {
+                    MetricRow(
+                        label: "N-gram table (streamed from SSD)",
+                        value: Format.bytes(table)
+                    )
+                }
                 // Retrieval weights are not part of the chat model's shard
                 // total, so without this row several GB would be unattributed.
                 if let retrieval = snapshot?.retrieval, retrieval.enabled {

@@ -1588,8 +1588,16 @@ class _SidecarGather:
     disables it (A/B arm); prefetch_batches is the engagement receipt.
     """
 
+    # Decode-step gathers are a few dozen rows; the LRU serves those. A
+    # prefill gather is millions of ids — per-row cache bookkeeping there
+    # would cost more than the IO, so big gathers bypass to the vectorized
+    # memmap path (which still warms the page cache for later decode).
+    _HOT_PATH_MAX_ROWS = 4096
+
     def __init__(self, path: Path, entries, bits: int, group_size: int):
+        import mmap as _mmap
         import numpy as np
+        from collections import OrderedDict
 
         self.bits = bits
         self.group_size = group_size
@@ -1600,10 +1608,14 @@ class _SidecarGather:
             dtype = {"U32": np.uint32, "BF16": np.uint16, "F16": np.uint16}[info["dtype"]]
             shape = tuple(info["shape"])
             offset = data_start + info["data_offsets"][0]
-            self._maps[name] = (
-                np.memmap(path, mode="r", dtype=dtype, offset=offset, shape=shape),
-                info["dtype"],
-            )
+            mm = np.memmap(path, mode="r", dtype=dtype, offset=offset, shape=shape)
+            try:
+                # Row ids are hash-scattered: sequential readahead on these
+                # maps is pure wasted IO (the pread pool is the prefetch).
+                mm._mmap.madvise(_mmap.MADV_RANDOM)
+            except (AttributeError, OSError, ValueError):
+                pass
+            self._maps[name] = (mm, info["dtype"])
             itemsize = 4 if info["dtype"] == "U32" else 2
             self._row_meta.append((offset, int(shape[1]) * itemsize))
         self._pool = None
@@ -1614,6 +1626,24 @@ class _SidecarGather:
             self._pool = ThreadPoolExecutor(
                 max_workers=16, thread_name_prefix="ngram-prefetch"
             )
+        # Hot-row LRU: raw row bytes per map, keyed by row id. Row
+        # popularity is Zipf (common n-grams recur constantly) even though
+        # row PLACEMENT is hash-uniform, so a bounded RAM-held hot set
+        # serves most decode gathers with zero pread and zero memmap touch
+        # — and keeps its speed when macOS reclaims the file's page cache
+        # under memory pressure. All access is on the single generation
+        # thread (stage()/forward); the pread pool only warms pages and
+        # never touches this dict. MTPLX_NGRAM_HOT_MB sizes it
+        # (default 1024; 0 disables).
+        self._hot = OrderedDict()
+        self._hot_row_bytes = max(1, sum(rb for _, rb in self._row_meta))
+        try:
+            hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "1024"))
+        except ValueError:
+            hot_mb = 1024
+        self._hot_cap_rows = (max(0, hot_mb) * 2**20) // self._hot_row_bytes
+        self.hot_hits = 0
+        self.hot_misses = 0
 
     def _warm(self, rows) -> None:
         fd = self._fd
@@ -1629,22 +1659,62 @@ class _SidecarGather:
         list(self._pool.map(touch, chunks))
         self.prefetch_batches += 1
 
+    def _rows_matrices(self, flat, names):
+        """Raw row matrices (one per map, flat order) — through the hot-row
+        LRU for decode-sized gathers, straight off the memmaps otherwise.
+        Values are identical either way: the cache stores the same raw row
+        bytes the maps would return."""
+        import numpy as np
+
+        uniq, inverse = np.unique(flat, return_inverse=True)
+        if not (0 < len(uniq) <= self._HOT_PATH_MAX_ROWS and self._hot_cap_rows):
+            if self._pool is not None and len(uniq):
+                self._warm(uniq)
+            return {
+                name: np.ascontiguousarray(self._maps[name][0][uniq])[inverse]
+                for name in names
+            }
+        hot = self._hot
+        miss = [int(r) for r in uniq if int(r) not in hot]
+        if miss:
+            miss_np = np.asarray(miss, dtype=np.int64)
+            if self._pool is not None:
+                self._warm(miss_np)
+            fetched = {
+                name: np.ascontiguousarray(self._maps[name][0][miss_np])
+                for name in names
+            }
+            for i, r in enumerate(miss):
+                hot[r] = tuple(fetched[name][i] for name in names)
+        self.hot_hits += len(uniq) - len(miss)
+        self.hot_misses += len(miss)
+        rows = []
+        for r in uniq:
+            key = int(r)
+            rows.append(hot[key])
+            hot.move_to_end(key)
+        while len(hot) > self._hot_cap_rows:
+            hot.popitem(last=False)
+        return {
+            name: np.stack([row[j] for row in rows])[inverse]
+            for j, name in enumerate(names)
+        }
+
     def gather_np(self, flat) -> mx.array:
         """Gather+dequantize rows for MATERIALIZED numpy int64 ids — the
         staged fast path: no graph tensor is evaluated here, so calling
         this before the step's graph is built costs no GPU sync."""
-        import numpy as np
-
-        if self._pool is not None:
-            self._warm(np.unique(flat))
         if self.bits == 0:  # raw bf16 rows, no dequantize
-            mm, dt = self._maps["weight"]
-            rows = mx.array(np.ascontiguousarray(mm[flat]))
+            mats = self._rows_matrices(flat, ("weight",))
+            dt = self._maps["weight"][1]
+            rows = mx.array(mats["weight"])
             return rows.view(mx.bfloat16 if dt == "BF16" else mx.float16)
+        names = ("weight", "scales", "biases")
+        mats = self._rows_matrices(flat, names)
         parts = []
-        for name in ("weight", "scales", "biases"):
-            mm, dt = self._maps[name]
-            rows = mx.array(np.ascontiguousarray(mm[flat]))
+        for name in names:
+            dt = self._maps[name][1]
+            rows = mx.array(mats[name])
             if dt == "BF16":
                 rows = rows.view(mx.bfloat16)
             elif dt == "F16":
@@ -1669,26 +1739,14 @@ def _read_safetensors_header(path: Path):
 
 def _ngram_resident_policy() -> bool:
     """Should the n-gram table go RAM-resident (arming the pipelined AR
-    lane)? MTPLX_NGRAM_RESIDENT=1/0 pins it; default is auto by machine
-    memory. Auto arms only above the 128G class: with the table resident
-    the serve process wires ~99G (pack weights + 30G table), and on a
-    128G Mac that left no headroom over the user's own apps — measured
-    2026-08-26 on an M5 Max 128G: two Jetsam events then a watchdogd-
-    starved kernel panic while a serve A/B cycled resident loads. The
-    128G default is the SSD sidecar + staged classic loop (~69G resident,
-    real headroom — the founder-specified table-on-SSD design);
-    MTPLX_NGRAM_RESIDENT=1 pins resident for quiet-machine benchmarking
-    or dedicated boxes."""
-    raw = (os.environ.get("MTPLX_NGRAM_RESIDENT") or "auto").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    try:
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError):
-        return False
-    return total >= 160 * 2**30
+    lane)? Delegates to memory_plan.ngram_table_resident_policy — THE
+    single source: the server's Metal floor and the memory plan consult
+    the same function, so gather behavior and memory accounting can never
+    disagree. (History: resident on 128G wired ~99G and kernel-panicked
+    the machine twice, 2026-08-26 — auto arms only at >=160G.)"""
+    from mtplx.memory_plan import ngram_table_resident_policy
+
+    return ngram_table_resident_policy()
 
 
 class NGramEmbedding(nn.Module):
@@ -1858,10 +1916,16 @@ class NGramEmbedding(nn.Module):
             return
         n = getattr(self, "_stage_consumed", 0) + getattr(self, "_graph_calls", 0)
         if n in (8, 64) or n % 512 == 0:
+            sidecar = self.ngram_embedding._sidecar
+            hot = (
+                f" hot={sidecar.hot_hits}/{sidecar.hot_hits + sidecar.hot_misses}"
+                if sidecar is not None
+                else ""
+            )
             print(
                 f"[qwen4_exp] ngram path census: staged={getattr(self, '_stage_consumed', 0)} "
                 f"graph={getattr(self, '_graph_calls', 0)} "
-                f"stale-shape={getattr(self, '_stage_bypassed', 0)}",
+                f"stale-shape={getattr(self, '_stage_bypassed', 0)}{hot}",
                 flush=True,
             )
 
@@ -2574,12 +2638,23 @@ class Model(nn.Module):
         if not path.exists():
             return
         resident = _ngram_resident_policy()
+        sidecar = None
         for layer in self.layers:
             if "ple" in layer:
                 table = layer.ple.ple_embedding.ngram_embedding
                 table.attach_sidecar(path)
+                sidecar = table._sidecar
                 if resident:
                     table.attach_resident(path)
+        if sidecar is not None and not resident:
+            hot_mb = (sidecar._hot_cap_rows * sidecar._hot_row_bytes) // 2**20
+            print(
+                "[qwen4_exp] ngram table: streamed from SSD (file-backed "
+                f"pages, hot cache {hot_mb}M, prefetch "
+                f"{'on' if sidecar._pool is not None else 'off'}) — "
+                "resident only at >=160G RAM or MTPLX_NGRAM_RESIDENT=1",
+                flush=True,
+            )
 
     def set_ar_pipeline_mode(self, enabled: bool) -> bool:
         """Flip the family into (or out of) the pipelined-AR decode contract:
