@@ -1162,6 +1162,15 @@ def load(
         qwen_row_owned_router_report=router_report,
         ngram_preflight_report=qwen4_preflight_report,
     )
+    if str(config.get("model_type") or "").lower() == "qwen4_exp":
+        from .qwen4_capture import (
+            install_qwen4_capture_route,
+            is_exact_qwen4_capture_config,
+        )
+
+        if is_exact_qwen4_capture_config(config):
+            capture_report = install_qwen4_capture_route(runtime, config=config)
+            logger.info("[qwen4-capture] %s", capture_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError
