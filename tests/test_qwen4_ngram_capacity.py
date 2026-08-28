@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from mtplx.qwen4_ngram import (
@@ -82,6 +84,35 @@ def test_qwen4_transient_bytes_follow_configured_prefill_geometry() -> None:
 def test_qwen4_transient_bytes_reject_overflow() -> None:
     with pytest.raises(OverflowError, match="signed 64-bit"):
         qwen4_ngram_transient_bytes((1 << 63) - 1)
+
+
+def test_transient_pool_tracks_capacity_without_a_full_slot_census() -> None:
+    from mtplx.qwen4_ngram import _TransientPool
+
+    class IndexedSlots:
+        def __init__(self, values):
+            self.values = list(values)
+
+        def __getitem__(self, index):
+            return self.values[index]
+
+        def __setitem__(self, index, value):
+            self.values[index] = value
+
+        def __iter__(self):
+            raise AssertionError("reservation must not census every transient slot")
+
+    pool = _TransientPool(
+        SimpleNamespace(transient_bytes=800, transient_metadata_bytes=8),
+        row_bytes=100,
+    )
+    pool.used = IndexedSlots(pool.used)
+
+    reservations = pool.reserve_fragmented((3, 2))
+    assert pool.free_slots == 3
+    for _group, _offset, start, count in reservations:
+        pool.release(start, count)
+    assert pool.free_slots == 8
 
 
 def test_packed_lru_uses_free_chain_then_oldest_unprotected_slots() -> None:

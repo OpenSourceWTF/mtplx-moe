@@ -2756,13 +2756,14 @@ class _DescriptorReader:
 class _TransientPool:
     """Fixed row-granular staging storage for positional reads."""
 
-    __slots__ = ("buffer", "row_bytes", "slots", "used", "view")
+    __slots__ = ("buffer", "free_slots", "row_bytes", "slots", "used", "view")
 
     def __init__(self, plan: NGramCachePlan, row_bytes: int) -> None:
         self.buffer = bytearray(plan.transient_bytes)
         self.view = memoryview(self.buffer)
         self.used = bytearray(plan.transient_metadata_bytes)
         self.slots = plan.transient_metadata_bytes
+        self.free_slots = self.slots
         self.row_bytes = row_bytes
 
     def reserve(self, row_counts: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
@@ -2787,6 +2788,7 @@ class _TransientPool:
                 raise NGramCacheFull("fixed n-gram transient pool is exhausted")
             for slot in range(start, start + count):
                 self.used[slot] = 1
+            self.free_slots -= count
             reserved.append((start, count))
         return tuple(reserved)
 
@@ -2796,7 +2798,7 @@ class _TransientPool:
         """Return (group, group-row-offset, pool-start, count) segments."""
 
         needed = sum(row_counts)
-        if sum(1 for value in self.used if value == 0) < needed:
+        if self.free_slots < needed:
             raise NGramCacheFull("fixed n-gram transient pool is exhausted")
         planned: list[tuple[int, int, int, int]] = []
         claimed: set[int] = set()
@@ -2823,11 +2825,13 @@ class _TransientPool:
                 group_offset += count
         for slot in claimed:
             self.used[slot] = 1
+        self.free_slots -= len(claimed)
         return tuple(planned)
 
     def release(self, start: int, count: int) -> None:
         for slot in range(start, start + count):
             self.used[slot] = 0
+        self.free_slots += count
 
     def bytes_view(self, start: int, count: int) -> memoryview:
         begin = start * self.row_bytes
@@ -2838,6 +2842,7 @@ class _TransientPool:
         self.buffer = bytearray()
         self.used = bytearray()
         self.slots = 0
+        self.free_slots = 0
 
 
 _CACHE_CONSTRUCTION_KEY = object()
