@@ -28359,6 +28359,12 @@ def create_app(state: ServerState) -> FastAPI:
             session = state.sessions.get_or_create(session_id)
             session.last_cache_miss_reason = cache_miss_reason
             session.last_restore_mode = session_restore_mode
+            # request_observability was built ~100 lines up, before this
+            # resolution ran, from the line-one None placeholder — so a
+            # header-identified session logged request_session_source: null
+            # while session_id was populated, which #384 read (reasonably)
+            # as the live-ref gate never opening. Stamp the truth.
+            request_observability["request_session_source"] = session_source
         if requested_model:
             request_observability["request_model"] = requested_model
             request_observability["served_model_id"] = state.model_id

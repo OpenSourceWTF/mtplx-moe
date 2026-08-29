@@ -1323,14 +1323,35 @@ class SessionBankColdTier:
 
         now = time.time()
         with self._stats_lock:
-            if (
-                self._pending_bytes + max(0, estimated_nbytes)
-                > self._backlog_budget_bytes
-            ):
-                self._stats["skipped_backlog_bytes"] = (
-                    int(self._stats.get("skipped_backlog_bytes", 0) or 0) + 1
-                )
-                return False
+            needed = max(0, estimated_nbytes)
+            if self._pending_bytes + needed > self._backlog_budget_bytes:
+                if self._pending_bytes <= 0:
+                    # #384: the backlog budget bounds QUEUED bytes, but a
+                    # single entry larger than the whole budget was rejected
+                    # on every attempt even with an empty queue — at ~84
+                    # KB/token of 27B KV the 4 GiB default made the SSD tier
+                    # silently off past ~50k tokens, exactly the sessions it
+                    # exists to serve, with only a skipped_backlog_bytes
+                    # counter as the trace. An empty queue is not backlog
+                    # pressure: admit the lone entry and say so by name.
+                    self._stats["admitted_oversized_alone"] = (
+                        int(self._stats.get("admitted_oversized_alone", 0) or 0)
+                        + 1
+                    )
+                    logger.warning(
+                        "SessionBank SSD write of %.2f GiB exceeds the "
+                        "writer backlog budget of %.2f GiB "
+                        "(MTPLX_SSD_WRITER_BACKLOG_BYTES); admitting it "
+                        "alone because the queue is empty",
+                        needed / (1024**3),
+                        self._backlog_budget_bytes / (1024**3),
+                    )
+                else:
+                    self._stats["skipped_backlog_bytes"] = (
+                        int(self._stats.get("skipped_backlog_bytes", 0) or 0)
+                        + 1
+                    )
+                    return False
             while self._written_window and self._written_window[0][0] < now - 3600:
                 self._written_window.popleft()
             written_last_hour = sum(nbytes for _, nbytes in self._written_window)
