@@ -264,6 +264,44 @@ def test_dynamic_ceiling_without_a_plan_stays_out_of_the_way() -> None:
     assert bank_dynamic_ceiling(unavailable, 10 * GIB) == BANK_CAP_BYTES
 
 
+def test_transient_reserve_tracks_the_observed_spike() -> None:
+    from mtplx.memory_plan import (
+        RUNTIME_TRANSIENTS_BYTES,
+        TRANSIENT_RESERVE_CAP_BYTES,
+        transient_reserve_bytes,
+    )
+
+    # Below the static floor: the floor wins (idle process, tiny spike).
+    assert (
+        transient_reserve_bytes(84 * GIB, 83 * GIB) == RUNTIME_TRANSIENTS_BYTES
+    )
+    # The measured 2026-08-29 shape: 95.2G peak over 82.8G active = 12.4G —
+    # the reserve must carry the real spike, not the 3 GiB guess.
+    spike = transient_reserve_bytes(int(95.2 * GIB), int(82.8 * GIB))
+    assert spike == int(95.2 * GIB) - int(82.8 * GIB)
+    # One pathological turn cannot starve the bank forever: capped.
+    assert (
+        transient_reserve_bytes(120 * GIB, 80 * GIB)
+        == TRANSIENT_RESERVE_CAP_BYTES
+    )
+
+
+def test_dynamic_ceiling_observed_reserve_shrinks_the_bank_first() -> None:
+    plan = _plan(48)
+    # 9 GiB more reserve (12 observed vs 3 static) comes straight out of
+    # the bank's ceiling — identical to 9 GiB more live working set — so
+    # entries demote BEFORE the next spike can kiss the Metal limit. The
+    # identity form survives the idle-max and floor clamps.
+    observed = bank_dynamic_ceiling(plan, 2 * GIB, transient_bytes=12 * GIB)
+    assert observed == bank_dynamic_ceiling(plan, 11 * GIB)
+    # The shrink actually bites on this plan (not clamped to the floor).
+    assert observed < bank_dynamic_ceiling(plan, 2 * GIB)
+    # A reserve below the static floor never RAISES the ceiling.
+    assert bank_dynamic_ceiling(
+        plan, 2 * GIB, transient_bytes=1 * GIB
+    ) == bank_dynamic_ceiling(plan, 2 * GIB)
+
+
 # ---------------------------------------------------------------------------
 # unavailability, serialization, description
 

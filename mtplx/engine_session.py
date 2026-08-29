@@ -1385,19 +1385,35 @@ class EngineSessionManager:
                 # reports. mlx is imported lazily so plan-carrying tests
                 # without a GPU fall back to the static budget (the bank
                 # counts, not swallows, ceiling failures).
-                from mtplx.memory_plan import bank_dynamic_ceiling
+                from mtplx.memory_plan import (
+                    bank_dynamic_ceiling,
+                    transient_reserve_bytes,
+                )
 
                 def _dynamic_ceiling(
                     _bank: SessionBank = bank, _plan: Any = memory_plan
                 ) -> int:
                     import mlx.core as mx
 
+                    active = int(mx.get_active_memory())
                     working = (
-                        int(mx.get_active_memory())
+                        active
                         - int(_plan.model_weights_bytes)
                         - int(_bank.total_nbytes)
                     )
-                    return bank_dynamic_ceiling(_plan, max(0, working))
+                    # Observed spike (peak high-water over current active)
+                    # replaces the static 3 GiB reserve: a deep chunked
+                    # prefill measured 12.4 GiB over active, and with only
+                    # the static term the bank held entries while the
+                    # allocator peak kissed 0.99+ of the Metal limit —
+                    # tripping the warning banner on every long coding turn
+                    # (2026-08-29 receipts).
+                    reserve = transient_reserve_bytes(
+                        int(mx.get_peak_memory()), active
+                    )
+                    return bank_dynamic_ceiling(
+                        _plan, max(0, working), transient_bytes=reserve
+                    )
 
                 bank.dynamic_ceiling_fn = _dynamic_ceiling
             # Visible on the daemon console on purpose (#229/#230): the

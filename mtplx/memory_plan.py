@@ -52,6 +52,9 @@ ENGINE_RAM_CAP_BYTES = 192 * GIB
 # Sustained-mode receipt (27.5 GB peak at 32k on the 128 GB M5 Max:
 # ~15.9 GiB weights + ~2.1 GiB KV + a few GiB bank leaves ~3 GiB residual).
 RUNTIME_TRANSIENTS_BYTES = 3 * GIB
+# Cap on the observed-spike reserve (transient_reserve_bytes): one
+# pathological turn must not shrink the bank to its floor forever.
+TRANSIENT_RESERVE_CAP_BYTES = 16 * GIB
 
 # Session-bank clamps. The 48 GiB cap is the founder ruling of 2026-07-05
 # (after the 55 GB in-flight climb on a 128 GB Mac); the 1 GiB floor is the
@@ -426,7 +429,35 @@ def plan_memory(
     )
 
 
-def bank_dynamic_ceiling(plan: MemoryPlan, working_set_bytes: int) -> int:
+def transient_reserve_bytes(peak_bytes: int, active_bytes: int) -> int:
+    """Headroom to hold back from the bank for the next allocation spike.
+
+    The static RUNTIME_TRANSIENTS_BYTES (3 GiB) underestimates a deep
+    chunked prefill: measured peak-over-active reached 12.4 GiB at 73k ctx
+    (2026-08-29 receipts), so the bank kept entries while the allocator
+    peak kissed 0.992-1.001 of the Metal limit — which is what tripped the
+    warning banner (allocator trigger 0.97) on every deep coding turn.
+    Reserve what this process has actually spiked (clamped: never below
+    the static floor, capped so one pathological turn cannot starve the
+    bank forever), so entries demote to SSD BEFORE the next spike can
+    slam the ceiling.
+
+    ``peak_bytes`` is the allocator's lifetime high-water; ``active`` is
+    now. Their difference overstates the instantaneous spike when active
+    has since fallen — overstating is the safe direction here (an extra
+    SSD restore costs seconds; a ceiling kiss costs the banner plus shed
+    churn on every long turn).
+    """
+    spike = max(0, int(peak_bytes) - max(0, int(active_bytes)))
+    return max(RUNTIME_TRANSIENTS_BYTES, min(TRANSIENT_RESERVE_CAP_BYTES, spike))
+
+
+def bank_dynamic_ceiling(
+    plan: MemoryPlan,
+    working_set_bytes: int,
+    *,
+    transient_bytes: int | None = None,
+) -> int:
     """The bank budget right now, given what live requests actually hold.
 
     ``working_set_bytes`` is live KV + generation transients as measured
@@ -437,13 +468,22 @@ def bank_dynamic_ceiling(plan: MemoryPlan, working_set_bytes: int) -> int:
     This is the "guard that turns on": zero effect until commitments
     actually grow, then caches yield in eviction order — never the live
     request.
+
+    ``transient_bytes`` overrides the static spike reserve with an
+    observed one (transient_reserve_bytes) so the ceiling anticipates the
+    real prefill high-water instead of the 3 GiB guess.
     """
     if not plan.available:
         return BANK_CAP_BYTES
+    reserve = (
+        RUNTIME_TRANSIENTS_BYTES
+        if transient_bytes is None
+        else max(RUNTIME_TRANSIENTS_BYTES, int(transient_bytes))
+    )
     ceiling = (
         plan.usable_bytes
         - plan.model_weights_bytes
-        - RUNTIME_TRANSIENTS_BYTES
+        - reserve
         - max(0, int(working_set_bytes))
     )
     return max(BANK_FLOOR_BYTES, min(int(plan.bank_idle_max_bytes), ceiling))
