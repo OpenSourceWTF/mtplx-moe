@@ -1569,6 +1569,32 @@ def _draft_sampler_from_spec(spec: dict[str, Any] | None) -> Any | None:
     )
 
 
+def _greedy_coupled_draft_spec(
+    spec: dict[str, Any] | None,
+    args: Any,
+    target_temperature: float,
+) -> dict[str, Any] | None:
+    """Force the draft greedy when the target decodes greedily.
+
+    Mirror of the daemon resolver's coupling for the lanes that call
+    generate_mtpk directly and never pass through it: a stamped sampled
+    draft under a greedy target collapses acceptance by depth
+    ([79/65/42]% vs [96/87/76]% coupled on the coding suite), which reads
+    as an engine slowdown. A user-typed --draft-temperature keeps its
+    value; a None spec already mirrors the target sampler downstream
+    (_effective_draft_sampler) and needs nothing.
+    """
+    if spec is None or target_temperature > 0:
+        return spec
+    if float(spec.get("temperature", 0.0)) <= 0:
+        return spec
+    if "draft-temperature" in set(getattr(args, "_cli_flags", set()) or set()):
+        return spec
+    coupled = dict(spec)
+    coupled["temperature"] = 0.0
+    return coupled
+
+
 _DRAFT_SAMPLER_FLAG_ATTRS = {
     "draft-temperature": "draft_temperature",
     "draft-top-p": "draft_top_p",
@@ -3787,6 +3813,9 @@ def _cmd_tune_candidate(args: Any) -> int:
                 else (draft_sampler or {}).get("top_k", 20)
             ),
         }
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, float(getattr(args, "temperature", 0.6))
+    )
     result = _depth_sweep_native60(
         model=runtime_model,
         prompt_suite=prompt_suite_path(
@@ -10138,6 +10167,9 @@ def _generate_one_shot_public(
         if generation_mode == GENERATION_MODE_MTP
         else None
     )
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, float(args.temperature)
+    )
 
     max_session: Any | None = None
     thermal: dict[str, Any] | None = None
@@ -11019,6 +11051,9 @@ def _quickstart_generate(
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
         top_k=int(getattr(args, "top_k", 20)),
+    )
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, sampler.temperature
     )
     seed = int(getattr(args, "seed", 0)) + turn_index
     generation_mode = _generation_mode_from_args(args)
