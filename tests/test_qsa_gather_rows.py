@@ -11,7 +11,13 @@ MTPLX_QSA_GATHER_MAX_ROWS the indexer must keep returning the dense mask.
 import mlx.core as mx
 import pytest
 
-from mtplx.models.qwen4_exp import Attention, QSACache, TextArgs
+from mtplx.models.qwen4_exp import (
+    Attention,
+    QSACache,
+    TextArgs,
+    _qsa_gather_max_rows,
+    _qsa_gather_min_context,
+)
 
 
 @pytest.fixture()
@@ -116,3 +122,12 @@ def test_rows_gather_stays_dense_above_max_rows(attn, monkeypatch):
     step = (mx.random.normal((1, 25, 2560)) * 0.3).astype(mx.bfloat16)
     sel = attn.indexer(step, cache.offset, cache)
     assert isinstance(sel, mx.array) and sel.ndim == 4, "copy-block widths stay dense"
+
+
+def test_qsa_gather_fence_defaults():
+    """The shipped fences behind the family default (founder release call
+    2026-08-28): rows-gather engages only at KV >= 16384 and serves 2..8
+    rows. Pins the release notes' 'bit-identical dense below 16k' claim —
+    no monkeypatching, these are the values a stranger's Mac gets."""
+    assert _qsa_gather_min_context() == 16384
+    assert _qsa_gather_max_rows() == 8

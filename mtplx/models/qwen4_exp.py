@@ -948,6 +948,11 @@ def _qsa_gather_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _qsa_gather_decode_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_QSA_GATHER_DECODE") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _qsa_gather_min_context() -> int:
     """Rows-gather engages only at/past this KV length. Below it the fused
     dense SDPA over full KV is cheaper (the gather trades one shared O(T)
@@ -1286,14 +1291,16 @@ class QSAIndexer(nn.Module):
             tail_start = ((pos_start + 1) // self.ratio) * self.ratio
             return ("flash", blk_idx, tail_start)
 
-        if S == 1 and _qsa_gather_enabled():
-            # Decode gather lane (MTPLX_QSA_GATHER): return the selected
-            # TOKEN INDICES instead of a dense [T] mask so attention reads
-            # only budget+tail keys/values. Every returned token is visible
-            # by construction (complete selected blocks are < the tail
-            # start; the tail runs to the current position), so the
-            # gathered SDPA needs no mask — identical math to the masked
-            # dense product over the same visible set.
+        if S == 1 and _qsa_gather_decode_enabled():
+            # Decode gather lane (MTPLX_QSA_GATHER_DECODE, dormant opt-in —
+            # FALSIFIED d6171d2c, clean A/B/A -5.25% at 22.9k, so the
+            # rows-gather family default must never arm it): return the
+            # selected TOKEN INDICES instead of a dense [T] mask so
+            # attention reads only budget+tail keys/values. Every returned
+            # token is visible by construction (complete selected blocks
+            # are < the tail start; the tail runs to the current position),
+            # so the gathered SDPA needs no mask — identical math to the
+            # masked dense product over the same visible set.
             blk_idx = mx.sort(top_idx[0].astype(mx.int32))  # [k_eff]
             tok_from_blocks = (
                 blk_idx[:, None] * self.ratio + mx.arange(self.ratio, dtype=mx.int32)
