@@ -1373,6 +1373,13 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     /// pre-governor daemons.
     public var memoryPressureLevel: Int?
     public var memoryPlan: MemoryPlanStatus?
+    /// The guard's action ring (pressure trims, ceiling evictions). The
+    /// level alone says "the allocator ran close to its limit for a tick";
+    /// only these events say caches were actually shed — the banner must
+    /// not claim shedding without one (2026-08-28: warning-level ticks
+    /// during multi-session prefill showed the shedding banner while the
+    /// ring was empty).
+    public var memoryGuardEvents: [MemoryGuardEvent]?
 
     enum CodingKeys: String, CodingKey {
         case ts
@@ -1397,6 +1404,26 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case retrieval
         case memoryPressureLevel = "memory_pressure_level"
         case memoryPlan = "memory_plan"
+        case memoryGuardEvents = "memory_guard_events"
+    }
+}
+
+public struct MemoryGuardEvent: Codable, Equatable, Sendable {
+    public var ts: Double?
+    public var action: String?
+    public var bankEntriesEvicted: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case ts
+        case action
+        case bankEntriesEvicted = "bank_entries_evicted"
+    }
+
+    /// True when this event represents caches actually being given back —
+    /// entries evicted, or the allocation-failure shed (which always
+    /// clears the allocator cache even at zero evictions).
+    public var didShed: Bool {
+        (bankEntriesEvicted ?? 0) > 0 || action == "allocation_failure_shed"
     }
 }
 

@@ -11034,4 +11034,35 @@ final class CompletionFingerprintTests: XCTestCase {
         XCTAssertEqual(a, b)
         XCTAssertNotEqual(a, c)
     }
+
+    func testMemoryGuardShedRecencyKeysOffActualEvictions() {
+        // The banner's "shedding caches" claim requires a recent event that
+        // actually shed — a warning-level tick with an empty ring (or with
+        // zero-eviction ceiling checks) is "memory running high", not
+        // shedding (2026-08-28: the shedding copy showed on every
+        // prefill-boundary tick while the guard ring stayed empty).
+        let now = 1_000_000.0
+        XCTAssertFalse(MTPLXBackendStore.guardShedRecently(nil, now: now))
+        XCTAssertFalse(MTPLXBackendStore.guardShedRecently([], now: now))
+        // Evicting event inside the window counts.
+        let shed = MemoryGuardEvent(
+            ts: now - 30, action: "dynamic_ceiling", bankEntriesEvicted: 2
+        )
+        XCTAssertTrue(MTPLXBackendStore.guardShedRecently([shed], now: now))
+        // Same event outside the window does not.
+        let stale = MemoryGuardEvent(
+            ts: now - 500, action: "pressure_trim", bankEntriesEvicted: 3
+        )
+        XCTAssertFalse(MTPLXBackendStore.guardShedRecently([stale], now: now))
+        // Zero-eviction trims are not sheds; allocation-failure sheds are
+        // (they clear the allocator cache even at zero evictions).
+        let noop = MemoryGuardEvent(
+            ts: now - 10, action: "pressure_trim", bankEntriesEvicted: 0
+        )
+        XCTAssertFalse(MTPLXBackendStore.guardShedRecently([noop], now: now))
+        let allocShed = MemoryGuardEvent(
+            ts: now - 10, action: "allocation_failure_shed", bankEntriesEvicted: 0
+        )
+        XCTAssertTrue(MTPLXBackendStore.guardShedRecently([allocShed], now: now))
+    }
 }

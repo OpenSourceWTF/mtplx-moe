@@ -176,6 +176,12 @@ public final class MTPLXBackendStore: ObservableObject {
     /// governor-aware daemon reports.
     @Published public private(set) var memoryPressureLevel: Int = 0
     @Published public private(set) var memoryPlan: MemoryPlanStatus?
+    /// True when the guard's event ring shows caches actually shed within
+    /// the recency window — the banner's "shedding" claim keys off this,
+    /// never off the pressure level alone (a warning-level tick during a
+    /// prefill spike sheds nothing: the guard is edge-triggered, defers
+    /// while busy, and protects the active session).
+    @Published public private(set) var memoryGuardRecentShed: Bool = false
     @Published public private(set) var settings: MutableSettings?
     @Published public private(set) var scheduler: DynamicObject?
     @Published public private(set) var prefillStatus: DynamicObject?
@@ -3697,6 +3703,10 @@ public final class MTPLXBackendStore: ObservableObject {
         thermal = snapshot.thermal
         memoryPressureLevel = snapshot.memoryPressureLevel ?? 0
         memoryPlan = snapshot.memoryPlan
+        memoryGuardRecentShed = Self.guardShedRecently(
+            snapshot.memoryGuardEvents,
+            now: Date().timeIntervalSince1970
+        )
         if daemonState == .running || supervisor.isRunning() {
             adoptDaemonSettings(snapshot.settings, persist: true)
         } else {
@@ -3882,6 +3892,23 @@ public final class MTPLXBackendStore: ObservableObject {
         guard now - lastProgressPublishS >= intervalS else { return false }
         lastProgressPublishS = now
         return true
+    }
+
+    /// A shed within this window keeps the banner's "shedding" copy honest
+    /// across snapshot polls; past it, an elevated level with a quiet ring
+    /// downgrades to the tight-memory copy.
+    nonisolated static let memoryGuardShedRecencyS: Double = 120
+
+    nonisolated static func guardShedRecently(
+        _ events: [MemoryGuardEvent]?,
+        now: Double
+    ) -> Bool {
+        guard let events, !events.isEmpty else { return false }
+        return events.contains { event in
+            guard event.didShed else { return false }
+            guard let ts = event.ts else { return false }
+            return now - ts <= memoryGuardShedRecencyS
+        }
     }
 
     private static func hasActivePrefill(_ request: InFlightRequest) -> Bool {

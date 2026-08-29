@@ -466,12 +466,18 @@ struct ThermalRuleBanner: View {
 
 // MARK: - MemoryGuardBanner
 
-/// Memory governor banner (issue #305). Shows while the daemon reports
-/// system/allocator memory pressure: the engine is already shedding its
-/// caches — this tells the user what that means and, when the plan knows
-/// the context window is overcommitted for this Mac, names the fix.
+/// Memory governor banner (issue #305). The pressure LEVEL alone only says
+/// the allocator ran close to its limit for a tick — the guard is
+/// edge-triggered, defers while busy, and protects the active session, so
+/// warning ticks during prefill spikes usually shed nothing. The banner
+/// claims shedding only when the guard's event ring shows a recent shed
+/// (2026-08-28: the shedding copy showed on every prefill-boundary tick
+/// with an empty ring, teaching the user that the banner CAUSES the
+/// acceptance-register dips it merely coincides with). Critical always
+/// acts, so its copy is unconditional.
 struct MemoryGuardBanner: View {
     let pressureLevel: Int
+    let recentShed: Bool
     let plan: MemoryPlanStatus?
 
     var body: some View {
@@ -483,13 +489,9 @@ struct MemoryGuardBanner: View {
                     .font(.title3)
                     .foregroundStyle(tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(
-                        critical
-                            ? "Critical memory pressure"
-                            : "Memory pressure — engine shedding caches"
-                    )
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(tint)
+                    Text(title(critical: critical))
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(tint)
                     Text(message(critical: critical))
                         .font(.caption)
                         .foregroundStyle(Brand.textHighlight.opacity(0.75))
@@ -508,10 +510,22 @@ struct MemoryGuardBanner: View {
         }
     }
 
+    private func title(critical: Bool) -> String {
+        if critical { return "Critical memory pressure" }
+        return recentShed
+            ? "Memory pressure — engine shedding caches"
+            : "Memory running high"
+    }
+
     private func message(critical: Bool) -> String {
-        var text = critical
-            ? "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD."
-            : "Warm sessions are being demoted to SSD ahead of any swap. Turns may restore from disk (seconds) instead of RAM."
+        var text: String
+        if critical {
+            text = "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD."
+        } else if recentShed {
+            text = "Warm sessions are being demoted to SSD ahead of any swap. Turns may restore from disk (seconds) instead of RAM."
+        } else {
+            text = "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here."
+        }
         if let plan,
            plan.contextOvercommitted == true,
            let resolved = plan.contextWindowResolved,
