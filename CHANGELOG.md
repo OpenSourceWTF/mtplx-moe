@@ -181,6 +181,17 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **The memory governor's ceiling never evicts the live session's cache.**
+  The dynamic bank ceiling subtracts an instantaneous working-set reading,
+  so a deep prefill's transient allocator spike read as a standing
+  commitment: on a 93k-token coding session the ceiling walked the session
+  bank to zero bytes mid-request, evicting the in-flight session's own
+  prefix entries, and every following agent turn re-prefilled from scratch
+  (TTFT 54 to 57 s, prefill 909 down to 175 tok/s). The ceiling now
+  squeezes idle sessions only; the active session's prefix chain survives
+  even when the bank stays above target. Real macOS or allocator pressure
+  keeps its take-anything eviction semantics, so the 48 GB swap-death
+  protection is unchanged.
 - **Flash-Next serves coding agents at its official sampler.** The app's
   OpenCode and Hermes launch presets pre-fill the Qwen3.6-era coding
   sampler (temperature 0.6), and the Flash-Next model defaults left those
