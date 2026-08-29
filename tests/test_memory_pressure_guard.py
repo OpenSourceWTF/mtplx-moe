@@ -18,9 +18,11 @@ class FakeBank:
         self.total_nbytes = total
         self.max_bytes = max_bytes
         self.calls = []
+        self.protect_active_calls = []
 
-    def shrink_to_bytes(self, target, *, reason):
+    def shrink_to_bytes(self, target, *, reason, protect_active=False):
         self.calls.append((target, reason))
+        self.protect_active_calls.append(protect_active)
         evicted = 1 if self.total_nbytes > target else 0
         self.total_nbytes = min(self.total_nbytes, target)
         return evicted
@@ -143,11 +145,15 @@ class FakeDynamicBank(FakeBank):
 def test_dynamic_ceiling_enforced_every_tick_even_at_level_normal(monkeypatch):
     # A long-context prefill grows KV for minutes with no put() running;
     # the loop must walk the bank down to the ceiling without waiting for
-    # a macOS pressure edge.
+    # a macOS pressure edge — but with the active session protected: the
+    # ceiling reads the working set instantaneously, and a prefill spike
+    # must never evict the live session's own prefix chain (93k receipt
+    # 2026-08-28: bank walked to 0 mid-request, 54-57 s TTFTs after).
     bank = FakeDynamicBank(total=8 << 30, max_bytes=8 << 30, ceiling=2 << 30)
     state = make_state(bank)
     run_one_tick(state, level=1, monkeypatch=monkeypatch)
     assert bank.calls == [(2 << 30, "dynamic_ceiling")]
+    assert bank.protect_active_calls == [True]
     events = list(state.dashboard.memory_guard_events)
     assert events and events[-1]["action"] == "dynamic_ceiling"
 
@@ -179,6 +185,8 @@ def test_allocator_pressure_escalates_before_macos(monkeypatch):
     )
     run_one_tick(state, level=1, monkeypatch=monkeypatch)
     assert bank.calls == [(4 << 30, "memory_pressure_warning")]
+    # Real pressure keeps take-anything semantics — no active protection.
+    assert bank.protect_active_calls == [False]
     assert state.dashboard.last_memory_pressure_level == 2
     events = list(state.dashboard.memory_guard_events)
     assert events and events[-1]["level_source"] == "allocator"
@@ -270,3 +278,53 @@ def test_bank_shrink_to_bytes_evicts_lru_first():
     evicted = bank.shrink_to_bytes(500)
     assert evicted == 2
     assert [e.session_id for e in bank._entries.values()] == ["new"]
+
+
+def test_bank_shrink_protect_active_never_evicts_the_live_session():
+    """Dynamic-ceiling semantics: idle sessions yield, the in-flight
+    session's prefix chain survives even when the bank stays above target
+    (2026-08-28 receipt: a 93k OpenCode session's own entries were walked
+    to 0 bytes mid-request; the next turns re-prefilled for 54-57 s)."""
+    import time as _time
+
+    from mtplx.session_bank import CacheSnapshot, SessionBank, SessionBankEntry
+
+    bank = SessionBank(max_entries=8, max_bytes=1 << 30, per_session_max_bytes=1 << 30)
+
+    def entry(name, session, last_access, nbytes):
+        return SessionBankEntry(
+            token_ids=(hash(name) % 1000, 2, 3),
+            token_hash=name,
+            model_path="/m",
+            mtp_enabled=False,
+            hidden_variant=None,
+            cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+            logits=None,
+            hidden=None,
+            cache_ref=None,
+            nbytes=nbytes,
+            session_id=session,
+            last_access_s=last_access,
+        )
+
+    fabricated = [
+        entry("live-a", "ses_live", last_access=1.0, nbytes=400),
+        entry("live-b", "ses_live", last_access=2.0, nbytes=400),
+        entry("idle-a", "ses_idle", last_access=3.0, nbytes=400),
+    ]
+    bank._entries = {e.token_ids: e for e in fabricated}
+    bank._session_last_active = {"ses_live": _time.monotonic()}
+
+    evicted = bank.shrink_to_bytes(0, reason="dynamic_ceiling", protect_active=True)
+
+    # Only the idle session's entry went; the live chain survives above
+    # target, so the bank ends over the ceiling by design.
+    assert evicted == 1
+    remaining = {e.session_id for e in bank._entries.values()}
+    assert remaining == {"ses_live"}
+    assert bank.total_nbytes == 800
+
+    # Real pressure (protect_active omitted) still takes everything.
+    evicted = bank.shrink_to_bytes(0, reason="memory_pressure_critical")
+    assert evicted == 2
+    assert bank.total_nbytes == 0

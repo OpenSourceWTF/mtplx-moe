@@ -16459,8 +16459,17 @@ async def _memory_pressure_loop(
                 try:
                     ceiling = int(bank.effective_max_bytes())
                     if int(bank.total_nbytes) > ceiling + 256 * 1024**2:
+                        # protect_active: the ceiling reads the working set
+                        # instantaneously, so a deep prefill's transient
+                        # spike must squeeze idle sessions' cache, never the
+                        # in-flight session's own prefix chain (93k receipt
+                        # 2026-08-28: bank walked to 0 mid-request, 54-57 s
+                        # TTFTs after). Real macOS/allocator pressure below
+                        # keeps take-anything semantics.
                         dyn_evicted = bank.shrink_to_bytes(
-                            ceiling, reason="dynamic_ceiling"
+                            ceiling,
+                            reason="dynamic_ceiling",
+                            protect_active=True,
                         )
                         if dyn_evicted:
                             _record_guard_event(

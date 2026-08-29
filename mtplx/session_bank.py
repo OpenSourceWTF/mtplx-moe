@@ -2267,20 +2267,45 @@ class SessionBank:
             )
             self._evict_entry(victim, reason=reason)
 
-    def shrink_to_bytes(self, target_bytes: int, *, reason: str = "memory_pressure") -> int:
+    def shrink_to_bytes(
+        self,
+        target_bytes: int,
+        *,
+        reason: str = "memory_pressure",
+        protect_active: bool = False,
+    ) -> int:
         """Evict least-recently-used entries until the bank fits the target.
 
         The memory-pressure guard calls this when macOS reports system-wide
         pressure (issue #144: a 64 GB Mac swapping 60 GB while the bank sat
         on its full budget). Returns the number of entries evicted.
+
+        ``protect_active=True`` (the dynamic-ceiling caller) never evicts an
+        active session's entries — the bank may stay above the target. The
+        ceiling subtracts an instantaneous working-set reading, so a deep
+        prefill's transient spike reads as a standing commitment; evicting
+        the live session's own prefix chain to absorb it trades a
+        seconds-long spike for a 50+ second re-prefill on the very next turn
+        (2026-08-28 receipt: a 93k OpenCode session's bank was walked to 0
+        bytes mid-request, TTFT 54-57 s after). Real macOS pressure keeps
+        take-anything semantics — active sessions merely sort last there.
         """
 
         evicted = 0
         target = max(0, int(target_bytes))
         active = self._active_session_ids()
         while self._entries and self.total_nbytes > target:
+            candidates = self._entries.values()
+            if protect_active and active:
+                candidates = [
+                    entry
+                    for entry in candidates
+                    if entry.session_id not in active
+                ]
+                if not candidates:
+                    break
             victim = min(
-                self._entries.values(),
+                candidates,
                 # Real memory pressure may take anything, but active sessions
                 # go last so the responder doesn't force a mid-run re-prefill
                 # while idle entries were available.
