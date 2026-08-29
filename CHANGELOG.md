@@ -191,7 +191,9 @@ All notable user-facing changes to MTPLX. The format is based on
   (`MTPLX_CONTEXT_COPY_PROBATION_K`) until the turn's acceptance EMA
   proves the content pays, and the suspension arms one round earlier.
   Long-context re-emission — where the lane is a measured +16.7% — opens
-  to full blocks by its third round and keeps its win.
+  to full blocks by its third round and keeps its win. The batched verify
+  lane (Flash-Next's copy mechanic, above) carries the identical
+  probation contract.
 - **SSD spills no longer fire mid-turn: the writer's foreground pause now
   outlasts a long coding turn.** The writer already stood down while a
   request was in flight, but its liveness bound was 60 s — shorter than a

@@ -9539,7 +9539,15 @@ def generate_mtpk(
             _cb_pos, _cb_ext = ccopy_index.find(_cb_hist, max_pos=len(prompt_ids))
             _cb_block: list[int] = []
             if _cb_pos is not None and _cb_ext >= ccopy_min_ext:
-                _cb_klen = block_for_ext(_cb_ext, ccopy_k)
+                # Same probation contract as the capture lane: full-size
+                # blocks only after the acceptance EMA proves this content
+                # pays (>=2 sampled rounds holding the 0.5 starting EMA).
+                _cb_k_now = (
+                    ccopy_k
+                    if (ccopy_seen >= 2 and ccopy_ema >= 0.5)
+                    else ccopy_probation_k
+                )
+                _cb_klen = block_for_ext(_cb_ext, _cb_k_now)
                 _cb_block = [int(t) for t in prompt_ids[_cb_pos:_cb_pos + _cb_klen]]
                 _cb_block = _cb_block[: max(1, max_tokens - len(tokens))]
                 if constraint is not None:
