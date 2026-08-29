@@ -40,9 +40,14 @@ STYLE = (
     "background:transparent;color:#1d1d1f}"
     "h1,h2{line-height:1.2}"
     "code{background:#f2f2f4;padding:0 .25em;border-radius:4px}"
+    "table{border-collapse:collapse;margin:1em 0}"
+    "th,td{border:1px solid rgba(0,0,0,.18);padding:.35em .65em}"
+    "th{background:#f2f2f4;text-align:left}"
     "@media (prefers-color-scheme:dark){"
     "body{color:#f5f5f7}"
     "code{background:rgba(255,255,255,.14)}"
+    "th,td{border-color:rgba(255,255,255,.24)}"
+    "th{background:rgba(255,255,255,.08)}"
     "}"
 )
 
