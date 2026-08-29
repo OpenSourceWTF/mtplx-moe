@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import gc
 from types import SimpleNamespace
 
+import mlx.core as mx
+import numpy as np
 import pytest
+from mlx_lm.models.cache import ArraysCache
 
 
 class _TailMlp:
@@ -69,6 +73,7 @@ def _runtime():
         )
         for _ in range(12)
     ]
+    layers[1].ple = SimpleNamespace()
     model = SimpleNamespace(
         language_model=SimpleNamespace(model=SimpleNamespace(layers=layers))
     )
@@ -84,6 +89,234 @@ def test_installer_binds_exact_qwen4_capture_route():
 
     assert report == {"installed": True, "linear_layers": 36, "rows": 2}
     assert runtime.forward_ar_capture.__func__.__name__ == "_forward_ar_capture"
+    assert (
+        runtime.prepare_compiled_verify_aux.__func__.__name__
+        == "_prepare_compiled_verify_aux"
+    )
+
+
+def test_installer_can_construct_the_corrected_prefix_route_without_prefetch(
+    monkeypatch,
+):
+    from mtplx.qwen4_capture import install_qwen4_capture_route
+
+    monkeypatch.setenv("MTPLX_QWEN4_PLE_PREFETCH", "0")
+    runtime = _runtime()
+
+    install_qwen4_capture_route(runtime, config=_config())
+
+    assert not hasattr(runtime, "prefetch_compiled_verify_aux")
+    assert runtime._mtplx_capture_extra_layout == (
+        (1, ("ple_conv_full", "ple_context_full")),
+    )
+
+
+def test_compiled_ple_aux_is_prepared_without_mutating_context():
+    from mtplx.qwen4_capture import _prepare_compiled_verify_aux
+
+    calls = []
+
+    def embedding(ids, previous):
+        calls.append((ids, previous))
+        return mx.ones((1, 2, 8), dtype=mx.bfloat16)
+
+    inner = SimpleNamespace(
+        ple_layers=[1],
+        args=SimpleNamespace(ngram_size=3, eos_token_id=0),
+        layers=[None, SimpleNamespace(ple=SimpleNamespace(ple_embedding=embedding))],
+    )
+    runtime = SimpleNamespace(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=inner))
+    )
+    previous = mx.array([[7, 8]], dtype=mx.int32)
+    cache = [None, [None, None, None, previous]]
+    ids = mx.array([[9, 10]], dtype=mx.int32)
+
+    result = _prepare_compiled_verify_aux(runtime, ids, cache)
+
+    assert calls == [(ids, previous)]
+    assert result.shape == (1, 2, 8)
+    assert cache[1][3] is previous
+
+
+def test_compiled_ple_prefetches_primary_row_before_draft_row_materializes():
+    from mtplx.qwen4_capture import (
+        _prefetch_compiled_verify_aux,
+        _prepare_compiled_verify_aux,
+    )
+
+    calls: list[tuple] = []
+    class Marker:
+        def cancel(self):
+            calls.append(("cancel",))
+            return True
+
+    marker = Marker()
+
+    class Geometry:
+        eos_token_id = 0
+
+        def plan_incremental(self, ids, prior_context=None):
+            host = np.asarray(ids, dtype=np.int64)
+            calls.append(("plan", host.tolist(), prior_context))
+            token = int(host[0, 0])
+            return (
+                np.array([[[10 * token, 10 * token + 1]]], dtype=np.int64),
+                ((int(prior_context[0][-1]), token),),
+            )
+
+    class Rows:
+        def prefetch_prevalidated_rows(self, rows):
+            calls.append(("prefetch", rows))
+            return marker
+
+        def materialize_prevalidated_rows(
+            self, rows, *, logical_shape, prefetched
+        ):
+            calls.append(("materialize", rows, logical_shape, prefetched))
+            return mx.ones((*logical_shape, 8), dtype=mx.bfloat16)
+
+    rows = Rows()
+    embedding = SimpleNamespace(ngram_embedding=rows)
+    inner = SimpleNamespace(
+        ple_layers=[1],
+        args=SimpleNamespace(ngram_size=3, eos_token_id=0),
+        layers=[None, SimpleNamespace(ple=SimpleNamespace(ple_embedding=embedding))],
+    )
+    runtime = SimpleNamespace(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=inner)),
+        _mtplx_qwen4_ngram_geometry=Geometry(),
+    )
+    previous = mx.array([[7, 8]], dtype=mx.int32)
+    cache = [None, [None, None, None, previous]]
+
+    prefetched = _prefetch_compiled_verify_aux(
+        runtime, primary=9, prior_context=(7, 8)
+    )
+    result = _prepare_compiled_verify_aux(
+        runtime,
+        mx.array([[9, 10]], dtype=mx.int32),
+        cache,
+        prefetched=prefetched,
+    )
+
+    assert calls == [
+        ("plan", [[9]], ((7, 8),)),
+        ("prefetch", (90, 91)),
+        ("plan", [[10]], ((8, 9),)),
+        ("materialize", (90, 91, 100, 101), (1, 2, 2), marker),
+    ]
+    assert result.shape == (1, 2, 16)
+    assert cache[1][3] is previous
+
+
+def test_unconsumed_ple_prefetch_cancels_when_cycle_owner_unwinds():
+    from mtplx.qwen4_capture import _CompiledAuxPrefetch
+
+    cancellations: list[bool] = []
+
+    class Future:
+        def cancel(self):
+            cancellations.append(True)
+            return True
+
+    prefetched = _CompiledAuxPrefetch(
+        rows=(1, 2),
+        next_context=((7, 8),),
+        future=Future(),
+    )
+
+    del prefetched
+    gc.collect()
+
+    assert cancellations == [True]
+
+
+def test_capture_commit_restores_ple_state_to_the_accepted_prefix():
+    from mtplx.gdn_capture import commit_captured_prefix
+
+    entry = ArraysCache(4)
+    entry[0] = mx.zeros((1, 3, 1), dtype=mx.float32)
+    entry[1] = mx.zeros((1, 1, 1, 1), dtype=mx.float32)
+    entry[2] = mx.full((1, 2, 1), 99, dtype=mx.float32)
+    entry[3] = mx.array([[99, 99]], dtype=mx.int32)
+    capture = {
+        "conv_states": mx.array(
+            [[[[1.0]], [[2.0]], [[3.0]]], [[[4.0]], [[5.0]], [[6.0]]]]
+        ).reshape(1, 2, 3, 1),
+        "states": mx.array([1.0, 2.0]).reshape(1, 2, 1, 1, 1),
+        "ple_conv_full": mx.array([10.0, 11.0, 20.0, 21.0]).reshape(1, 4, 1),
+        "ple_context_full": mx.array([[7, 8, 9, 10]], dtype=mx.int32),
+    }
+
+    committed = commit_captured_prefix(
+        [entry], {0: capture}, keep_tokens=1, verified_tokens=2
+    )
+    mx.eval(*entry.cache)
+
+    assert committed is True
+    np.testing.assert_array_equal(np.asarray(entry[2]).reshape(-1), [11.0, 20.0])
+    np.testing.assert_array_equal(np.asarray(entry[3]).reshape(-1), [8, 9])
+
+
+def test_ple_capture_helper_matches_stock_arithmetic_and_state():
+    from mtplx.models.qwen4_omlx import PLELayer
+    from mtplx.qwen4_capture import _qwen4_ple_with_capture
+
+    args = SimpleNamespace(
+        hidden_size=4,
+        hc_count=2,
+        ple_embed_dim=4,
+        ple_conv_kernel_size=2,
+        ngram_size=3,
+        heads_per_ngram=1,
+        eos_token_id=0,
+        ngram_vocab_size_base=17,
+        make_ngram_vocab_size_divisible_by=8,
+        split_ngram_parts=1,
+        vocab_size=32,
+        seed=7,
+        rms_norm_eps=1e-6,
+    )
+    ple = PLELayer(args, ple_layer_index=0, layer_index=1)
+    hidden = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8) / 16
+    embedding = mx.arange(8, dtype=mx.float32).reshape(1, 2, 4) / 8
+    ids = mx.array([[9, 10]], dtype=mx.int32)
+    previous = mx.array([[7, 8]], dtype=mx.int32)
+    mask = mx.array([[True, False]])
+    initial_state = mx.arange(24, dtype=mx.float32).reshape(1, 3, 8) / 24
+    stock_cache = [None, None, initial_state, previous]
+    capture_cache = [None, None, initial_state, previous]
+
+    stock = ple(
+        hidden,
+        ids,
+        previous,
+        stock_cache,
+        conv_mask=mask,
+        precomputed_embedding=embedding,
+    )
+    captured, full = _qwen4_ple_with_capture(
+        ple,
+        hidden,
+        ids,
+        previous,
+        capture_cache,
+        conv_mask=mask,
+        precomputed_embedding=embedding,
+    )
+    mx.eval(stock, captured, full, stock_cache[2], capture_cache[2])
+
+    np.testing.assert_allclose(np.asarray(captured), np.asarray(stock), rtol=0, atol=0)
+    np.testing.assert_allclose(
+        np.asarray(capture_cache[2]), np.asarray(stock_cache[2]), rtol=0, atol=0
+    )
+    np.testing.assert_allclose(
+        np.asarray(full[:, -ple.short_conv_state_len :, :]),
+        np.asarray(stock_cache[2]),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_installer_selects_constructed_m2_hyper_route():

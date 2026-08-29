@@ -30,6 +30,9 @@ class _Cache:
     def acquire_prevalidated_rows(self, _requested):
         return self.lease
 
+    def acquire_prevalidated_rows_async(self, _requested):
+        return SimpleNamespace(cancel=lambda: True)
+
 
 def test_m2_rows_do_not_force_an_internal_mlx_eval(monkeypatch):
     cache = _Cache()
@@ -60,3 +63,36 @@ def test_m2_rows_do_not_force_an_internal_mlx_eval(monkeypatch):
     np.testing.assert_array_equal(
         np.asarray(output.astype(mx.float32)), expected_host
     )
+
+
+def test_prefetched_rows_overlap_io_then_release_the_prefetch_pin(monkeypatch):
+    calls: list[tuple] = []
+
+    class Future:
+        def cancel(self):
+            calls.append(("cancel",))
+            return True
+
+    cache = _Cache()
+    future = Future()
+
+    def acquire_async(requested):
+        calls.append(("async", requested))
+        return future
+
+    def acquire(requested):
+        calls.append(("sync", requested))
+        return cache.lease
+
+    cache.acquire_prevalidated_rows_async = acquire_async
+    cache.acquire_prevalidated_rows = acquire
+    rows = AffineQ4NGramRows(cache, row_width=32)
+
+    prefetched = rows.prefetch_prevalidated_rows((0,))
+    output = rows.materialize_prevalidated_rows(
+        (0, 1), logical_shape=(1, 2, 1), prefetched=prefetched
+    )
+
+    assert output.shape == (1, 2, 1, 32)
+    assert calls == [("async", (0,)), ("sync", (0, 1)), ("cancel",)]
+    assert cache.lease.released is True

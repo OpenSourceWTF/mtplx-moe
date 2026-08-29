@@ -3154,6 +3154,20 @@ def commit_captured_prefix(
             from .cache_state import replace_recurrent_cache_state
 
             replace_recurrent_cache_state(entry, [conv_state, gdn_state])
+            ple_conv_full = capture.get("ple_conv_full")
+            ple_context_full = capture.get("ple_context_full")
+            if ple_conv_full is not None and ple_context_full is not None:
+                ple_conv_len = int(entry[2].shape[1])
+                ple_context_len = int(entry[3].shape[1])
+                ple_start = capture_index + 1
+                entry[2] = mx.contiguous(
+                    ple_conv_full[:, ple_start : ple_start + ple_conv_len, :]
+                )
+                entry[3] = mx.contiguous(
+                    ple_context_full[
+                        :, ple_start : ple_start + ple_context_len
+                    ]
+                )
         elif trim_tokens and hasattr(entry, "is_trimmable") and entry.is_trimmable():
             entry.trim(trim_tokens)
     return True

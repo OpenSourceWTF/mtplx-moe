@@ -159,6 +159,12 @@ def _rope_partial(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     return mx.concatenate([xr, xp], axis=-1) if xp.shape[-1] else xr
 
 
+def _positions_from_offset(offset: int | mx.array, rows: int) -> mx.array:
+    """Build positions without converting an array offset to a host scalar."""
+
+    return mx.arange(int(rows), dtype=mx.int32) + offset
+
+
 class RotaryEmbedding:
     def __init__(self, dim: int, base: float):
         self.dim = dim
@@ -241,6 +247,10 @@ class QSAIndexer(nn.Module):
 
         if cache is not None:
             raw_k = cache.update(raw_k)
+            if getattr(cache, "fixed_capacity", False):
+                return self._select_blocks_fixed_capacity(
+                    q, raw_k, rope, cache, offset
+                )
         kv_len = raw_k.shape[1]
 
         # No sparsification possible: every visible token fits in the budget, so the
@@ -276,7 +286,7 @@ class QSAIndexer(nn.Module):
             else:
                 pooled = cache.pooled_keys
 
-        q_pos = mx.arange(offset, offset + S)
+        q_pos = _positions_from_offset(offset, S)
         cos_q, sin_q = rope(q_pos[None, :])
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
@@ -303,6 +313,68 @@ class QSAIndexer(nn.Module):
             q_pos=q_pos,
         )
 
+    def _select_blocks_fixed_capacity(self, q, raw_k, rope, cache, offset):
+        """Select from fixed banks while logical lengths remain tensor state."""
+
+        B, S = int(q.shape[0]), int(q.shape[1])
+        ratio = self.compress_ratio
+        logical_length = cache.offset
+        pooled_at = cache.pooled_offset
+        completed_blocks = logical_length // ratio
+
+        # Exact M=2 advances across at most one four-token pool boundary. The
+        # candidate block is always computed, but becomes visible and mutates
+        # the derived bank only when the tensor logical length completed it.
+        raw_block = mx.slice(
+            raw_k,
+            pooled_at * ratio,
+            axes=(1,),
+            slice_size=(B, ratio, self.head_dim),
+        )
+        pooled_new = self.k_layernorm(
+            raw_block.astype(mx.float32).mean(axis=1).astype(raw_k.dtype)
+        )[:, None, :]
+        block_start = (pooled_at * ratio).reshape(1, 1)
+        cos_k, sin_k = rope(block_start)
+        pooled_new = _rope_partial(pooled_new, cos_k, sin_k)
+        pooled_candidate = mx.slice_update(
+            cache.pooled_keys, pooled_new, pooled_at, axes=(1,)
+        )
+        completed_new_block = completed_blocks > pooled_at
+        cache.cache[2] = mx.where(
+            completed_new_block, pooled_candidate, cache.pooled_keys
+        )
+        cache.cache[3] = mx.where(
+            completed_new_block, pooled_at + 1, pooled_at
+        )
+        pooled = cache.pooled_keys
+
+        n_blocks = int(pooled.shape[1])
+        block_starts = mx.arange(n_blocks) * ratio
+        q_pos = offset + mx.arange(S)
+        cos_q, sin_q = rope(q_pos[None, :])
+        q = self.q_layernorm(q)
+        q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
+        scores = mx.einsum(
+            "bshd,bnd->bsnh", q.astype(mx.float32), pooled.astype(mx.float32)
+        )
+        scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
+        block_end = block_starts + ratio - 1
+        visible = (block_end[None, None, :] <= q_pos[None, :, None]) & (
+            block_starts[None, None, :] < logical_length
+        )
+        scores = mx.where(visible, scores, -mx.inf)
+        k = min(self.block_topk, n_blocks)
+        top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]
+        top_visible = mx.take_along_axis(visible, top, axis=-1)
+        return _QSASelectedBlocks(
+            kv_len=logical_length,
+            n_blocks=n_blocks,
+            top=top,
+            top_visible=top_visible,
+            q_pos=q_pos,
+        )
+
     def select_projected(self, qk, rope, cache, offset: int) -> Optional[mx.array]:
         B, S, _ = qk.shape
         selected = self._select_blocks(qk, rope, cache, offset)
@@ -321,12 +393,17 @@ class QSAIndexer(nn.Module):
         # own incomplete visible block exactly; a block that is complete only
         # relative to a later query must not disappear from an earlier query.
         keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
-        tail = selected.kv_len - selected.n_blocks * self.compress_ratio
-        if tail:
-            keep = mx.concatenate(
-                [keep, mx.zeros((B, S, tail), dtype=mx.bool_)], axis=-1
-            )
-        token_positions = mx.arange(selected.kv_len)[None, None, :]
+        if getattr(cache, "fixed_capacity", False):
+            mask_capacity = int(cache.attention_capacity)
+            keep = keep[..., :mask_capacity]
+        else:
+            mask_capacity = selected.kv_len
+            tail = mask_capacity - selected.n_blocks * self.compress_ratio
+            if tail:
+                keep = mx.concatenate(
+                    [keep, mx.zeros((B, S, tail), dtype=mx.bool_)], axis=-1
+                )
+        token_positions = mx.arange(mask_capacity)[None, None, :]
         visible_length = selected.q_pos[None, :, None] + 1
         partial_start = (
             visible_length // self.compress_ratio
@@ -502,7 +579,7 @@ class Attention(nn.Module):
         )
         v = v_proj.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        cos, sin = rope(mx.arange(offset, offset + S)[None])
+        cos, sin = rope(_positions_from_offset(offset, S)[None])
         cos, sin = cos[:, None], sin[:, None]
         q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 
@@ -886,8 +963,13 @@ class PLELayer(nn.Module):
         prev_ctx: mx.array,
         cache,
         conv_mask: mx.array | None = None,
+        precomputed_embedding: mx.array | None = None,
     ) -> mx.array:
-        emb = self.ple_embedding(ids, prev_ctx).astype(hidden.dtype)
+        emb = (
+            self.ple_embedding(ids, prev_ctx)
+            if precomputed_embedding is None
+            else precomputed_embedding
+        ).astype(hidden.dtype)
         key = self.norm_key(self.key_proj(emb))
         key = key.reshape(*key.shape[:-1], self.hc, self.d)
         value = self.value_proj(emb)

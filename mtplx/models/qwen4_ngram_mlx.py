@@ -35,6 +35,7 @@ class AffineQ4NGramRows(nn.Module):
 
         self._cache = cache
         self._acquire_rows = cache.acquire_prevalidated_rows
+        self._prefetch_rows = cache.acquire_prevalidated_rows_async
         self._arena_rows = arena.reshape((-1, row_bytes))
         self._arena_host_rows = np.frombuffer(
             memoryview(arena), dtype=np.uint8
@@ -43,12 +44,29 @@ class AffineQ4NGramRows(nn.Module):
         self._weight_bytes = weight_bytes
         self._parameter_bytes = parameter_bytes
 
-    def __call__(self, row_ids: mx.array) -> mx.array:
-        logical_shape = tuple(int(dimension) for dimension in row_ids.shape)
-        host_rows = np.asarray(row_ids).reshape(-1)
-        requested = tuple(int(row_id) for row_id in host_rows)
-        lease = self._acquire_rows(requested)
+    def prefetch_prevalidated_rows(self, requested: tuple[int, ...]) -> Any:
+        """Begin one construction-proven row acquisition without a host wait."""
+
+        return self._prefetch_rows(requested)
+
+    def materialize_prevalidated_rows(
+        self,
+        requested: tuple[int, ...],
+        *,
+        logical_shape: tuple[int, ...],
+        prefetched: Any | None = None,
+    ) -> mx.array:
+        """Materialize exact rows, consuming an optional overlapping prefetch."""
+
+        lease = None
         try:
+            lease = self._acquire_rows(requested)
+            if prefetched is not None:
+                # The complete lease now pins every requested row, including
+                # the prefetched prefix. Drop the prefetch request's duplicate
+                # pins before copying; an in-flight read is shared by ticket.
+                prefetched.cancel()
+                prefetched = None
             if len(logical_shape) == 3 and logical_shape[1] == 2:
                 # The fixed verifier M=2 route owns a tiny packed-row copy.
                 # Once copied, cache slots can be unpinned while dequantize
@@ -86,8 +104,19 @@ class AffineQ4NGramRows(nn.Module):
                 mx.eval(output)
             return output
         finally:
+            if prefetched is not None:
+                prefetched.cancel()
             if lease is not None:
                 lease.release()
+
+    def __call__(self, row_ids: mx.array) -> mx.array:
+        logical_shape = tuple(int(dimension) for dimension in row_ids.shape)
+        host_rows = np.asarray(row_ids).reshape(-1)
+        requested = tuple(int(row_id) for row_id in host_rows)
+        return self.materialize_prevalidated_rows(
+            requested,
+            logical_shape=logical_shape,
+        )
 
     def detach(self, cache: Any) -> None:
         """Drop every arena/cache reference after construction-owned unbinding."""
@@ -96,6 +125,7 @@ class AffineQ4NGramRows(nn.Module):
             raise ValueError("Qwen4 n-gram provider is bound to a different cache")
         self._cache = None
         self._acquire_rows = None
+        self._prefetch_rows = None
         self._arena_rows = None
         self._arena_host_rows = None
 

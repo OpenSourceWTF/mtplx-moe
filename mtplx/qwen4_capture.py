@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+import math
+import os
 from types import MethodType
 from typing import Any
+import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .gdn_capture import (
     _linear_gated_delta_from_conv_headquarter_kernel,
@@ -17,6 +22,33 @@ from .models.qwen4_omlx import create_attention_mask, create_ssm_mask
 
 class Qwen4CaptureConfigError(RuntimeError):
     """The exact two-row Qwen4 capture route cannot be installed."""
+
+
+@dataclass(frozen=True)
+class _CompiledAuxPrefetch:
+    rows: tuple[int, ...]
+    next_context: tuple[tuple[int, int], ...]
+    future: Any
+    _finalizer: Any = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # The row cache owns futures strongly while they pin rows. Keep the
+        # cycle owner separate so unwinding before verify deterministically
+        # cancels the request instead of leaving it registered forever.
+        object.__setattr__(
+            self,
+            "_finalizer",
+            weakref.finalize(self, self.future.cancel),
+        )
+
+    def cancel(self) -> None:
+        self._finalizer()
+
+    def transfer(self) -> Any:
+        """Transfer cancellation ownership to the materialization boundary."""
+
+        self._finalizer.detach()
+        return self.future
 
 
 def _make_qwen4_norm_gate_kernel():
@@ -250,6 +282,7 @@ def _qwen4_forward_with_capture(
     *,
     cache: list[Any],
     return_hidden: bool,
+    compiled_aux: mx.array | None = None,
 ):
     text_model = model.language_model
     inner = text_model.model
@@ -283,20 +316,32 @@ def _qwen4_forward_with_capture(
             if layer_cache is not None and hasattr(layer_cache, "indexer")
             else None
         )
+        ple_capture = None
         if layer.ple is not None:
-            hidden = hidden + layer.ple(
+            ple_output, ple_conv_full = _qwen4_ple_with_capture(
+                layer.ple,
                 hidden,
                 inputs,
                 prev_ctx,
                 layer_cache,
                 conv_mask=conv_mask,
+                precomputed_embedding=compiled_aux,
             )
+            hidden = hidden + ple_output
+            ple_capture = {
+                "ple_conv_full": ple_conv_full,
+                "ple_context_full": mx.concatenate(
+                    [prev_ctx, inputs], axis=1
+                ),
+            }
 
         value, residual, inject = attn_hyper(layer.attn_hyper_connection, hidden)
         if layer.is_linear:
             value, capture = _gdn_with_capture(
                 layer.linear_attn, value, conv_mask, layer_cache
             )
+            if ple_capture is not None:
+                capture.update(ple_capture)
             captures[layer_index] = capture
         else:
             value = layer.self_attn(
@@ -319,6 +364,55 @@ def _qwen4_forward_with_capture(
     return (logits, hidden, captures) if return_hidden else (logits, captures)
 
 
+def _qwen4_ple_with_capture(
+    ple: Any,
+    hidden: mx.array,
+    ids: mx.array,
+    prev_ctx: mx.array,
+    cache: Any,
+    *,
+    conv_mask: mx.array | None,
+    precomputed_embedding: mx.array | None,
+) -> tuple[mx.array, mx.array]:
+    """Run the exact PLE arithmetic and retain its prefix-selectable conv tape."""
+
+    emb = (
+        ple.ple_embedding(ids, prev_ctx)
+        if precomputed_embedding is None
+        else precomputed_embedding
+    ).astype(hidden.dtype)
+    key = ple.norm_key(ple.key_proj(emb))
+    key = key.reshape(*key.shape[:-1], ple.hc, ple.d)
+    value = ple.value_proj(emb)
+    query = ple.norm_query(hidden)
+    query = query.reshape(*query.shape[:-1], ple.hc, ple.d)
+
+    gate = (key * query).sum(axis=-1, keepdims=True) / math.sqrt(ple.d)
+    gate = mx.sqrt(mx.maximum(mx.abs(gate), 1e-6)) * mx.sign(gate)
+    gated = mx.sigmoid(gate) * value[..., None, :]
+    gated = gated.reshape(*gated.shape[:-2], -1)
+    normalized = ple.norm_conv(gated)
+    gated = ple._apply_mask(gated, conv_mask)
+    normalized = ple._apply_mask(normalized, conv_mask)
+
+    state_len = int(ple.short_conv_state_len)
+    state = (
+        cache[2]
+        if cache is not None and cache[2] is not None
+        else mx.zeros(
+            (normalized.shape[0], state_len, normalized.shape[-1]),
+            dtype=normalized.dtype,
+        )
+    )
+    full = mx.concatenate([state, normalized], axis=1)
+    if cache is not None:
+        cache[2] = mx.contiguous(full[:, -state_len:, :])
+    convolved = nn.silu(
+        ple.conv1d(full[:, -(state_len + int(normalized.shape[1])) :, :])
+    )
+    return gated + convolved, full
+
+
 def _forward_ar_capture(
     self: Any,
     input_ids: mx.array,
@@ -326,6 +420,7 @@ def _forward_ar_capture(
     return_hidden: bool = False,
     hidden_variant: str | None = None,
     capture_backend: str | None = None,
+    compiled_aux: mx.array | None = None,
 ):
     del hidden_variant, capture_backend
     if cache is None:
@@ -335,7 +430,88 @@ def _forward_ar_capture(
         input_ids,
         cache=cache,
         return_hidden=return_hidden,
+        compiled_aux=compiled_aux,
     )
+
+
+def _prefetch_compiled_verify_aux(
+    self: Any,
+    *,
+    primary: int,
+    prior_context: tuple[int, ...],
+) -> _CompiledAuxPrefetch:
+    """Start the primary PLE row read while the depth-1 draft is running."""
+
+    geometry = self._mtplx_qwen4_ngram_geometry
+    context = tuple(int(token) for token in prior_context[-2:])
+    if len(context) < 2:
+        context = (int(geometry.eos_token_id),) * (2 - len(context)) + context
+    rows, next_context = geometry.plan_incremental(
+        [[int(primary)]],
+        prior_context=(context,),
+    )
+    requested = tuple(int(row) for row in rows.reshape(-1))
+    inner = self.model.language_model.model
+    ple_index = int(inner.ple_layers[0])
+    provider = inner.layers[ple_index].ple.ple_embedding.ngram_embedding
+    return _CompiledAuxPrefetch(
+        rows=requested,
+        next_context=next_context,
+        future=provider.prefetch_prevalidated_rows(requested),
+    )
+
+
+def _cancel_compiled_verify_aux(
+    self: Any, prefetched: _CompiledAuxPrefetch | None
+) -> None:
+    del self
+    if prefetched is not None:
+        prefetched.cancel()
+
+
+def _prepare_compiled_verify_aux(
+    self: Any,
+    input_ids: mx.array,
+    cache: list[Any],
+    *,
+    prefetched: _CompiledAuxPrefetch | None = None,
+) -> mx.array:
+    """Resolve the host-backed PLE rows before entering ``mx.compile``."""
+
+    inner = self.model.language_model.model
+    ple_index = int(inner.ple_layers[0])
+    embedding = inner.layers[ple_index].ple.ple_embedding
+    if prefetched is not None:
+        # Only the draft-dependent second row crosses the device/host boundary
+        # here. The primary's first-touch SSD read has already been in flight
+        # throughout MTP drafting.
+        draft_ids = np.asarray(input_ids[:, 1:], dtype=np.int64)
+        draft_rows, _next_context = self._mtplx_qwen4_ngram_geometry.plan_incremental(
+            draft_ids,
+            prior_context=prefetched.next_context,
+        )
+        requested = prefetched.rows + tuple(
+            int(row) for row in draft_rows.reshape(-1)
+        )
+        return embedding.ngram_embedding.materialize_prevalidated_rows(
+            requested,
+            logical_shape=(
+                int(input_ids.shape[0]),
+                int(input_ids.shape[1]),
+                int(draft_rows.shape[-1]),
+            ),
+            prefetched=prefetched.transfer(),
+        ).reshape(int(input_ids.shape[0]), int(input_ids.shape[1]), -1)
+    ple_cache = cache[ple_index]
+    previous = ple_cache[3]
+    if previous is None:
+        context_len = int(inner.args.ngram_size) - 1
+        eos = inner.args.eos_token_id
+        eos = eos[0] if isinstance(eos, list) else eos
+        previous = mx.full(
+            (int(input_ids.shape[0]), context_len), int(eos), input_ids.dtype
+        )
+    return embedding(input_ids, previous)
 
 
 def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict[str, Any]:
@@ -348,6 +524,15 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
     linear = tuple(layer for layer in layers if layer.is_linear)
     if len(layers) != 48 or len(linear) != 36:
         raise Qwen4CaptureConfigError("capture route requires 36/48 linear layers")
+    ple_layers = tuple(
+        index
+        for index, layer in enumerate(layers)
+        if getattr(layer, "ple", None) is not None
+    )
+    if len(ple_layers) != 1 or not layers[ple_layers[0]].is_linear:
+        raise Qwen4CaptureConfigError(
+            "capture route requires one PLE on a captured linear layer"
+        )
     expected = (16, 48, 128, 128, 2048, 10240)
     for layer in linear:
         gdn = layer.linear_attn
@@ -411,6 +596,23 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
     ):
         raise Qwen4CaptureConfigError("capture Metal kernels are unavailable")
     runtime.forward_ar_capture = MethodType(_forward_ar_capture, runtime)
+    runtime._mtplx_capture_extra_layout = (
+        (ple_layers[0], ("ple_conv_full", "ple_context_full")),
+    )
+    from .qwen4_ngram import NGramGeometry
+
+    prefetch_value = os.environ.get("MTPLX_QWEN4_PLE_PREFETCH", "1")
+    if prefetch_value.strip().lower() not in {"0", "false", "no", "off"}:
+        runtime._mtplx_qwen4_ngram_geometry = NGramGeometry.qwen38()
+        runtime.prefetch_compiled_verify_aux = MethodType(
+            _prefetch_compiled_verify_aux, runtime
+        )
+        runtime.cancel_compiled_verify_aux = MethodType(
+            _cancel_compiled_verify_aux, runtime
+        )
+    runtime.prepare_compiled_verify_aux = MethodType(
+        _prepare_compiled_verify_aux, runtime
+    )
     return {"installed": True, "linear_layers": 36, "rows": 2}
 
 

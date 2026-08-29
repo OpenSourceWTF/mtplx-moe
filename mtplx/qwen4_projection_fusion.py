@@ -24,6 +24,7 @@ from .models.qwen4_omlx import (
     GatedDeltaNet,
     _qsa_compact_runtime_enabled,
     _qsa_compact_attention,
+    _positions_from_offset,
     _rope_partial,
     scaled_dot_product_attention,
 )
@@ -179,7 +180,7 @@ class FusedProjectionAttention(Attention):
         )
         v = v_proj.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        cos, sin = rope(mx.arange(offset, offset + S)[None])
+        cos, sin = rope(_positions_from_offset(offset, S)[None])
         cos, sin = cos[:, None], sin[:, None]
         q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 

@@ -7367,6 +7367,12 @@ def generate_mtpk(
         )
         else None
     )
+    compiled_aux_prefetcher = (
+        compiled_verify_bank.prefetch_aux
+        if compiled_verify_bank is not None
+        and compiled_verify_bank._prefetch_compiled_aux is not None
+        else None
+    )
     a3b_target_prefix_route = None
     a3b_rebase_state = None  # stashed post-primary state for a deferred correction
     snapshot_time = accept_time = rollback_time = repair_time = 0.0
@@ -8491,6 +8497,7 @@ def generate_mtpk(
         draft_cache_keys: list[tuple[int, ...]] = []
         draft_hidden_for_update: list[mx.array] = []
         draft_hidden_update_keys: list[object] = []
+        compiled_aux_prefetch = None
         if _mtp_history_uses_committed_cache(mtp_history_policy):
             mtp_cache = mtp_history_cache
             cycle_mtp_offset = _mtp_cache_offset(mtp_cache)
@@ -8786,6 +8793,23 @@ def generate_mtpk(
                 if _cc_finished:
                     break
                 continue
+        if compiled_aux_prefetcher is not None and cycle_depth == 1:
+            # The primary is already committed and host-resident. Start its
+            # exact PLE row acquisition now so SSD latency overlaps the MTP
+            # draft; only the draft-dependent row waits at target dispatch.
+            generated_prior = tokens[:-1]
+            if len(generated_prior) >= 2:
+                prior_context = tuple(int(token) for token in generated_prior[-2:])
+            else:
+                missing = 2 - len(generated_prior)
+                prior_context = (
+                    *(int(token) for token in prompt_ids[-missing:]),
+                    *(int(token) for token in generated_prior),
+                )
+            compiled_aux_prefetch = compiled_aux_prefetcher(
+                primary=int(primary),
+                prior_context=prior_context,
+            )
         draft_hidden = hidden
         next_token = primary
         device_draft_token = None
@@ -9604,6 +9628,7 @@ def generate_mtpk(
                             cache=cache,
                             return_hidden=True,
                             hidden_variant=base_hidden_variant,
+                            compiled_aux_prefetch=compiled_aux_prefetch,
                         )
                     )
                 elif graphbank is not None:
@@ -9673,6 +9698,7 @@ def generate_mtpk(
                         cache=cache,
                         return_hidden=True,
                         hidden_variant=base_hidden_variant,
+                        compiled_aux_prefetch=compiled_aux_prefetch,
                     )
                 )
             elif graphbank is not None:

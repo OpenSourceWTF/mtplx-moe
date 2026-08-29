@@ -23,11 +23,13 @@ from mtplx.graphbank import (
     CompiledVerifyBank,
     CompiledVerifyParityError,
     TensorOffsetKVCache,
+    TensorOffsetQSAKVCache,
     build_verify_state_spec,
     compare_verify_outputs,
     compiled_verify_mode,
     promote_kv_cache_offsets,
 )
+from mtplx.models.qwen4_omlx import QSAIndexer, QSAKVCache, RotaryEmbedding, TextArgs
 
 
 def _arrays_cache_cls() -> type:
@@ -221,6 +223,83 @@ def test_prewarm_ladder_is_harmless_before_organic_calls(monkeypatch):
     assert int(cache[1].size()) == 9
 
 
+def test_prewarm_ladder_passes_prepared_aux_before_state(monkeypatch):
+    class AuxRuntime:
+        def forward_ar_capture(
+            self,
+            input_ids,
+            *,
+            cache,
+            return_hidden,
+            compiled_aux=None,
+        ):
+            raise AssertionError("the fake compiled step owns this test")
+
+        def prepare_compiled_verify_aux(self, input_ids, cache):
+            del input_ids, cache
+            return mx.array([7], dtype=mx.int32)
+
+    runtime = AuxRuntime()
+    bank = CompiledVerifyBank(runtime)
+    cache = [type("PagedEntry", (), {"capacity": 4})()]
+    input_ids = mx.array([[1, 2]], dtype=mx.int32)
+    calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(bank, "_fallback_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bank, "_resolve_bucket", lambda *args, **kwargs: 4)
+    monkeypatch.setattr(bank, "_paged_ineligibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bank, "_ensure_shadow", lambda cache: None)
+    monkeypatch.setattr(bank, "_apply_bucket", lambda cache, bucket: None)
+    monkeypatch.setattr(
+        bank,
+        "_read_state_leaves",
+        lambda cache: [mx.array([11], dtype=mx.int32)],
+    )
+    bank._spec = [(0, "fa", 3)]
+
+    def compiled_step(ids, aux, state):
+        calls.append((int(aux.item()), int(state.item())))
+        return (ids.astype(mx.float32),)
+
+    monkeypatch.setattr(
+        bank,
+        "_shared_or_new_verify_step",
+        lambda *args, **kwargs: compiled_step,
+    )
+
+    report = bank.prewarm_ladder(cache, input_ids, max_context=4)
+
+    assert calls == [(7, 11)]
+    assert report["buckets"][0]["bucket"] == 4
+
+
+def test_qwen4_fixed_qsa_rejects_unbounded_request_budget_at_construction():
+    class AuxRuntime:
+        _mtplx_capture_extra_layout = (
+            (1, ("ple_conv_full", "ple_context_full")),
+        )
+
+        def forward_ar_capture(
+            self,
+            input_ids,
+            *,
+            cache,
+            return_hidden,
+            compiled_aux=None,
+        ):
+            raise AssertionError("construction gate must keep this route eager")
+
+        def prepare_compiled_verify_aux(self, input_ids, cache):
+            del input_ids, cache
+            return mx.zeros((1, 2, 4), dtype=mx.float32)
+
+    bank = CompiledVerifyBank(AuxRuntime(), request_max_tokens=262_133)
+
+    assert bank.permanent_eager is True
+    assert bank.permanent_eager_reason == "qwen4_fixed_qsa_request_above_1024"
+    assert bank.qsa_growth_reserve_tokens == 1030
+
+
 def test_build_verify_state_spec_orders_layers():
     rt = ToyHybridRuntime()
     cache = _prefill(rt, [0, 1, 2])
@@ -245,6 +324,254 @@ def test_build_verify_state_spec_orders_layers():
     spec, reason = build_verify_state_spec([object()])
     assert spec is None
     assert reason == "unsupported_container:object"
+
+    qwen_gdn = _arrays_cache_cls()(4)
+    for slot in range(4):
+        qwen_gdn[slot] = mx.zeros((1, slot + 1), dtype=mx.float32)
+    spec, reason = build_verify_state_spec([qwen_gdn])
+    assert reason is None
+    assert spec == [(0, "gdn", 4)]
+
+    qwen_gdn_without_ple = _arrays_cache_cls()(4)
+    qwen_gdn_without_ple[0] = mx.zeros((1, 1), dtype=mx.float32)
+    qwen_gdn_without_ple[1] = mx.zeros((1, 1), dtype=mx.float32)
+    spec, reason = build_verify_state_spec([qwen_gdn_without_ple])
+    assert reason is None
+    assert spec == [(0, "gdn", 2)]
+
+
+def _tensor_qsa_adapter(rows: int = 12) -> TensorOffsetQSAKVCache:
+    indexer = QSAIndexer(
+        TextArgs(
+            indexer_n_heads=2,
+            indexer_kv_heads=1,
+            indexer_head_dim=8,
+            indexer_budget=8,
+            indexer_compress_ratio=4,
+        )
+    )
+    rope = RotaryEmbedding(4, 10_000.0)
+    qk = mx.sin(mx.arange(rows * 24).reshape(1, rows, 24) * 0.017).astype(
+        mx.float16
+    )
+    entry = QSAKVCache()
+    entry.update_and_fetch(
+        mx.zeros((1, 1, rows, 8), dtype=mx.float16),
+        mx.zeros((1, 1, rows, 8), dtype=mx.float16),
+    )
+    indexer.select_projected_compact(qk, rope, entry.indexer, 0)
+    cache = [entry]
+    promoted, failures = promote_kv_cache_offsets(cache, reserve_tokens=8)
+    assert promoted == 1 and failures == {}
+    assert isinstance(cache[0], TensorOffsetQSAKVCache)
+    return cache[0]
+
+
+def test_qsa_shadow_and_mirror_commit_carry_all_seven_leaves() -> None:
+    entry = _tensor_qsa_adapter()
+    cache = [entry]
+    bank = CompiledVerifyBank(NullRuntime())
+    bank._spec = [(0, "qsa", 7)]
+
+    bank._ensure_shadow(cache)
+    shadow = bank._shadow[0]
+    assert isinstance(shadow, TensorOffsetQSAKVCache)
+    assert shadow is not entry
+    assert bank._read_state_leaves(cache) == entry.state_leaves
+
+    state_out = list(entry.state_leaves)
+    state_out[2] = state_out[2] + 2
+    state_out[4] = state_out[4] + 2
+    state_out[6] = state_out[6] + 1
+    bank._mirror_commit(cache, state_out)
+    mx.eval(entry.offset, entry.indexer.offset, entry.indexer.pooled_offset)
+
+    assert int(entry.size()) == 14
+    assert int(entry.indexer.size()) == 14
+    assert int(entry.indexer.pooled_size()) == 4
+    assert entry.rollback_state == [None, None, None]
+
+
+class ToyQSARuntime:
+    def __init__(self) -> None:
+        self.indexer = QSAIndexer(
+            TextArgs(
+                indexer_n_heads=2,
+                indexer_kv_heads=1,
+                indexer_head_dim=8,
+                indexer_budget=8,
+                indexer_compress_ratio=4,
+            )
+        )
+        self.rope = RotaryEmbedding(4, 10_000.0)
+
+    def forward_ar_capture(
+        self,
+        input_ids,
+        cache=None,
+        return_hidden=False,
+        hidden_variant=None,
+        capture_backend=None,
+    ):
+        del hidden_variant, capture_backend
+        entry = cache[0]
+        basis = mx.arange(24, dtype=mx.float32)[None, None, :]
+        qk = mx.sin(input_ids[..., None].astype(mx.float32) * 0.13 + basis * 0.017)
+        qk = qk.astype(mx.float16)
+        selected = self.indexer.select_projected_compact(
+            qk, self.rope, entry.indexer, entry.offset
+        )
+        raw = qk[..., -8:]
+        kv = raw[:, None, :, :]
+        entry.update_and_fetch(kv, -kv)
+        selected_values = mx.where(selected.valid, selected.indices, 0)
+        logits = mx.stack(
+            [
+                mx.sum(selected_values, axis=-1),
+                mx.sum(selected.valid, axis=-1),
+            ],
+            axis=-1,
+        ).astype(mx.float32)
+        hidden = qk
+        if return_hidden:
+            return logits, hidden, {}
+        return logits, {}
+
+
+def test_compiled_qsa_replays_one_trace_across_accept_prefixes(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    runtime = ToyQSARuntime()
+    cache = [QSAKVCache()]
+    runtime.forward_ar_capture(
+        mx.arange(12, dtype=mx.int32)[None], cache=cache, return_hidden=True
+    )
+    bank = CompiledVerifyBank(runtime, request_max_tokens=8, parity=True)
+
+    for ids in (mx.array([[12, 13]]), mx.array([[14, 15]])):
+        logits, hidden, captures = bank.forward_ar_capture(ids, cache=cache)
+        mx.eval(logits, hidden)
+        assert commit_captured_prefix(cache, captures, 1, 2)
+
+    assert bank.stats["compiled_calls"] == 2
+    assert bank.stats["fallback_calls"] == 0
+    assert bank.stats["traces"] == 1
+    assert bank.stats["parity_failures"] == 0
+    assert isinstance(cache[0], TensorOffsetQSAKVCache)
+    assert cache[0].size() == 14
+    assert cache[0].indexer.size() == 14
+
+
+def test_qsa_bank_reserves_full_known_request_outside_dense_growth_ceiling(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_GROWTH_RESERVE", "4")
+    runtime = ToyQSARuntime()
+    cache = [QSAKVCache()]
+    runtime.forward_ar_capture(
+        mx.arange(12, dtype=mx.int32)[None], cache=cache, return_hidden=True
+    )
+    bank = CompiledVerifyBank(runtime, request_max_tokens=8)
+
+    bank.forward_ar_capture(mx.array([[12, 13]]), cache=cache)
+
+    assert isinstance(cache[0], TensorOffsetQSAKVCache)
+    expected_capacity = 12 + bank.request_max_tokens + bank.speculative_headroom
+    assert cache[0].keys.shape[2] == expected_capacity
+    assert cache[0].indexer.attention_capacity == expected_capacity
+
+
+class ToyAuxHybridRuntime(ToyHybridRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prepare_calls = 0
+
+    def prefetch_compiled_verify_aux(self, primary, prior_context):
+        return ("prefetch", int(primary), tuple(prior_context))
+
+    def cancel_compiled_verify_aux(self, prefetched):
+        del prefetched
+
+    def prepare_compiled_verify_aux(self, input_ids, cache, *, prefetched=None):
+        del cache
+        self.prepare_calls += 1
+        marker = 0.0 if prefetched is None else float(prefetched[1])
+        return input_ids.astype(mx.float32)[..., None] + marker
+
+    def forward_ar_capture(self, input_ids, *, compiled_aux=None, **kwargs):
+        logits, hidden, captures = super().forward_ar_capture(
+            input_ids, **kwargs
+        )
+        if compiled_aux is not None:
+            logits = logits + compiled_aux
+        return logits, hidden, captures
+
+
+class ToyExtraCaptureRuntime(ToyHybridRuntime):
+    _mtplx_capture_extra_layout = (
+        (0, ("ple_conv_full", "ple_context_full")),
+    )
+
+    def forward_ar_capture(self, input_ids, **kwargs):
+        logits, hidden, captures = super().forward_ar_capture(input_ids, **kwargs)
+        captures[0]["ple_conv_full"] = hidden
+        captures[0]["ple_context_full"] = input_ids
+        return logits, hidden, captures
+
+
+def test_compiled_verify_prepares_dynamic_aux_outside_trace(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    runtime = ToyAuxHybridRuntime()
+    cache = _prefill(runtime, [0, 1, 2])
+    bank = CompiledVerifyBank(runtime, parity=True)
+
+    for ids in (mx.array([[3, 4]]), mx.array([[1, 2]])):
+        logits, hidden, _captures = bank.forward_ar_capture(ids, cache=cache)
+        mx.eval(logits, hidden)
+
+    assert runtime.prepare_calls == 2
+    assert bank.stats["compiled_calls"] == 2
+    assert bank.stats["fallback_calls"] == 0
+    assert bank.stats["traces"] == 1
+    assert bank.stats["parity_failures"] == 0
+
+
+def test_compiled_verify_accepts_one_prefetched_aux_window(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    runtime = ToyAuxHybridRuntime()
+    cache = _prefill(runtime, [0, 1, 2])
+    bank = CompiledVerifyBank(runtime)
+
+    prefetched = bank.prefetch_aux(primary=3, prior_context=(1, 2))
+    logits, hidden, _captures = bank.forward_ar_capture(
+        mx.array([[3, 4]]),
+        cache=cache,
+        compiled_aux_prefetch=prefetched,
+    )
+    mx.eval(logits, hidden)
+
+    assert prefetched == ("prefetch", 3, (1, 2))
+    assert runtime.prepare_calls == 1
+    assert bank.stats["compiled_calls"] == 1
+
+
+def test_compiled_verify_returns_construction_declared_extra_captures(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_PREWARM", "0")
+    runtime = ToyExtraCaptureRuntime()
+    cache = _prefill(runtime, [0, 1, 2])
+    bank = CompiledVerifyBank(runtime)
+
+    logits, hidden, captures = bank.forward_ar_capture(
+        mx.array([[3, 4]]), cache=cache
+    )
+    mx.eval(logits, hidden, *captures[0].values())
+
+    assert np.asarray(captures[0]["ple_context_full"]).tolist() == [[3, 4]]
+    np.testing.assert_array_equal(
+        np.asarray(captures[0]["ple_conv_full"]), np.asarray(hidden)
+    )
 
 
 def test_real_entries_unchanged_until_mirror_commit():

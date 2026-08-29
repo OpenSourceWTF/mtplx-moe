@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+import mtplx.models.qwen4_omlx as qwen4_omlx
 from mtplx.models.qwen4_omlx import Attention, GatedDeltaNet, RotaryEmbedding, TextArgs
 from mtplx.proj_fusion import configure_fused_projections
 from mtplx.qwen4_projection_fusion import install_qwen4_fused_projection_routes
@@ -136,3 +137,12 @@ def test_qwen4_attention_wide_forward_keeps_separate_indexer_projection(monkeypa
     mx.eval(out)
 
     assert combined_calls == 0
+
+
+def test_tensor_offset_positions_compile_without_host_materialization():
+    compiled = mx.compile(lambda offset: qwen4_omlx._positions_from_offset(offset, 2))
+
+    positions = compiled(mx.array(16_384, dtype=mx.int32))
+    mx.eval(positions)
+
+    assert mx.array_equal(positions, mx.array([16_384, 16_385], dtype=mx.int32))

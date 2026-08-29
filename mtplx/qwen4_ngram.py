@@ -3593,6 +3593,13 @@ class NGramRowCache:
 
         return self._acquire_prevalidated_rows_async(row_ids).result()
 
+    def acquire_prevalidated_rows_async(
+        self, row_ids: tuple[int, ...]
+    ) -> NGramAcquireFuture:
+        """Start trusted PLE row I/O without waiting for publication."""
+
+        return self._acquire_prevalidated_rows_async(row_ids)
+
     def _cancel_request(self, request: NGramAcquireFuture) -> bool:
         with self._lock:
             if (
