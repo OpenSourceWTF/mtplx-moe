@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,12 +117,33 @@ def user_config_path(value: str | Path | None = None) -> Path:
     return DEFAULT_CONFIG_PATH
 
 
+def _warn_bad_config(resolved: Path, detail: str) -> None:
+    """One stderr line, never a traceback. See ``load_user_config``."""
+
+    print(
+        f"mtplx: ignoring {resolved}: {detail}; fix or delete the file; "
+        "`mtplx config show` prints the active config",
+        file=sys.stderr,
+    )
+
+
 def load_user_config(path: str | Path | None = None) -> UserConfig:
     resolved = user_config_path(path)
     if not resolved.exists():
         return UserConfig(path=resolved, exists=False)
-    with resolved.open("rb") as handle:
-        data = tomllib.load(handle)
+    # This runs on EVERY CLI dispatch. A truncated or hand-mangled config.toml
+    # used to raise TOMLDecodeError straight through `mtplx status`, `doctor`,
+    # and `stop` — every command bricked by one bad file, with no way to read
+    # the hint out of a traceback. Degrade to defaults and say so once instead.
+    try:
+        with resolved.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
+        _warn_bad_config(resolved, str(exc))
+        return UserConfig(path=resolved, exists=False)
+    if not isinstance(data, dict):
+        _warn_bad_config(resolved, "top level is not a table")
+        return UserConfig(path=resolved, exists=False)
     model = data.get("model")
     model_dir = data.get("model_dir")
     profile = data.get("profile")
@@ -136,7 +158,13 @@ def load_user_config(path: str | Path | None = None) -> UserConfig:
             # commands before they can parse or explicitly choose a profile.
             profile = str(profile)
     if paged_kv_quantization is not None:
-        paged_kv_quantization = normalize_paged_kv_quantization(paged_kv_quantization)
+        try:
+            paged_kv_quantization = normalize_paged_kv_quantization(paged_kv_quantization)
+        except (ValueError, TypeError) as exc:
+            # A bad saved value degrades to this key's default, matching the
+            # stale-profile handling above. One key must not brick every command.
+            _warn_bad_config(resolved, f"invalid paged_kv_quantization: {exc}")
+            paged_kv_quantization = None
     return UserConfig(
         path=resolved,
         exists=True,

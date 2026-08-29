@@ -32,6 +32,10 @@ from .models.laguna_config import (
 from .profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     OPTIMIZED_SPEED_V1_HF_MODEL_ID,
@@ -92,6 +96,8 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID: QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
     QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID: QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID: QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID: FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
     # Artifact-basename aliases (folder-name style).
     "qwen3.5-9b-mtplx-optimized-speed": QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
     "qwen3.5-9b-mtplx-optimized-speed-fp16": QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
@@ -111,6 +117,14 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     "qwen3.8-27b-mtplx-optimized-speed-fp16": QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     "qwen3.8-27b-mtplx-optimized-quality-fp16": QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
     "qwen3.8-27b-mtplx-optimized-quality": QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    # Flash-Next basenames are derived, not hand-copied: this table drifted
+    # from model_catalog and commands/public once already, which broke the
+    # release-notes command `mtplx pull mtplx-flash-next-bare-speed`.
+    # test_public_model_id_alias_tables_agree keeps all three in agreement.
+    Path(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID).name.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    Path(
+        FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID
+    ).name.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
 }
 
 

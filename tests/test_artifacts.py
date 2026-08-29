@@ -2902,3 +2902,48 @@ def test_remote_code_checkpoints_refuse_cleanly(tmp_path):
     assert result.compatibility["runtime_compatibility"] == "trust-remote-code-required"
     assert result.compatibility["can_run"] is False
     assert "trust_remote_code" in result.compatibility["message"]
+
+
+def test_public_model_id_alias_tables_agree():
+    """Every public model id must resolve, by id and by HF folder basename.
+
+    Three hand-maintained alias tables carry these pairs (mtplx/artifacts.py,
+    mtplx/model_catalog.py, mtplx/commands/public.py). They drifted once: the
+    Flash-Next rows were missing from artifacts.py, so the release notes' own
+    `mtplx pull mtplx-flash-next-bare-speed` died with "pull requires a Hugging
+    Face repo id or URL" and `serve --model mtplx-flash-next-bare-speed` raised
+    FileNotFoundError. Enumerating from mtplx.profiles (rather than listing the
+    ids here) means a newly added public id joins this test automatically.
+    """
+
+    from pathlib import Path as _Path
+
+    from mtplx import profiles
+    from mtplx.hf_loader import repo_id_from_model_ref
+
+    public_id_names = sorted(
+        name for name in dir(profiles) if name.endswith("_PUBLIC_MODEL_ID")
+    )
+    assert public_id_names, "no public model ids exported by mtplx.profiles"
+
+    checked = set()
+    for name in public_id_names:
+        hf_name = name.replace("_PUBLIC_MODEL_ID", "_HF_MODEL_ID")
+        assert hasattr(profiles, hf_name), f"{name} has no {hf_name} pair"
+        public_id = getattr(profiles, name)
+        hf_repo_id = getattr(profiles, hf_name)
+
+        assert (
+            repo_id_from_model_ref(public_id) == hf_repo_id
+        ), f"{name} ({public_id!r}) does not resolve to {hf_repo_id!r}"
+        basename = _Path(hf_repo_id).name
+        assert (
+            repo_id_from_model_ref(basename) == hf_repo_id
+        ), f"HF basename {basename!r} does not resolve to {hf_repo_id!r}"
+        checked.add(public_id)
+
+    # The two ids the 2.10.0 release notes tell users to pull by name.
+    assert {
+        "mtplx-flash-next-bare-speed",
+        "mtplx-flash-next-optimized-speed",
+    } <= checked

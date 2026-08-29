@@ -5928,8 +5928,38 @@ def cmd_list_public(args: Any) -> int:
 
 
 def cmd_remove_public(args: Any) -> int:
-    from mtplx.hf_loader import remove_cached_model
+    from mtplx.hf_loader import (
+        directory_size_bytes,
+        remove_cached_model,
+        resolve_cached_model_target,
+    )
 
+    # Resolve through the same containment fence the remover uses, so a
+    # traversal ref is refused before we offer to delete anything.
+    try:
+        repo_id, target = resolve_cached_model_target(
+            args.model, cache_dir=args.cache_dir
+        )
+    except ValueError as exc:
+        print(f"mtplx remove: {exc}", file=sys.stderr)
+        return 1
+    if target.exists() and not getattr(args, "yes", False):
+        size = _format_bytes(directory_size_bytes(target))
+        if not sys.stdin.isatty():
+            print(
+                f"mtplx remove: refusing to delete {target} ({size}) without "
+                "confirmation; pass --yes to remove it non-interactively",
+                file=sys.stderr,
+            )
+            return 1
+        print("MTPLX remove")
+        print(f"model: {repo_id}")
+        print(f"path: {target}")
+        print(f"size: {size}")
+        answer = input("Delete this cached model? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("aborted: nothing was removed")
+            return 1
     result = remove_cached_model(args.model, cache_dir=args.cache_dir)
     if getattr(args, "json", False):
         _print(result)

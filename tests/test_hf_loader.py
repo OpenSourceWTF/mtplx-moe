@@ -577,6 +577,116 @@ def test_list_and_remove_cached_models(tmp_path: Path):
     assert not model.exists()
 
 
+def _traversal_cache(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A ~/.mtplx-shaped tree: cache dir, a sentinel model, a sibling file."""
+
+    home = tmp_path / "home" / ".mtplx"
+    cache = home / "models"
+    cache.mkdir(parents=True)
+    config = home / "config.toml"
+    config.write_text('model = "mtplx/example"\n', encoding="utf-8")
+    model = cache / "mtplx--sentinel"
+    model.mkdir()
+    (model / "weights.bin").write_bytes(b"1234")
+    return home, cache, model
+
+
+@pytest.mark.parametrize("ref", [".", "/", "..", "", "./", "//"])
+def test_remove_cached_model_refuses_paths_outside_cache(tmp_path: Path, ref: str):
+    # safe_model_name only swaps "/" for "--", so these refs used to resolve
+    # onto the models cache itself or its parent (~/.mtplx: bin, config.toml,
+    # session-bank, logs) and rmtree took the lot, exit 0, "removed" printed.
+    home, cache, model = _traversal_cache(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        remove_cached_model(ref, cache_dir=cache)
+
+    assert repr(ref) in str(excinfo.value)
+    assert home.exists()
+    assert cache.exists()
+    assert (home / "config.toml").exists()
+    assert (model / "weights.bin").read_bytes() == b"1234"
+
+
+def test_remove_cached_model_contains_dotdot_refs_inside_cache(tmp_path: Path):
+    # "../.." is not an escape: safe_model_name folds it to the literal child
+    # name "..--..", which stays inside the cache. It must therefore be a
+    # plain miss, not a deletion and not a traversal.
+    home, cache, model = _traversal_cache(tmp_path)
+
+    result = remove_cached_model("../..", cache_dir=cache)
+
+    assert result["removed"] is False
+    assert Path(result["path"]).parent == cache.resolve()
+    assert home.exists()
+    assert (home / "config.toml").exists()
+    assert (model / "weights.bin").read_bytes() == b"1234"
+
+
+def test_remove_cached_model_removes_legitimate_ref(tmp_path: Path):
+    home, cache, model = _traversal_cache(tmp_path)
+
+    result = remove_cached_model("mtplx/sentinel", cache_dir=cache)
+
+    assert Path(result["path"]).parent == cache.resolve()
+    assert result["repo_id"] == "mtplx/sentinel"
+    assert result["removed"] is True
+    assert result["size_bytes_removed"] == 4
+    assert not model.exists()
+    # Only the model goes; the cache and its siblings survive.
+    assert cache.exists()
+    assert (home / "config.toml").exists()
+
+    # Missing-entry behaviour is unchanged: a second call is a clean miss.
+    again = remove_cached_model("mtplx/sentinel", cache_dir=cache)
+    assert again["removed"] is False
+    assert again["size_bytes_removed"] == 0
+
+
+def test_remove_cli_requires_confirmation_without_yes(tmp_path: Path, monkeypatch, capsys):
+    from mtplx.cli import main
+
+    home, cache, model = _traversal_cache(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    exit_code = main(["remove", "mtplx/sentinel", "--cache-dir", str(cache)])
+
+    assert exit_code == 1
+    assert model.exists()
+    assert "--yes" in capsys.readouterr().err
+
+
+def test_remove_cli_prompt_declines_and_accepts(tmp_path: Path, monkeypatch, capsys):
+    from mtplx.cli import main
+
+    home, cache, model = _traversal_cache(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    monkeypatch.setattr("builtins.input", lambda *_: "n")
+    assert main(["remove", "mtplx/sentinel", "--cache-dir", str(cache)]) == 1
+    assert model.exists()
+
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    assert main(["remove", "mtplx/sentinel", "--cache-dir", str(cache)]) == 0
+    assert not model.exists()
+    assert cache.exists()
+    assert (home / "config.toml").exists()
+
+
+def test_remove_cli_refuses_traversal_even_with_yes(tmp_path: Path, capsys):
+    from mtplx.cli import main
+
+    home, cache, model = _traversal_cache(tmp_path)
+
+    exit_code = main(["remove", "..", "--cache-dir", str(cache), "--yes"])
+
+    assert exit_code == 1
+    assert "refusing to remove" in capsys.readouterr().err
+    assert home.exists()
+    assert (home / "config.toml").exists()
+    assert (model / "weights.bin").read_bytes() == b"1234"
+
+
 def test_hf_cache_report_is_no_network(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)

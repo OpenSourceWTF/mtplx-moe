@@ -3240,6 +3240,9 @@ def build_parser() -> argparse.ArgumentParser:
     remove_p.add_argument("--cache-dir")
     remove_p.add_argument("--missing-ok", action="store_true")
     remove_p.add_argument(
+        "--yes", action="store_true", help="Skip the delete confirmation prompt"
+    )
+    remove_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     remove_p.set_defaults(func=cmd_remove_public)

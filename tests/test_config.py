@@ -262,3 +262,48 @@ def test_apply_user_config_fills_bench_tune_model_defaults(tmp_path):
 
     assert args.model == "mtplx/example"
     assert args.cache_dir == str(model_dir)
+
+
+def test_malformed_user_config_does_not_crash_any_command(tmp_path, monkeypatch, capsys):
+    # load_user_config runs on EVERY CLI dispatch. A truncated or hand-mangled
+    # config.toml used to raise TOMLDecodeError straight through `mtplx status`,
+    # `doctor`, and `stop`, so one bad file bricked the whole CLI.
+    config = tmp_path / "config.toml"
+    config.write_text('model = "unterminated\nprofile =\n', encoding="utf-8")
+
+    loaded = load_user_config(config)
+
+    assert loaded.exists is False
+    assert loaded.path == config
+    assert loaded.model is None
+    assert loaded.profile is None
+    warning = capsys.readouterr().err
+    assert str(config) in warning
+    assert "mtplx config show" in warning
+    assert warning.count("\n") == 1
+
+    # And the same file survives a real command dispatch rather than tracebacking.
+    from mtplx.cli import main
+
+    monkeypatch.setenv("MTPLX_CONFIG", str(config))
+    assert main(["status", "--json"]) == 0
+    assert str(config) in capsys.readouterr().err
+
+
+def test_malformed_config_value_degrades_to_default(tmp_path, capsys):
+    # A bad individual value degrades to that key's default with the same
+    # one-line warning; it must not take the rest of the config down with it.
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'model = "mtplx/example"\npaged_kv_quantization = "not-a-mode"\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_user_config(config)
+
+    assert loaded.exists is True
+    assert loaded.model == "mtplx/example"
+    assert loaded.paged_kv_quantization is None
+    warning = capsys.readouterr().err
+    assert str(config) in warning
+    assert "paged_kv_quantization" in warning

@@ -1131,9 +1131,32 @@ def pull_model(
     }
 
 
-def remove_cached_model(model_ref: str, *, cache_dir: str | Path | None = None) -> dict[str, Any]:
+def resolve_cached_model_target(
+    model_ref: str, *, cache_dir: str | Path | None = None
+) -> tuple[str, Path]:
+    """Resolve a model ref to the cached directory it is allowed to delete.
+
+    Containment fence for destructive cache operations. ``safe_model_name``
+    only swaps "/" for "--", so refs like ".", "..", "/", and "" collapse onto
+    the models cache itself or its parent (~/.mtplx — bin, config.toml,
+    session-bank, logs); an unguarded ``rmtree`` took the lot and still exited
+    0. A legitimate ref always resolves to a direct child of the models cache.
+    Raises ValueError for anything else, so callers refuse rather than delete.
+    """
+
     repo_id = repo_id_from_model_ref(model_ref) or model_ref.replace("--", "/")
-    path = cached_model_path(repo_id, cache_dir=cache_dir)
+    root = model_cache_dir(cache_dir).resolve()
+    path = cached_model_path(repo_id, cache_dir=cache_dir).resolve()
+    if path.parent != root or path.name in {"", ".", ".."}:
+        raise ValueError(
+            f"refusing to remove {path}: model ref {model_ref!r} does not name "
+            f"a model directory inside {root}"
+        )
+    return repo_id, path
+
+
+def remove_cached_model(model_ref: str, *, cache_dir: str | Path | None = None) -> dict[str, Any]:
+    repo_id, path = resolve_cached_model_target(model_ref, cache_dir=cache_dir)
     existed = path.exists()
     size = directory_size_bytes(path) if existed else 0
     if existed:
