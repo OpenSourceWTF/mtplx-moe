@@ -233,6 +233,11 @@ class MTPLXRuntime:
     ngram_preflight_report: dict[str, Any] | None = None
     qwen4_depth1_batched_target_arrays: bool = field(default=False, init=False)
     context_copy_probation_k: int | None = field(default=None, init=False)
+    qwen4_cycle_fold_issue: Callable[..., Any] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
         init=False,
@@ -1193,6 +1198,14 @@ def load(
         if is_exact_qwen4_capture_config(config):
             capture_report = install_qwen4_capture_route(runtime, config=config)
             logger.info("[qwen4-capture] %s", capture_report)
+            from .qwen4_cycle_fold import (
+                install_qwen4_cycle_fold,
+                qwen4_cycle_fold_enabled,
+            )
+
+            if qwen4_cycle_fold_enabled():
+                cycle_fold_report = install_qwen4_cycle_fold(runtime, config=config)
+                logger.info("[qwen4-cycle-fold] %s", cycle_fold_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError
