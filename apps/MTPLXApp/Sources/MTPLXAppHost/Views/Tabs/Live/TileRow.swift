@@ -191,7 +191,8 @@ struct TileRow: View {
                 caption: memoryCaption(
                     mem: mem,
                     machine: machine,
-                    pressureLevel: backend.memoryPressureLevel
+                    pressureLevel: backend.memoryPressureLevel,
+                    recentShed: backend.memoryGuardRecentShed
                 ),
                 liftIndex: 2
             ),
@@ -363,7 +364,8 @@ struct TileRow: View {
     }
 
     private func memoryCaption(
-        mem: MemSnapshot?, machine: HealthPayload?, pressureLevel: Int = 0
+        mem: MemSnapshot?, machine: HealthPayload?, pressureLevel: Int = 0,
+        recentShed: Bool = false
     ) -> String? {
         guard let used = mem.flatMap({ ($0.activeMemoryBytes ?? 0) + ($0.cacheMemoryBytes ?? 0) }),
               let total = machine?.unifiedMemoryBytes,
@@ -375,7 +377,11 @@ struct TileRow: View {
         // what it means instead of leaving the user to guess (#305).
         let base = "\(Format.percent(pct, fractionDigits: 0)) used"
         if pressureLevel >= 4 { return base + " · critical pressure" }
-        if pressureLevel >= 2 { return base + " · pressure, shedding cache" }
+        // Same contract as the banner (605a1006): a shed claim requires an
+        // actual shed in the guard ring, never pressure level alone.
+        if pressureLevel >= 2 {
+            return base + (recentShed ? " · pressure, shedding cache" : " · memory pressure")
+        }
         if pct > 1.0 { return base + " · over budget" }
         return base
     }

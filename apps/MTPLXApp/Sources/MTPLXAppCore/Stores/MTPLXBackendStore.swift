@@ -1521,6 +1521,10 @@ public final class MTPLXBackendStore: ObservableObject {
         prefillStatus = nil
         prefillHistory = nil
         thermalStatus = nil
+        memoryPressureLevel = 0
+        memoryPressureSource = nil
+        memoryPlan = nil
+        memoryGuardRecentShed = false
         models = nil
         observedCompletionCount = 0
         observedUserMetricEventCount = 0
