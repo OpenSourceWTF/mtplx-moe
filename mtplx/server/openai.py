@@ -815,6 +815,17 @@ def _server_runtime_env_overrides(
             "MTPLX_FUSED_GDN_CONVNORM",
             "MTPLX_FUSED_GDN_STEP",
             "MTPLX_FUSED_CONVNORM_VERIFY",
+            # QSA rows-gather (2026-08-28, adapting PR #380 by @maceip):
+            # family default ON. Self-fenced to S 2..8 at KV >= 16384, so
+            # below that the config is bit-identical dense. Receipt: paired
+            # 16,384-token xhigh arms — dense verify grew 37.0->46.9
+            # ms/round (last-256 36.0 tok/s), gather held flat 45.3->45.9
+            # (last-256 64.5); parity 2e-2 on the real layer over identical
+            # visible sets. Founder release call 2026-08-28: family is
+            # unshipped, fences bound the blast radius, kill switch is
+            # MTPLX_QSA_GATHER=0. 100k rung + copy-block widths (25 rows,
+            # MTPLX_QSA_GATHER_MAX_ROWS) remain the post-release sweep.
+            "MTPLX_QSA_GATHER",
         ):
             if os.environ.get(key) is None:
                 overrides.setdefault(key, "1")

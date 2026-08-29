@@ -867,6 +867,9 @@ _QWEN4_EXP_FAMILY_ENV_DEFAULTS = (
     "MTPLX_FUSED_GDN_CONVNORM",
     "MTPLX_FUSED_GDN_STEP",
     "MTPLX_FUSED_CONVNORM_VERIFY",
+    # Rows-gather family default (2026-08-28, adapting PR #380 by @maceip):
+    # self-fenced to S 2..8 at KV >= 16384; kill switch MTPLX_QSA_GATHER=0.
+    "MTPLX_QSA_GATHER",
 )
 
 
@@ -905,9 +908,11 @@ def test_qwen4_exp_family_defaults_octet_and_nax_neutralize(tmp_path, monkeypatc
     # Operator env beats every family default (the launch-time export lane).
     monkeypatch.setenv("MTPLX_FUSED_GDN_STEP", "0")
     monkeypatch.setenv("MTPLX_NAX_VERIFY", "1")
+    monkeypatch.setenv("MTPLX_QSA_GATHER", "0")
     pinned = openai._server_runtime_env_overrides(args, {})
     assert "MTPLX_FUSED_GDN_STEP" not in pinned
     assert "MTPLX_NAX_VERIFY" not in pinned
+    assert "MTPLX_QSA_GATHER" not in pinned
 
     # Non-family models get neither the octet nor the neutralize.
     plain = tmp_path / "plain"

@@ -171,8 +171,13 @@ All notable user-facing changes to MTPLX. The format is based on
   that grows with the generation. The opt-in lane gathers each row's
   selected blocks plus its visible tail at a constant width instead, with
   context-length and row-count routing fences so short contexts keep the
-  fused dense path. Off by default behind `MTPLX_QSA_GATHER`;
-  parity-tested against the dense path on the real layer.
+  fused dense path. Family default ON for Flash-Next (self-fenced to
+  2..8 rows at 16384+ tokens of context, so shorter contexts are
+  bit-identical dense; `MTPLX_QSA_GATHER=0` is the kill switch). Paired
+  16,384-token receipt: the dense path's verify cost grew 37.0 to 46.9 ms
+  per round across the run while the gather arm held flat 45.3 to 45.9,
+  finishing its last window at 64.5 tok/s against 36.0 dense.
+  Parity-tested against the dense path on the real layer.
 
 ### Fixed
 
