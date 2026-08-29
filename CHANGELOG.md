@@ -111,6 +111,23 @@ All notable user-facing changes to MTPLX. The format is based on
   rebuilding or copying the artifact. Families the tune instrument cannot
   measure (Flash-Next today) take their rows through a locally booted
   `mtplx serve`, the lane that actually applies their family contract.
+- **The CLI's first 90 seconds behave like 2026.** The terminal chat
+  gets readline line editing with a persistent history
+  (`~/.mtplx/history`, 1000 entries; arrow keys used to print raw
+  escape sequences into the prompt); prompts pipe in
+  (`echo "..." | mtplx run`, and a piped prompt into the chat entry
+  answers through the same path `--prompt` uses, while an empty pipe
+  keeps the non-tty refusal); `serve`/`run`/`chat` join the main help
+  and `list`/`remove`/`config`/`env`/`dashboard`/`integrate` get a
+  "Server and scripting" help group, with a one-line difflib
+  "Did you mean" on any typo across all registered subcommands (exit
+  code still 2); `mtplx ask` joins `run`/`chat` on
+  `--reasoning-effort` and the chat REPL gains `/effort
+  <level|status>`, live per turn like `/reasoning`; `mtplx --version`
+  drops the redundant parenthetical when display and package versions
+  match; and `mtplx hardware` stops printing "hardware acceleration
+  confirmed: false" at humans for a field that means "not profiled"
+  (JSON output unchanged everywhere).
 - Streaming endpoints (`/v1/chat/completions`, `/v1/completions`,
   `/v1/messages`) emit a `: keep-alive` SSE comment every 5 seconds
   while a stream is still silent before its first token (#358). Long
