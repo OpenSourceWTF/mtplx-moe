@@ -69,6 +69,7 @@ not be treated as retained work.
 | Dedicated MLX/Metal stream | Upstream `mlx-serve` attempt crashed under thread-local stream behavior and was reverted | rejected; use earlier dependency-chained submission on the default stream |
 | M=2 split-K verifier QMM | Isolated medians beat stock by 3.75% at `K2560xN13952`, 2.76% at `K2560xN16480`, and 0.60% at the LM head; forced two-way split was best for the Q4 attention output. The exact production run fell from the 69.7388 TPS frontier to 68.4443 TPS (-1.86%). Artifact inspection also proved the 36 GDN output projections are Q5/G128, so the synthetic Q4 `K7680xN2560` split sweep was not a production fit | rejected and fully reverted; isolated wins did not survive mixed scheduling |
 | Fuse top-10 normalization into the row-owned router | Focused parity passed, but the exact production run fell from the 69.7388 TPS frontier to 62.3136 TPS (-10.65%) and decode time rose to 16.4330 seconds | rejected and fully reverted; the extra router synchronization disrupted the mixed dispatch window |
+| M=2 MoE stage-3 threadgroup sweep | The corrected exact-shape 256-thread route produced 69.5864 TPS and the 64-thread route produced 69.6382 TPS versus the 69.7388 TPS frontier mean. Both retained the production digest, 391/600 acceptance, 605 verifier calls, and zero repair | rejected and fully reverted; the existing 128-thread geometry remains best in the mixed production schedule |
 
 ## `mlx-serve` candidates
 
