@@ -148,8 +148,43 @@ All notable user-facing changes to MTPLX. The format is based on
   which caps the lane at ~7 GiB and mutely excluded every 100k+-token
   session — the same silence class as #278, in a brand-new lane).
 
+- **RAMP: opt-in long-block and fuzzy re-anchor policy for context copy**
+  (adapting community PR #375 by @johninthewinter). A fixed 48-token copy
+  block replaces the confidence ladder and an exact n-gram miss falls
+  through to a mismatch-tolerant short-anchor re-match, for edit-shaped
+  temperature-0 agent workloads where the author measured +45.9 to +53.9
+  percent decode with byte-identical output. Our own paired temperature-1
+  chat-rewrite arms measured it a net loss (copy supply fell 504 to 123
+  tokens on seed-identical streams), so it ships off by default
+  (`MTPLX_RAMP_ENABLED`); off is byte-for-byte the prior proposer.
+- **One-sync greedy draft read on confidence lanes** (adapting community
+  PR #288 by @ArthurOstapenko). Margin-gate and adaptive-depth lanes now
+  read the greedy draft token and its confidence metrics in one GPU
+  synchronization instead of two; the author's paired receipt is +0.559
+  percent geomean on the ExpectedValue depth-3 lane. The default greedy
+  chain and every sampled-draft lane are untouched, proven by an
+  engagement counter that reads zero there.
+- **QSA rows-gather lane for verify widths** (adapting the per-query
+  gather and GQA head-group broadcast from community PR #380 by @maceip).
+  Multi-row QSA forwards previously staged a dense [rows, context] mask
+  and read the full KV in all 12 QSA layers every verify round, a cost
+  that grows with the generation. The opt-in lane gathers each row's
+  selected blocks plus its visible tail at a constant width instead, with
+  context-length and row-count routing fences so short contexts keep the
+  fused dense path. Off by default behind `MTPLX_QSA_GATHER`;
+  parity-tested against the dense path on the real layer.
+
 ### Fixed
 
+- **The warm ladder yields to live traffic and no longer stamps the
+  traffic clock** (adapting community PR #300 by @Blakeolson21). A request
+  that had arrived but not yet completed read as an idle daemon, so the
+  first request of a serve could share the GPU with a warm rung; and warm
+  rungs stamped `last_request_at`, making /health report user traffic on
+  an untouched daemon while the ladder deferred against its own output.
+  Rung admission now checks live and queued foreground work as its own
+  branch (safe at zero idle grace), and warm generations no longer move
+  the request clock or counters anywhere.
 - **The Live tab's acceptance panel no longer goes blank after a finished
   request.** Two stacked causes: the daemon's idle warmup ladder published
   its rungs into the dashboard's `latest` slot, replacing the finished
