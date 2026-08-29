@@ -211,6 +211,25 @@ def context_copy_block_k() -> int:
     return base
 
 
+def context_copy_probation_k() -> int:
+    """Block cap while the copy lane is still unproven in this generation.
+
+    Misfired copy rounds verify 16-24-token blocks — a ~4x-cost forward vs
+    the normal q=4 round — and the acceptance EMA needs several rounds to
+    arm a suspension, so short coding-agent turns re-paid that tuition
+    every turn (2026-08-29 receipts: turn-long verify 60-88 ms/round at 8k
+    ctx with 21/96 copy tokens accepted; the same lane is a +16.7% win on
+    long-context re-emission). Until the EMA proves the content pays,
+    blocks stay this size; a proven lane opens to the full
+    MTPLX_CONTEXT_COPY_K. Winners lose at most two short blocks of upside;
+    losers pay a quarter of the old misfire cost.
+    """
+    try:
+        return max(2, int(os.environ.get("MTPLX_CONTEXT_COPY_PROBATION_K") or 8))
+    except ValueError:
+        return 8
+
+
 def context_copy_ng_min() -> int:
     try:
         return max(2, int(os.environ.get("MTPLX_CONTEXT_COPY_NGMIN") or 6))

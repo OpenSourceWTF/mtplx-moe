@@ -106,3 +106,40 @@ def test_ramp_lane_smoke_batched_parrot_stream_identical(monkeypatch):
     assert ramp.stats.context_copy_accepted_tokens > 0
     # Longer blocks -> at least as much committed per verify call.
     assert ramp.stats.verify_calls <= stock.stats.verify_calls
+
+
+def test_probation_k_default_and_env(monkeypatch):
+    # Probation cap (2026-08-29): copy blocks stay small until the lane's
+    # acceptance EMA proves the content pays — misfired 16-24-token blocks
+    # are ~4x-cost verify forwards and short coding-agent turns re-paid
+    # that tuition every turn before a suspension could arm.
+    from mtplx.context_copy import context_copy_probation_k
+
+    monkeypatch.delenv("MTPLX_CONTEXT_COPY_PROBATION_K", raising=False)
+    assert context_copy_probation_k() == 8
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY_PROBATION_K", "4")
+    assert context_copy_probation_k() == 4
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY_PROBATION_K", "1")
+    assert context_copy_probation_k() == 2  # floor
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY_PROBATION_K", "garbage")
+    assert context_copy_probation_k() == 8
+
+
+def test_probation_ema_contract_math():
+    # The gate is (seen >= 2 and ema >= 0.5) with ema' = 0.7*ema + 0.3*ratio
+    # from a 0.5 start. Two winning rounds must open the full block; two
+    # losing rounds must keep probation and put the lane one round from the
+    # (seen >= 3, ema < 0.35) suspension.
+    ema, seen = 0.5, 0
+    for ratio in (1.0, 1.0):
+        ema = 0.7 * ema + 0.3 * min(1.0, ratio)
+        seen += 1
+    assert seen >= 2 and ema >= 0.5  # winners open up by round 3
+    ema, seen = 0.5, 0
+    for ratio in (0.2, 0.2):
+        ema = 0.7 * ema + 0.3 * min(1.0, ratio)
+        seen += 1
+    assert not (seen >= 2 and ema >= 0.5)  # losers stay on probation
+    ema = 0.7 * ema + 0.3 * 0.2
+    seen += 1
+    assert seen >= 3 and ema < 0.35  # and suspend on the third miss

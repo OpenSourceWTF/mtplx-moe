@@ -181,6 +181,17 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **The context-copy lane earns its block size before spending it.** Copy
+  rounds verify 16-24-token candidate blocks — a ~4x-cost forward versus a
+  normal round — and the acceptance gate needed four sampled rounds per
+  generation before it could suspend, so short coding-agent turns re-paid
+  the full misfire cost every turn (measured: whole-turn verify 60-88
+  ms/round at 8k context with 21/96 copy tokens accepted, decode down to
+  ~27 tok/s). Blocks now stay at 8 tokens
+  (`MTPLX_CONTEXT_COPY_PROBATION_K`) until the turn's acceptance EMA
+  proves the content pays, and the suspension arms one round earlier.
+  Long-context re-emission — where the lane is a measured +16.7% — opens
+  to full blocks by its third round and keeps its win.
 - **SSD spills no longer fire mid-turn: the writer's foreground pause now
   outlasts a long coding turn.** The writer already stood down while a
   request was in flight, but its liveness bound was 60 s — shorter than a

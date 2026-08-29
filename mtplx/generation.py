@@ -8709,6 +8709,7 @@ def generate_mtpk(
                                context_copy_block_k,
                                context_copy_enabled, context_copy_min_ext,
                                context_copy_ng_max, context_copy_ng_min,
+                               context_copy_probation_k,
                                context_copy_target_prefix_enabled)
     # Temperature is supported through the same probability-ratio acceptance
     # as the MTP path: the copy block is a point-mass proposal, so a copied
@@ -8775,6 +8776,7 @@ def generate_mtpk(
     _cc_streak_outstanding = 0  # substituted drafts not yet seen by the sync
     ccopy_index = None
     ccopy_k = context_copy_block_k()
+    ccopy_probation_k = min(ccopy_k, context_copy_probation_k())
     ccopy_min_ext = context_copy_min_ext()
     ccopy_ng_min = context_copy_ng_min()
     ccopy_ng_max = context_copy_ng_max()
@@ -9157,7 +9159,7 @@ def generate_mtpk(
                     ccopy_seen += 1
                     if _cc_ratio >= 0.5:
                         ccopy_backoff = 64
-                    if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                    if ccopy_seen >= 3 and ccopy_ema < 0.35:
                         ccopy_suspend_until = len(tokens) + ccopy_backoff
                         ccopy_backoff = min(ccopy_backoff * 2, 4096)
                         ccopy_ema, ccopy_seen = 0.5, 0
@@ -9197,7 +9199,19 @@ def generate_mtpk(
             _cc_pos, _cc_ext = ccopy_index.find(_cc_hist, max_pos=len(prompt_ids))
             _cc_block: list[int] = []
             if _cc_pos is not None and _cc_ext >= ccopy_min_ext:
-                _cc_klen = block_for_ext(_cc_ext, ccopy_k)
+                # Probation: full-size blocks only after the acceptance EMA
+                # proves this content pays (>=2 sampled rounds holding the
+                # 0.5 starting EMA or better). Misfired 16-24-token blocks
+                # are ~4x-cost verify forwards, and short coding-agent turns
+                # re-paid that tuition every turn before suspension armed
+                # (2026-08-29: verify 60-88 ms/round at 8k ctx, 21/96 copy
+                # tokens accepted, whole-turn decode 27 tok/s).
+                _cc_k_now = (
+                    ccopy_k
+                    if (ccopy_seen >= 2 and ccopy_ema >= 0.5)
+                    else ccopy_probation_k
+                )
+                _cc_klen = block_for_ext(_cc_ext, _cc_k_now)
                 _cc_block = [int(t) for t in prompt_ids[_cc_pos:_cc_pos + _cc_klen]]
                 _cc_block = _cc_block[: max(1, max_tokens - len(tokens))]
                 if constraint is not None:
@@ -9463,7 +9477,7 @@ def generate_mtpk(
                 ccopy_seen += 1
                 if _cc_nacc / len(_cc_block) >= 0.5:
                     ccopy_backoff = 64          # copy is paying again: full retry rate
-                if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                if ccopy_seen >= 3 and ccopy_ema < 0.35:
                     # acceptance collapsed (novel region with incidental repeats):
                     # suspend copy rounds and let the MTP head work; retry with
                     # exponential backoff so recurring probes stay cheap
@@ -9690,7 +9704,7 @@ def generate_mtpk(
                 ccopy_seen += 1
                 if _cb_nacc / len(_cb_block) >= 0.5:
                     ccopy_backoff = 64
-                if ccopy_seen >= 4 and ccopy_ema < 0.35:
+                if ccopy_seen >= 3 and ccopy_ema < 0.35:
                     ccopy_suspend_until = len(tokens) + ccopy_backoff
                     ccopy_backoff = min(ccopy_backoff * 2, 4096)
                     ccopy_ema, ccopy_seen = 0.5, 0
