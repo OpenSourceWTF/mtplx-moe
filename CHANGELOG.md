@@ -181,6 +181,19 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **Long sessions persist to SSD: the writer's backlog budget no longer
+  rejects a snapshot bigger than itself** (#384, thanks @sapiens77 for a
+  forensic-grade report). The SSD writer bounds queued bytes at 4 GiB by
+  default, but a single snapshot larger than the whole budget failed
+  admission on every attempt even with an empty queue — at roughly 84
+  KB/token of 27B KV that turned the SSD tier silently off past ~50k
+  tokens, with only a counter as the trace. An empty queue is not backlog
+  pressure: a lone oversized entry is now admitted, logged by name, and
+  counted in `/admin/cache/ssd` as `admitted_oversized_alone`; a genuinely
+  backlogged writer still rejects. The reporter measured 41.7x TTFT across
+  a restart (282 s to 6.8 s) once writes could land. Also from the same
+  thread: `request_session_source` now reports the header source instead
+  of null for header-identified sessions.
 - **The memory governor's ceiling never evicts the live session's cache.**
   The dynamic bank ceiling subtracts an instantaneous working-set reading,
   so a deep prefill's transient allocator spike read as a standing
