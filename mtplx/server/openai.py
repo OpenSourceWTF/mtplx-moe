@@ -16447,12 +16447,20 @@ async def _memory_pressure_loop(
             level = await asyncio.to_thread(_memory_pressure_level)
             level_source = "macos"
             allocator_level, allocator_fraction = _allocator_pressure_level(state)
-            if allocator_level > level:
+            if allocator_level >= 2 and allocator_level >= level:
                 # The allocator sees the wall minutes before macOS does
                 # (see _allocator_pressure_level); the guard acts on
-                # whichever signal is worse.
+                # whichever signal is worse. Ties at WARNING+ blame the
+                # allocator: the "macos" copy asserts the engine footprint
+                # is steady, which is false while the allocator is also at
+                # its ceiling.
                 level = allocator_level
                 level_source = "allocator"
+            elif level >= 2 and allocator_fraction <= 0.0:
+                # macOS reports pressure but the allocator probe bailed
+                # (no Metal limit configured, or zero active memory), so
+                # engine steadiness cannot be attested either way.
+                level_source = "unknown"
             state.dashboard.last_memory_pressure_level = level
             state.dashboard.last_memory_pressure_source = level_source
             state.dashboard.last_allocator_fraction = float(allocator_fraction)

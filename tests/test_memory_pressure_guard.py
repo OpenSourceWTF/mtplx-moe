@@ -217,9 +217,56 @@ def test_allocator_pressure_escalates_before_macos(monkeypatch):
 def test_macos_sourced_warning_stamps_external_attribution(monkeypatch):
     bank = FakeBank(total=8 << 30, max_bytes=8 << 30)
     state = make_state(bank)
+    state.metal_memory_caps = {"memory_limit_bytes": 100 << 30}
+    monkeypatch.setattr(
+        srv,
+        "_mlx_memory_stats_live",
+        lambda: {
+            "ok": True,
+            "active_memory_bytes": 10 << 30,
+            "cache_memory_bytes": 1 << 30,
+        },
+    )
     run_one_tick(state, level=2, monkeypatch=monkeypatch)
     assert state.dashboard.last_memory_pressure_level == 2
+    # The allocator probe read a genuinely healthy fraction, so the
+    # external attribution ("another process") is attested, not assumed.
     assert state.dashboard.last_memory_pressure_source == "macos"
+
+
+def test_macos_warning_without_allocator_reading_stamps_unknown(monkeypatch):
+    # No Metal caps: the allocator probe bails (fraction 0.0). The old
+    # code still blamed "macos", and the app copy then asserted the
+    # engine footprint was steady with nothing to back it. Now the
+    # source is "unknown" and the banner stays neutral.
+    bank = FakeBank(total=8 << 30, max_bytes=8 << 30)
+    state = make_state(bank)
+    run_one_tick(state, level=2, monkeypatch=monkeypatch)
+    assert state.dashboard.last_memory_pressure_level == 2
+    assert state.dashboard.last_memory_pressure_source == "unknown"
+
+
+def test_tied_warning_blames_allocator(monkeypatch):
+    # macOS WARNING and the allocator at 99% in the same tick: the old
+    # strict > kept the "macos" attribution (banner: "another process...
+    # the engine's own footprint is steady"), inverting the blame while
+    # the engine itself sat at the wall. Ties at WARNING+ now name the
+    # allocator.
+    bank = FakeBank(total=8 << 30, max_bytes=8 << 30)
+    state = make_state(bank)
+    state.metal_memory_caps = {"memory_limit_bytes": 100 << 30}
+    monkeypatch.setattr(
+        srv,
+        "_mlx_memory_stats_live",
+        lambda: {
+            "ok": True,
+            "active_memory_bytes": 95 << 30,
+            "cache_memory_bytes": 4 << 30,
+        },
+    )
+    run_one_tick(state, level=2, monkeypatch=monkeypatch)
+    assert state.dashboard.last_memory_pressure_level == 2
+    assert state.dashboard.last_memory_pressure_source == "allocator"
 
 
 def test_allocator_pressure_below_threshold_stays_normal():

@@ -518,6 +518,9 @@ struct MemoryGuardBanner: View {
     }
 
     private var externalSource: Bool { pressureSource == "macos" }
+    /// Daemon could not attribute the pressure (allocator probe bailed):
+    /// neither "another process" nor "the allocator" can be claimed.
+    private var unknownSource: Bool { pressureSource == "unknown" }
 
     private func title(critical: Bool) -> String {
         if critical { return "Critical memory pressure" }
@@ -533,6 +536,8 @@ struct MemoryGuardBanner: View {
             text = "Warm sessions are being demoted to SSD ahead of any swap. Turns may restore from disk (seconds) instead of RAM."
         } else if externalSource {
             text = "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted."
+        } else if unknownSource {
+            text = "This Mac is under memory pressure. Nothing has been evicted; caches yield to SSD before any swap if it stays here."
         } else {
             text = "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here."
         }
@@ -541,7 +546,7 @@ struct MemoryGuardBanner: View {
            let resolved = plan.contextWindowResolved,
            let fit = plan.contextWindowFit
         {
-            text += " Context window \(resolved) exceeds this Mac's fit of \(fit) tokens — lower it (or use q8 KV quantization) to stop this recurring."
+            text += " Context window \(resolved.formatted()) exceeds this Mac's fit of \(fit.formatted()) tokens. Lower it to stop this recurring."
         }
         return text
     }
