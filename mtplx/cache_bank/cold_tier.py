@@ -695,7 +695,27 @@ class SessionBankColdTier:
             this dict stays empty on purpose."""
 
             def __setitem__(self, name: str, raw: bytes) -> None:  # noqa: N804
-                tier._pause_for_foreground()
+                # Abort, never wait (2026-08-29). This sink runs on the
+                # single model-owner thread (spill_entry runs on the idle
+                # lane), and foreground_busy counts QUEUED work — a request
+                # queued behind this very spill cannot start until the
+                # spill yields the thread, so a _pause_for_foreground here
+                # could never see busy clear: it ran out its full deadline
+                # (600 s of frozen TTFT) before writing anyway. Busy on
+                # the encode path therefore means raise, same contract as
+                # the codec's per-tensor check: nothing restorable is left
+                # behind (payload.json + manifest row land only at the
+                # end) and session_bank re-dispatches the coalesce-keyed
+                # job for the next idle window. The WRITER-thread pause in
+                # _writer_loop keeps waiting on purpose — nothing queues
+                # behind that thread (ac0386d0 decode-theft fix).
+                if should_abort is not None:
+                    try:
+                        busy = bool(should_abort())
+                    except Exception:
+                        busy = False
+                    if busy:
+                        raise ColdEncodeInterrupted()
                 if tier._stop.is_set():
                     raise ColdEncodeInterrupted()
                 digest = hashlib.sha256(raw).hexdigest()

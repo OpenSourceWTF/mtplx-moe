@@ -17,6 +17,7 @@ shrink test spun an eviction loop to 122 GB once).
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import mlx.core as mx
@@ -258,6 +259,63 @@ def test_interrupted_live_ref_spill_redispatches(tmp_path):
         cold.foreground_busy = lambda: False
         assert jobs[1]() is True
         assert cold.stats()["spill_writes_completed"] == 1
+    finally:
+        cold.close()
+
+
+def test_spill_sink_yields_instead_of_pausing_on_encode_thread(tmp_path):
+    """A request arriving DURING a streaming spill aborts it at the next
+    tensor boundary — never waits it out (2026-08-29 freeze: the sink
+    called _pause_for_foreground on the model-owner thread, but
+    foreground_busy counts QUEUED work and the single-owner scheduler
+    never preempts, so a request queued behind the running spill could
+    never clear busy — the pause always ran its full 600 s deadline, one
+    frozen TTFT per arrival). Busy on the encode thread means raise; the
+    sleep-loop pause belongs to the writer thread alone."""
+    cold = make_cold(tmp_path)
+    try:
+        pause_calls = []
+        original_pause = cold._pause_for_foreground
+
+        def recording_pause():
+            pause_calls.append(time.monotonic())
+            original_pause()
+
+        cold._pause_for_foreground = recording_pause
+        blob_dir = tmp_path / "session-bank" / "blobs"
+        # False until the first tensor blob lands on disk, True forever
+        # after — a foreground arrival keyed to real sink progress.
+        cold.foreground_busy = lambda: any(blob_dir.rglob("*.bin"))
+        bank = SessionBank()
+        entry = put_small_entry(bank)
+        started = time.monotonic()
+        stored = cold.spill_entry(entry, capabilities=["ar_insert"])
+        elapsed = time.monotonic() - started
+        assert stored is False
+        assert elapsed < 1.0, (
+            f"spill blocked {elapsed:.1f}s: the sink waited for foreground "
+            "instead of yielding"
+        )
+        # At least one tensor was written before busy flipped, so the
+        # abort really fired mid-encode, not at the first codec check.
+        assert any(blob_dir.rglob("*.bin"))
+        # The owner-thread spill path must never enter the writer's
+        # sleep-loop pause.
+        assert pause_calls == []
+        stats = cold.stats()
+        assert stats["encode_yields_foreground"] == 1
+        assert stats.get("spill_writes_completed", 0) == 0
+        # No partial manifest entry or payload survives the abort: the
+        # blob store holds orphan blobs only (existing orphan cleanup
+        # territory), nothing restorable.
+        assert cold.lookup([1, 2, 3, 4, 5], **LOOKUP_IDENTITY) is None
+        assert not list(
+            (tmp_path / "session-bank" / "entries").rglob("payload.json")
+        )
+        # Writer-pause stats belong to the writer thread only.
+        assert stats["writer_foreground_pauses"] == 0
+        assert stats["writer_pause_expired_busy"] == 0
+        assert stats["writer_foreground_pause_s"] == 0.0
     finally:
         cold.close()
 

@@ -131,6 +131,10 @@ def test_writer_pauses_while_foreground_busy(tmp_path):
     assert stats_end["writes_completed"] >= 1
     assert stats_end["writer_foreground_pauses"] >= 1
     assert stats_end["writer_foreground_pause_s"] > 0.0
+    # The writer THREAD keeps its wait-out-the-turn pause (ac0386d0);
+    # only the owner-thread encode/spill paths yield. The pause here must
+    # not masquerade as an encode yield (2026-08-29 spill-sink fix).
+    assert stats_end["encode_yields_foreground"] == 0
     # The write must not have completed while we were holding it busy,
     # unless it slipped in before the flip (tolerated: pause counter proves
     # the writer honored the signal at least once).
