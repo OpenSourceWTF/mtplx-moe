@@ -17924,8 +17924,9 @@ def _record_stream_cancellation_metric(
         envelope.update(_mlx_allocator_public_stats())
     envelope.update(request_observability)
     _record_request_metrics(state, envelope)
-    state.last_request_at = time.time()
-    state.requests_cancelled = int(getattr(state, "requests_cancelled", 0) or 0) + 1
+    if not bool(envelope.get("warmup")):
+        state.last_request_at = time.time()
+        state.requests_cancelled = int(getattr(state, "requests_cancelled", 0) or 0) + 1
     try:
         state.dashboard.bus.publish(
             {
@@ -20267,8 +20268,13 @@ def _finalize_batched_ar_generation(
     if not bool(envelope.get("warmup")):
         state.last_metrics.append(dict(envelope))
         state.last_metrics = state.last_metrics[-100:]
-    state.last_request_at = time.time()
-    state.requests_completed += 1
+        # Warming generations are not user requests (adapting community PR
+        # #300 by @Blakeolson21): stamping the traffic clock from a warm rung
+        # made the ladder defer against its own output and made /health
+        # report user traffic on an untouched daemon. Clock and counter move
+        # together so the two /health fields cannot disagree.
+        state.last_request_at = time.time()
+        state.requests_completed += 1
     _dashboard_record_completion(state, envelope=envelope, stats=stats)
     generated["stats"] = _json_safe(stats)
     generated["completion_tokens"] = completion_tokens
@@ -20463,8 +20469,13 @@ def _finalize_mtp_batch_generation(
     if not bool(envelope.get("warmup")):
         state.last_metrics.append(dict(envelope))
         state.last_metrics = state.last_metrics[-100:]
-    state.last_request_at = time.time()
-    state.requests_completed += 1
+        # Warming generations are not user requests (adapting community PR
+        # #300 by @Blakeolson21): stamping the traffic clock from a warm rung
+        # made the ladder defer against its own output and made /health
+        # report user traffic on an untouched daemon. Clock and counter move
+        # together so the two /health fields cannot disagree.
+        state.last_request_at = time.time()
+        state.requests_completed += 1
     _dashboard_record_completion(state, envelope=envelope, stats=stats)
     generated["stats"] = _json_safe(stats)
     generated["completion_tokens"] = completion_tokens
@@ -22262,8 +22273,11 @@ def _run_generation(
             else (getattr(out, "finish_reason", None) or "stop")
         )
         _record_request_metrics(state, dict(envelope))
-        state.last_request_at = time.time()
-        state.requests_completed += 1
+        if not bool(envelope.get("warmup")):
+            # Same contract as the batch lanes: warm rungs never stamp the
+            # traffic clock (adapting community PR #300 by @Blakeolson21).
+            state.last_request_at = time.time()
+            state.requests_completed += 1
         _dashboard_record_completion(state, envelope=envelope, stats=stats)
         last = {
             "text": out.text,
@@ -22501,10 +22515,40 @@ class _BackgroundWarmup:
                 return cls.IDLE_GRACE_S
         return cls.IDLE_GRACE_S
 
+    def _foreground_busy(self) -> bool:
+        """True while a real request is generating or queued for the model.
+
+        Only sound at step admission. The warming generation itself calls
+        ``begin_foreground`` for the whole rung, so ``has_foreground()``
+        reads zero here but non-zero once the rung is running: a caller
+        that re-checked from inside a rung would see warmup's own work as
+        live traffic and defer the ladder forever. That is why the sibling
+        ``_ForegroundYield`` reads the scheduler queues instead -- it runs
+        during the rung, this runs before it.
+        """
+        state = self.state
+        try:
+            if state.has_foreground():
+                return True
+        except BaseException:
+            pass
+        try:
+            return bool(_foreground_model_work_pending(state))
+        except BaseException:
+            return False
+
     def _foreground_quiet_for_s(self) -> float:
+        # last_request_at is stamped when a request COMPLETES, so a request
+        # that has arrived and is still generating leaves it untouched --
+        # 0.0 on a daemon that has not finished one yet, which read as
+        # "infinitely quiet" and admitted a warm rung against live traffic.
+        # That is the post-restart window an operator actually types into,
+        # so the very first request of a serve was the one most likely to
+        # be warmed over. In-flight and queued work is _foreground_busy's
+        # answer; this measures the completion stamp alone.
         last = float(getattr(self.state, "last_request_at", 0.0) or 0.0)
         if last <= 0.0:
-            # No request has ever landed (fresh boot): warm immediately.
+            # Nothing has ever completed: no traffic to stay clear of.
             return float("inf")
         return max(0.0, time.time() - last)
 
@@ -22540,10 +22584,15 @@ class _BackgroundWarmup:
             self._finish()
             return
         grace = self._idle_grace_s()
-        quiet = self._foreground_quiet_for_s()
-        if quiet < grace:
-            # Recently-served traffic: hold the plan without burning GPU or
-            # the resubmit budget, and re-check when the grace can be met.
+        busy = self._foreground_busy()
+        quiet = 0.0 if busy else self._foreground_quiet_for_s()
+        if busy or quiet < grace:
+            # Live or recently-served traffic: hold the plan without burning
+            # GPU or the resubmit budget, and re-check when the grace can be
+            # met. Busy is its own branch, not a zero folded into the grace
+            # comparison: MTPLX_WARMUP_IDLE_GRACE_S=0 is how an operator says
+            # "do not wait between turns", and it must not also hand a warm
+            # rung a request that is still generating.
             step = self.steps[index]
             if step.get("state") in ("pending", "yielded", "waiting_idle"):
                 step["state"] = "waiting_idle"
