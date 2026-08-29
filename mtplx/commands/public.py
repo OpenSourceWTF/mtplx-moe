@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import hashlib
 import json
@@ -10126,11 +10127,37 @@ class _MaxIdleWatchdog:
                 self._is_max = False
 
 
+def _piped_prompt_text() -> str:
+    """Prompt text waiting on a piped stdin, or ``""`` when there is none.
+
+    ``echo "..." | mtplx run`` is the shape every other CLI honors. Returns
+    ``""`` — never raises — when stdin is a terminal, is absent, or is a stream
+    that refuses reads (a captured test stdin, a detached daemon), so callers
+    keep their own "requires a prompt" error for exactly those cases.
+    """
+
+    stream = getattr(sys, "stdin", None)
+    if stream is None:
+        return ""
+    try:
+        if stream.isatty():
+            return ""
+        return str(stream.read() or "").strip()
+    except (OSError, ValueError):
+        # An unreadable stdin means "no piped prompt", not a failure worth
+        # reporting on its own — the caller's own error is the useful one.
+        return ""
+
+
 def _generate_one_shot_public(
     args: Any, *, command: str
 ) -> tuple[int, dict[str, Any], list[Any]]:
     fan_mode = _fan_mode_from_args(args)
     prompt = getattr(args, "prompt", None) or getattr(args, "prompt_arg", None)
+    if not prompt:
+        # Nothing on the command line: accept the prompt from a pipe before
+        # giving up, so `cat bug.py | mtplx run` works like every other tool.
+        prompt = _piped_prompt_text()
     if not prompt:
         raise SystemExit(f"mtplx {command} requires a prompt")
     depth_error = _validate_public_depth(args, printer=lambda _line: None)
@@ -10499,6 +10526,41 @@ def _handle_quickstart_reasoning_command(args: Any, prompt: str) -> bool:
     return True
 
 
+def _handle_quickstart_effort_command(args: Any, prompt: str) -> bool:
+    """`/effort <level|status>` — the live twin of ``--reasoning-effort``.
+
+    ``_quickstart_generate`` re-reads ``args.reasoning_effort`` on every turn
+    (through ``_one_shot_reasoning_effort``), so setting it here really does
+    change the next answer, exactly like ``/reasoning`` does for the mode.
+    """
+
+    parts = prompt.strip().split()
+    if not parts or parts[0].lower() not in {"/effort", "--effort"}:
+        return False
+    levels = "|".join(REASONING_EFFORT_CHOICES)
+    if len(parts) == 1 or parts[1].lower() == "status":
+        _quickstart_line(f"Reasoning effort: {_quickstart_effort_label(args)}")
+        _quickstart_line(f"try: /effort {levels}")
+        return True
+    if len(parts) == 2 and parts[1].lower() in REASONING_EFFORT_CHOICES:
+        setattr(args, "reasoning_effort", parts[1].lower())
+        _quickstart_line(f"Reasoning effort: {_quickstart_effort_label(args)}")
+        return True
+    _quickstart_line(f"usage: /effort {levels}|status")
+    return True
+
+
+def _quickstart_effort_label(args: Any) -> str:
+    """How the live effort dial reads to the user.
+
+    ``auto`` is not a level — it defers to the loaded family's default — so
+    say that rather than printing a word the model never sees.
+    """
+
+    effort = str(getattr(args, "reasoning_effort", None) or "auto").strip().lower()
+    return "auto (model default)" if effort == "auto" else effort
+
+
 def _handle_quickstart_mtp_command(
     args: Any, prompt: str, *, runtime: Any | None = None
 ) -> bool:
@@ -10549,6 +10611,50 @@ def _quickstart_console() -> Any:
         return None
 
 
+CHAT_HISTORY_PATH = Path("~/.mtplx/history").expanduser()
+CHAT_HISTORY_LENGTH = 1000
+
+# True once ``readline`` is driving the chat REPL's ``input()`` calls. It
+# changes how the prompt has to be written (see ``_chat_input_prompt``), so the
+# fact has to outlive ``_enable_chat_line_editing``.
+_CHAT_LINE_EDITING = False
+
+
+def _enable_chat_line_editing() -> None:
+    """Give the terminal chat arrow-key editing and a history that persists.
+
+    Importing ``readline`` is the whole trick: bare ``input()`` is a raw line
+    reader, so today an up-arrow arrives as a literal ``^[[A`` and nothing
+    survives the session. The import installs editing; the rest is history.
+
+    Every step is best-effort by design. A Python built without readline, a
+    corrupt history file, or a read-only home must all degrade to a plain
+    prompt — a convenience feature never takes the chat down with it.
+    """
+
+    global _CHAT_LINE_EDITING
+    try:
+        import readline
+    except ImportError:
+        return
+
+    try:
+        readline.read_history_file(CHAT_HISTORY_PATH)
+    except (OSError, ValueError):
+        pass  # no history yet, or a file readline cannot parse: start empty
+    readline.set_history_length(CHAT_HISTORY_LENGTH)
+
+    def _save_history() -> None:
+        try:
+            CHAT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(CHAT_HISTORY_PATH)
+        except OSError:
+            pass  # read-only home or a full disk: losing history is not fatal
+
+    atexit.register(_save_history)
+    _CHAT_LINE_EDITING = True
+
+
 def _chat_input_prompt() -> str:
     """Prompt string for the chat REPL ``input()`` call.
 
@@ -10557,9 +10663,25 @@ def _chat_input_prompt() -> str:
 
     if not sys.stdout.isatty():
         return "\nyou> "
+
     # ANSI bold cyan for "you", reset, then bold "> ", then reset.
     # Avoid using rich here; ``input()`` does not interact well with rich Live.
-    return "\n\033[1;36myou\033[0m\033[1m>\033[0m "
+    # Under readline every non-printing byte must sit inside \001..\002 or it
+    # is counted as prompt width, and editing a wrapped line then redraws over
+    # the prompt itself.
+    def _esc(code: str) -> str:
+        return ("\001" + code + "\002") if _CHAT_LINE_EDITING else code
+
+    return (
+        "\n"
+        + _esc("\033[1;36m")
+        + "you"
+        + _esc("\033[0m")
+        + _esc("\033[1m")
+        + ">"
+        + _esc("\033[0m")
+        + " "
+    )
 
 
 def _print_assistant_fallback(label: str, text: str) -> None:
@@ -13449,13 +13571,21 @@ def _quickstart_run_terminal_chat_body(
         return run_turn(str(first_prompt), 0)
 
     if not sys.stdin.isatty():
+        # A piped prompt is a one-shot, not a broken REPL: answer it through
+        # the same turn path `--prompt` uses above. Only an *empty* pipe is
+        # the no-terminal case the refusal below was written for.
+        piped_prompt = _piped_prompt_text()
+        if piped_prompt:
+            return run_turn(piped_prompt, 0)
         _quickstart_line("error: no interactive terminal detected")
         prompt_hint = _start_invocation(args, ' --prompt "Say hi"')
         _quickstart_line(f"try: {prompt_hint}")
         return 2
 
+    _enable_chat_line_editing()
     _quickstart_line(
-        "Chat is ready. Type /mtp on|off|status, /stats, /speed, /reasoning on|off|auto, or /exit."
+        "Chat is ready. Type /mtp on|off|status, /stats, /speed, "
+        "/reasoning on|off|auto, /effort <level>, or /exit."
     )
     turn_index = 0
     worst_code = 0
@@ -13472,6 +13602,8 @@ def _quickstart_run_terminal_chat_body(
             _quickstart_line("bye")
             return worst_code
         if _handle_quickstart_reasoning_command(args, prompt):
+            continue
+        if _handle_quickstart_effort_command(args, prompt):
             continue
         if _handle_quickstart_mtp_command(args, prompt, runtime=rt):
             continue
