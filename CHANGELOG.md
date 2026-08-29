@@ -194,6 +194,16 @@ All notable user-facing changes to MTPLX. The format is based on
   to full blocks by its third round and keeps its win. The batched verify
   lane (Flash-Next's copy mechanic, above) carries the identical
   probation contract.
+- **Greedy draft coupling engages on launch-default-greedy servers.** The
+  draft-sampler resolver received the raw request `temperature` — `None`
+  when a client omits the field — so a server launched with
+  `--temperature 0` serving such a client decoded greedily while drafts
+  stayed at the family default (1.0): the silent sampled-draft acceptance
+  collapse ([79/65/42]% by depth vs [96/87/76]% coupled), with no
+  `draft_sampler_greedy_coupled` stamp to show for it. Both serve lanes
+  now hand the resolver the effective sampler temperature, matching the
+  resolver's documented contract; explicit-temperature requests were
+  never affected.
 - **SSD spills no longer fire mid-turn: the writer's foreground pause now
   outlasts a long coding turn.** The writer already stood down while a
   request was in flight, but its liveness bound was 60 s — shorter than a

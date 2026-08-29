@@ -20916,7 +20916,9 @@ def _run_mtp_batch_generation_dispatched(
     draft_sampler = _resolve_draft_sampler_for_request(
         state,
         request_draft_sampler=kwargs.get("draft_sampler"),
-        target_temperature=kwargs.get("temperature"),
+        # Effective temperature, not the raw kwarg (None when omitted) —
+        # same coupling contract as the serial lane.
+        target_temperature=float(sampler.temperature),
         target_sampler=sampler,
         request_observability=request_observability,
     )
@@ -21780,7 +21782,11 @@ def _run_generation(
         else _resolve_draft_sampler_for_request(
             state,
             request_draft_sampler=draft_sampler,
-            target_temperature=temperature,
+            # Effective temperature, not the raw request field: the field is
+            # None when the client omits it while the launch default still
+            # decodes greedily, and a None here skips greedy coupling — a
+            # silent sampled-draft collapse ([79/65/42]% vs [96/87/76]%).
+            target_temperature=float(sampler.temperature),
             target_sampler=sampler,
             request_observability=request_observability,
         )
