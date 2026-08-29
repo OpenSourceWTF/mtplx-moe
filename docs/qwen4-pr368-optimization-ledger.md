@@ -79,12 +79,14 @@ not be treated as retained work.
 | Proposal-only draft-temperature sweep | With the target sampler fixed at temperature 1.0/top-p 0.95/top-k 20, draft temperature 0.8 produced 69.0417 TPS, 393/591 accepted drafts, and 601 verifier calls; draft temperature 1.2 produced 61.8749 TPS, 378/596 accepted drafts, and 607 verifier calls. The mirrored 1.0 control remains 69.7388 TPS mean, 391/600, and 605 calls. Different output trajectories were allowed because exact p/q correction preserves the target marginal | rejected and fully reverted; retain the production proposal sampler at 1.0/0.95/20 |
 | Generic 8-token context-copy probation after syncing upstream `4ce96908` | 65.1788 TPS, 17 copy rounds, 180 proposed copy tokens, 363/578 accepted drafts, and 595 verifier calls; this changed the stochastic trajectory and regressed 6.54% from the 69.7388 frontier mean | rejected for the exact Qwen4 lane; upstream default retained for other families |
 | Construction-bound Qwen4 24-token context-copy probation | No environment override: 69.6408 TPS, the original 5 copy rounds / 56 proposals, 391/600 accepted drafts, 605 verifier calls, zero repair, and the original output digest | retained; restores the proven schedule on current upstream main |
+| Row-serial early next-draft submission, full QSA roots | 63.3944 TPS / 16.1529 s decode versus the 69.6408 TPS / 14.7040 s current-main control. Output digest, 391/600 acceptance, 605 verifier calls, five context-copy rounds, and zero repair were unchanged. Draft attribution fell by 0.3496 s, but verify forward rose by 1.1748 s | rejected and generation integration removed; proactive async submission created verifier backpressure instead of eliminating work |
+| Row-serial early next-draft submission, output-owned roots only | 61.8677 TPS / 16.5515 s decode with the same exact digest and trajectory. Removing explicit cache roots did not recover the verifier; verify forward remained 1.3896 s above control | rejected and generation integration removed; the regression is the early async schedule, not duplicate cache roots |
 
 ## `mlx-serve` candidates
 
 | Upstream commit | Mechanism | Qwen4 M=2 assessment | Status |
 |---|---|---|---|
-| `f2601ba` | Build and async-dispatch the next MTP draft at the end of the current round | Directly targets the verifier-to-next-draft gap, but Qwen4 QSA, pooled/indexer, PLE, and MTP-cache state must all represent the committed prefix | high-priority audit |
+| `f2601ba` | Build and async-dispatch the next MTP draft at the end of the current round | Exact Qwen4 row-serial ports preserved state and trajectory, but measured 63.3944 and 61.8677 TPS versus the 69.6408 control because work shifted into verifier backpressure | rejected for this Qwen4 M=2 lane |
 | `3d437f`, `eafcc0` | Keep draft sampling lazy and feed the device token directly into verify | Targets the draft-to-target gap; MTPLX's host-backed n-gram provider still needs the draft ID for exact row acquisition | high-priority, partial fit |
 | `d032c1f`, `49610d7` | Device top-k/top-p/categorical sampling with row-axis-correct top-k | Fits temperature 1/top-k 20; preserve the target/draft RNG contract and exact p/q distributions | candidate building block |
 | `1e32a74` | Batch stochastic acceptance, correction samples, and recurrent-state capture into one async submission | Strong fit for the 0.598/0.325/0.174-second decision gaps after Qwen4 state ownership is proven | high-priority |
@@ -149,3 +151,6 @@ of the same pressure and must not be added to the 2.3191-second GPU-idle total.
    GPU idle/utilization does not regress.
 4. Keep the rejected M=2 split-K result as a geometry warning; do not retry it
    without a materially different mixed-scheduling design.
+5. Do not retry proactive next-draft `async_eval`; the next draft-side route must
+   remove Python graph construction through a fixed compiled M1 entrypoint while
+   preserving the default lazy submission order.

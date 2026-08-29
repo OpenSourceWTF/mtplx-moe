@@ -1,5 +1,13 @@
 # Qwen4 Row-Serial Cycle Fold Implementation Plan
 
+> **Outcome: rejected on the exact production gate.** The row-serial arithmetic
+> and output trajectory were exact, but proactive `mx.async_eval` moved work
+> into the following verifier and reduced decode throughput. The full-root
+> candidate measured 63.3944 tok/s (16.1529 s) and the output-owned isolate
+> measured 61.8677 tok/s (16.5515 s), versus the unchanged 69.6408 tok/s
+> (14.7040 s) control. Generation-loop and harness integration were removed.
+> The next investigation is compiled graph reuse without early async submission.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers-optimized:subagent-driven-development (recommended) or superpowers-optimized:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Submit the next exact Qwen4 depth-one MTP draft before CPU telemetry and streaming work, while retaining the existing sequential M1 arithmetic and complete QSA cache ownership.
@@ -10,7 +18,9 @@
 
 **Assumptions:**
 
-- Assumes the exact `qwen4_exp` one-layer MTP artifact and native `QSAKVCache` topology — will NOT install for another family, paged MTP cache, adapter-backed head, or different topology.
+- Assumes the exact `qwen4_exp` one-layer MTP artifact and its single native
+  `QSAKVCache` entry — will NOT install for another family, paged MTP cache,
+  adapter-backed head, or different topology.
 - Assumes depth one, persistent committed-history cache, `capture_commit`, no grammar constraint, and the stock stochastic draft loop — will NOT run for adaptive depth, context-copy-owned cycles, device draft cores, target-prefix verification, or request shapes other than the proven lane.
 - Assumes an already-built lazy history append is safe to chain into the next ordinary M1 draft on all-accept cycles — rejection tickets remain one physical M1 because the accepted-prefix cache owns no correction history row.
 
@@ -47,7 +57,7 @@
 def test_installer_binds_only_the_exact_qwen4_qsa_topology():
     runtime = exact_qwen4_runtime()
     report = install_qwen4_cycle_fold(runtime, config=exact_qwen4_config())
-    assert report == {"installed": True, "ticket_rows": 1, "qsa_layers": 48}
+    assert report == {"installed": True, "ticket_rows": 1, "qsa_layers": 1}
     assert callable(runtime.qwen4_cycle_fold_issue)
 
 
@@ -123,7 +133,12 @@ def _issue_qwen4_cycle_fold(
     )
 ```
 
-`install_qwen4_cycle_fold` must validate the exact config and a newly constructed cache's 48 QSA containers once, then bind `_issue_qwen4_cycle_fold` with `MethodType`. Add `qwen4_cycle_fold_issue: Callable[..., Any] | None = field(default=None, init=False, repr=False)` to `MTPLXRuntime`. Call the installer from `install_qwen4_capture_route` only after every existing capture invariant succeeds.
+`install_qwen4_cycle_fold` must validate the exact config and the actual runtime
+cache allocation route's single QSA entry once, then bind
+`_issue_qwen4_cycle_fold` with `MethodType`. Add
+`qwen4_cycle_fold_issue: Callable[..., Any] | None = field(default=None,
+init=False, repr=False)` to `MTPLXRuntime`. Install only after the exact
+depth-one n-gram/runtime resources have been bound.
 
 - [ ] **Step 4: Run focused tests and verify GREEN**
 
@@ -286,6 +301,11 @@ git commit -m "test(qwen4): gate row-serial fold on exact production state"
 ```
 
 ### Task 4: Counterbalanced production and profiler gate
+
+**Measured disposition:** rejected before ABBA because both exact candidate
+isolates were materially below the existing control while preserving the same
+prompt digest, output digest, 391/600 acceptance trajectory, 605 verifier calls,
+five context-copy rounds, and zero repair.
 
 **Files:**
 - Modify: `docs/qwen4-pr368-optimization-ledger.md`

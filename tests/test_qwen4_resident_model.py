@@ -62,7 +62,7 @@ def _tiny_args():
 
 def test_qwen4_uses_resident_switch_glu_for_target_and_mtp() -> None:
     from mlx_lm.models.switch_layers import SwitchGLU
-    from mtplx.models.qwen4_omlx import Model
+    from mtplx.models.qwen4_omlx import Model, QSAKVCache
 
     model = Model(_tiny_args())
     target_switch = model.language_model.model.layers[0].mlp.switch_mlp
@@ -74,6 +74,7 @@ def test_qwen4_uses_resident_switch_glu_for_target_and_mtp() -> None:
     assert any("model.layers.0.mlp.switch_mlp" in name for name in parameter_names)
     assert any("mtp.layers.0.mlp.switch_mlp" in name for name in parameter_names)
     assert not hasattr(model, "streamed_layers")
+    assert [type(entry) for entry in model.make_mtp_cache()] == [QSAKVCache]
     assert validate_mtp_support(model) is True
 
 

@@ -1198,14 +1198,6 @@ def load(
         if is_exact_qwen4_capture_config(config):
             capture_report = install_qwen4_capture_route(runtime, config=config)
             logger.info("[qwen4-capture] %s", capture_report)
-            from .qwen4_cycle_fold import (
-                install_qwen4_cycle_fold,
-                qwen4_cycle_fold_enabled,
-            )
-
-            if qwen4_cycle_fold_enabled():
-                cycle_fold_report = install_qwen4_cycle_fold(runtime, config=config)
-                logger.info("[qwen4-cycle-fold] %s", cycle_fold_report)
     if whole_moe_plan is not None:
         if compiled_target_factory is None:
             from .a3b_whole_moe import A3BWholeMoeConfigError
@@ -1246,6 +1238,18 @@ def load(
             )
             runtime.ngram_memory_report = ngram_resources.report
             ngram_owners.clear()
+            if str(config.get("model_type") or "").lower() == "qwen4_exp":
+                from .qwen4_cycle_fold import (
+                    install_qwen4_cycle_fold,
+                    qwen4_cycle_fold_enabled,
+                )
+
+                if qwen4_cycle_fold_enabled():
+                    cycle_fold_report = install_qwen4_cycle_fold(
+                        runtime,
+                        config=config,
+                    )
+                    logger.info("[qwen4-cycle-fold] %s", cycle_fold_report)
     except BaseException:
         for owner in ngram_owners:
             try:

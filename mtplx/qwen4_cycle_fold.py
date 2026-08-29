@@ -84,16 +84,20 @@ def _issue_qwen4_cycle_fold(
 
 
 def install_qwen4_cycle_fold(runtime: Any, *, config: dict[str, Any]) -> dict[str, Any]:
-    """Prove the native 48-layer QSA topology and bind the direct issuer."""
+    """Prove the native one-layer MTP QSA topology and bind the direct issuer."""
 
     from .qwen4_capture import is_exact_qwen4_capture_config
 
     if not is_exact_qwen4_capture_config(config):
         raise Qwen4CycleFoldConfigError("cycle fold requires exact Qwen4 config")
-    cache = runtime.model.make_mtp_cache()
-    if len(cache) != 48 or any(type(entry) is not QSAKVCache for entry in cache):
+    if not bool(getattr(runtime, "qwen4_depth1_batched_target_arrays", False)):
         raise Qwen4CycleFoldConfigError(
-            "cycle fold requires exactly 48 QSA cache entries"
+            "cycle fold requires the exact depth-one runtime to be bound"
+        )
+    cache = runtime.make_mtp_cache()
+    if len(cache) != 1 or type(cache[0]) is not QSAKVCache:
+        raise Qwen4CycleFoldConfigError(
+            "cycle fold requires exactly one QSA cache entry"
         )
     runtime.qwen4_cycle_fold_issue = MethodType(_issue_qwen4_cycle_fold, runtime)
     return {"installed": True, "ticket_rows": 1, "qsa_layers": len(cache)}

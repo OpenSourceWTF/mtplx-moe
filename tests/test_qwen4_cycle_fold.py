@@ -28,7 +28,7 @@ def _config() -> dict:
 
 
 def _cache() -> list[QSAKVCache]:
-    cache = [QSAKVCache(4) for _ in range(48)]
+    cache = [QSAKVCache(4)]
     for entry in cache:
         entry.keys = mx.zeros((1, 2, 1, 4), dtype=mx.bfloat16)
         entry.values = mx.zeros((1, 2, 1, 4), dtype=mx.bfloat16)
@@ -43,8 +43,10 @@ def _cache() -> list[QSAKVCache]:
 def _runtime(cache: list[QSAKVCache] | None = None):
     constructed = _cache() if cache is None else cache
     runtime = SimpleNamespace(
-        model=SimpleNamespace(make_mtp_cache=lambda: [QSAKVCache(4) for _ in range(48)]),
+        model=SimpleNamespace(make_mtp_cache=lambda: [QSAKVCache(4)]),
+        qwen4_depth1_batched_target_arrays=True,
     )
+    runtime.make_mtp_cache = runtime.model.make_mtp_cache
 
     def draft_mtp(
         hidden,
@@ -80,7 +82,7 @@ def test_installer_binds_only_exact_qwen4_qsa_topology():
 
     report = install_qwen4_cycle_fold(runtime, config=_config())
 
-    assert report == {"installed": True, "ticket_rows": 1, "qsa_layers": 48}
+    assert report == {"installed": True, "ticket_rows": 1, "qsa_layers": 1}
     assert callable(runtime.qwen4_cycle_fold_issue)
 
 
@@ -91,9 +93,22 @@ def test_installer_rejects_non_qsa_mtp_cache():
     )
 
     runtime = _runtime()
-    runtime.model.make_mtp_cache = lambda: [SimpleNamespace() for _ in range(48)]
+    runtime.make_mtp_cache = lambda: [SimpleNamespace()]
 
-    with pytest.raises(Qwen4CycleFoldConfigError, match="48 QSA cache entries"):
+    with pytest.raises(Qwen4CycleFoldConfigError, match="one QSA cache entry"):
+        install_qwen4_cycle_fold(runtime, config=_config())
+
+
+def test_installer_rejects_before_exact_depth1_runtime_is_bound():
+    from mtplx.qwen4_cycle_fold import (
+        Qwen4CycleFoldConfigError,
+        install_qwen4_cycle_fold,
+    )
+
+    runtime = _runtime()
+    runtime.qwen4_depth1_batched_target_arrays = False
+
+    with pytest.raises(Qwen4CycleFoldConfigError, match="depth-one runtime"):
         install_qwen4_cycle_fold(runtime, config=_config())
 
 
