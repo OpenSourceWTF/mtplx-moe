@@ -883,7 +883,13 @@ public struct OpenCodeIntegration: Sendable {
         for tier in openCodeDefaultEffortTiers where !familyLevels.contains(tier) {
             variants[tier] = .object(["disabled": .bool(true)])
         }
-        for level in familyLevels where !openCodeDefaultEffortTiers.contains(level) {
+        // Every family tier is declared as an explicit variant, not only the
+        // ones outside OPENAI_EFFORTS: Desktop 1.18.21's picker does not
+        // surface its full built-in list for a custom openai-compatible
+        // provider (xhigh was missing live for the Flash-Next dial while
+        // low/medium rendered). An explicit variant renders on every version
+        // and merges over a same-named built-in.
+        for level in familyLevels {
             variants[level] = .object(["reasoningEffort": .string(level)])
         }
         return variants

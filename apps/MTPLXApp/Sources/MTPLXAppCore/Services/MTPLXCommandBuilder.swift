@@ -1444,6 +1444,22 @@ private struct TargetPreset {
         // the app and the CLI launch identically.
         preset.reasoningParser = "qwen3"
         preset.reasoningEffort = "xhigh"
+        // "NOT pinned" must also hold on targets whose preset pre-fills the
+        // 3.6-era coding sampler (openCode/hermes 0.6, pi's top-p/top-k):
+        // an inherited value reaches `mtplx serve` as an explicit flag, which
+        // suppresses the boot-time pack-stamp injection and served OpenCode
+        // Flash-Next at target 0.6 against the family's 1.0 — with the draft
+        // still at the stamp's 1.0, a mismatched verify pair (request-log
+        // receipt 2026-08-28, port 8000). Clearing the slots restores the
+        // zero-flag boot path on those targets (they never carry the
+        // Settings sampler — targetCarriesSettingsSampler); chat-lane
+        // targets still carry a user-set Settings sampler unchanged.
+        preset.temperature = nil
+        preset.topP = nil
+        preset.topK = nil
+        preset.draftTemperature = nil
+        preset.draftTopP = nil
+        preset.draftTopK = nil
         return preset
     }
 

@@ -1356,6 +1356,48 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertFalse(qwen38.arguments.contains("--reasoning-effort"))
     }
 
+    func testCommandBuilderFlashNextClearsCodingTargetSamplerPins() throws {
+        // The openCode/hermes target presets pre-fill the 3.6-era coding
+        // sampler (0.6). Flash-Next must clear those slots so the daemon's
+        // zero-flag boot injects the pack stamp (1.0/0.95/20) — an inherited
+        // --temperature 0.6 is an explicit flag to `mtplx serve` and served
+        // OpenCode Flash-Next at 0.6 against the family's 1.0 with the
+        // draft at 1.0 (request-log receipt 2026-08-28).
+        let fake = try makeExecutable(named: "mtplx")
+        let builder = MTPLXCommandBuilder(environment: ["PATH": fake.deletingLastPathComponent().path])
+        for target in [LaunchTarget.openCode, .hermes, .pi] {
+            let command = try builder.buildServeCommand(
+                configuration: MTPLXAppConfiguration(
+                    executablePath: fake.path,
+                    model: "/Users/example/.mtplx/models/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+                    profile: "auto"
+                ),
+                target: target,
+                launchID: "flash-next-\(target.rawValue)"
+            )
+            XCTAssertFalse(command.arguments.contains("--temperature"), target.rawValue)
+            XCTAssertFalse(command.arguments.contains("--top-p"), target.rawValue)
+            XCTAssertFalse(command.arguments.contains("--top-k"), target.rawValue)
+            XCTAssertFalse(command.arguments.contains("--draft-temperature"), target.rawValue)
+            XCTAssertFalse(command.arguments.contains("--draft-top-p"), target.rawValue)
+            XCTAssertFalse(command.arguments.contains("--draft-top-k"), target.rawValue)
+            XCTAssertTrue(command.arguments.containsInOrder(["--reasoning-effort", "xhigh"]), target.rawValue)
+        }
+
+        // Other families keep the measured target-preset pin (the 3.6-era
+        // lane relies on it): the clear is family-scoped, not target-wide.
+        let generic = try builder.buildServeCommand(
+            configuration: MTPLXAppConfiguration(
+                executablePath: fake.path,
+                model: "/models/qwen",
+                profile: "sustained"
+            ),
+            target: .openCode,
+            launchID: "generic-opencode"
+        )
+        XCTAssertTrue(generic.arguments.containsInOrder(["--temperature", "0.6"]))
+    }
+
     func testOnboardingTuneUsesTurboForQwen27BOptimizedModels() {
         for model in [
             "/Users/example/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed",
@@ -5034,9 +5076,19 @@ final class MTPLXAppCoreTests: XCTestCase {
             "low"
         )
         let variants = try XCTUnwrap(model["variants"]?.objectValue)
-        XCTAssertEqual(Set(variants.keys), ["none", "minimal", "xhigh"])
-        for value in variants.values {
-            XCTAssertEqual(value.objectValue?["disabled"]?.boolValue, true)
+        XCTAssertEqual(
+            Set(variants.keys),
+            ["none", "minimal", "xhigh", "low", "medium", "high"]
+        )
+        for tier in ["none", "minimal", "xhigh"] {
+            XCTAssertEqual(variants[tier]?.objectValue?["disabled"]?.boolValue, true, tier)
+        }
+        for tier in ["low", "medium", "high"] {
+            XCTAssertEqual(
+                variants[tier]?.objectValue?["reasoningEffort"]?.stringValue,
+                tier,
+                tier
+            )
         }
     }
 
@@ -5072,9 +5124,23 @@ final class MTPLXAppCoreTests: XCTestCase {
         // the client's none/minimal/high tiers are disabled, xhigh/medium/low
         // stay selectable (an explicit pick wins for that request).
         var variants = try XCTUnwrap(model["variants"]?.objectValue)
-        XCTAssertEqual(Set(variants.keys), ["none", "minimal", "high"])
-        for value in variants.values {
-            XCTAssertEqual(value.objectValue?["disabled"]?.boolValue, true)
+        // Tiers outside the family dial are disabled; every family tier is
+        // an explicit variant (Desktop 1.18.21 does not surface its built-in
+        // effort list for custom openai-compatible providers — xhigh was
+        // missing from the live picker until declared explicitly).
+        XCTAssertEqual(
+            Set(variants.keys),
+            ["none", "minimal", "high", "xhigh", "medium", "low"]
+        )
+        for tier in ["none", "minimal", "high"] {
+            XCTAssertEqual(variants[tier]?.objectValue?["disabled"]?.boolValue, true, tier)
+        }
+        for tier in ["xhigh", "medium", "low"] {
+            XCTAssertEqual(
+                variants[tier]?.objectValue?["reasoningEffort"]?.stringValue,
+                tier,
+                tier
+            )
         }
 
         // Changing the effort dial in the app updates OpenCode like a mirror.
@@ -5098,7 +5164,10 @@ final class MTPLXAppCoreTests: XCTestCase {
             "xhigh"
         )
         variants = try XCTUnwrap(model["variants"]?.objectValue)
-        XCTAssertEqual(Set(variants.keys), ["none", "minimal", "high"])
+        XCTAssertEqual(
+            Set(variants.keys),
+            ["none", "minimal", "high", "xhigh", "medium", "low"]
+        )
     }
 
     func testOpenCodeReasoningEffortRoutesFlashNextBeforeQwen38Markers() {
@@ -5168,9 +5237,23 @@ final class MTPLXAppCoreTests: XCTestCase {
             "medium"
         )
         var variants = try XCTUnwrap(model["variants"]?.objectValue)
-        XCTAssertEqual(Set(variants.keys), ["none", "minimal", "high"])
-        for value in variants.values {
-            XCTAssertEqual(value.objectValue?["disabled"]?.boolValue, true)
+        // Tiers outside the family dial are disabled; every family tier is
+        // an explicit variant (Desktop 1.18.21 does not surface its built-in
+        // effort list for custom openai-compatible providers — xhigh was
+        // missing from the live picker until declared explicitly).
+        XCTAssertEqual(
+            Set(variants.keys),
+            ["none", "minimal", "high", "xhigh", "medium", "low"]
+        )
+        for tier in ["none", "minimal", "high"] {
+            XCTAssertEqual(variants[tier]?.objectValue?["disabled"]?.boolValue, true, tier)
+        }
+        for tier in ["xhigh", "medium", "low"] {
+            XCTAssertEqual(
+                variants[tier]?.objectValue?["reasoningEffort"]?.stringValue,
+                tier,
+                tier
+            )
         }
 
         // The Optimized Speed sibling resolves its own served id with the
@@ -5193,7 +5276,10 @@ final class MTPLXAppCoreTests: XCTestCase {
             "medium"
         )
         variants = try XCTUnwrap(model["variants"]?.objectValue)
-        XCTAssertEqual(Set(variants.keys), ["none", "minimal", "high"])
+        XCTAssertEqual(
+            Set(variants.keys),
+            ["none", "minimal", "high", "xhigh", "medium", "low"]
+        )
     }
 
     func testPiIntegrationWritesCurrentPortAndNoHiddenCaps() throws {

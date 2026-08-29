@@ -181,6 +181,27 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **Flash-Next serves coding agents at its official sampler.** The app's
+  OpenCode and Hermes launch presets pre-fill the Qwen3.6-era coding
+  sampler (temperature 0.6), and the Flash-Next model defaults left those
+  slots untouched, so the daemon booted with an explicit `--temperature
+  0.6` that suppressed the pack-stamp injection — OpenCode requests were
+  normalized to a 0.6 target against the family's official 1.0, with the
+  draft still at the stamp's 1.0 (a mismatched verify pair). Flash-Next
+  now clears the target-preset sampler slots on every launch target, so
+  the zero-flag boot path injects the artifact's stamped 1.0/0.95/20 for
+  target and draft alike, identical to a bare `mtplx serve`. The dense
+  27B was already correct (its preset pins the official triple); 3.6-era
+  models keep their measured 0.6 lane.
+- **OpenCode's effort picker shows the whole Flash-Next dial.** The
+  generated config only declared effort variants for tiers outside
+  OpenCode's built-in list, trusting the client to surface the rest — but
+  OpenCode Desktop 1.18.21 does not offer its full built-in list for
+  custom openai-compatible providers, so xhigh (the Flash-Next chat
+  default) was missing from the picker entirely. Every family tier is now
+  written as an explicit variant, which renders on every OpenCode version
+  and still merges over same-named built-ins; out-of-family tiers stay
+  disabled.
 - **The KV-quantization control explains itself on Flash-Next.** The
   setting showed the anonymous "not supported for this model" line because
   the family had no entry in the KV-quant policy table. The policy is

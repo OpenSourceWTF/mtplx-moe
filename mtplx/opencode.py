@@ -231,12 +231,15 @@ def _opencode_effort_variants(
 ) -> dict[str, dict[str, Any]]:
     """Mirror the family effort dial into OpenCode's variant picker.
 
-    OpenCode offers its full built-in effort list for every reasoning-capable
-    openai-compatible model. Disable the tiers the family contract does not
-    define and add any family tier OpenCode does not offer, so the picker
-    shows exactly the MTPLX dial (config `variants` merge over computed
-    variants: sst/opencode provider/provider.ts, identical at 1.18.18 and
-    1.18.21).
+    Disable the built-in tiers the family contract does not define, and write
+    an EXPLICIT variant for every tier it does. The earlier form declared a
+    family tier only when it was outside OPENAI_EFFORTS, trusting OpenCode to
+    surface the rest — but Desktop 1.18.21's picker does not offer its full
+    built-in list for a custom openai-compatible provider (observed live:
+    xhigh missing for the Flash-Next dial while low/medium rendered). An
+    explicit `{"reasoningEffort": tier}` variant always renders and merges
+    over any same-named built-in, so declaring every tier is correct on both
+    behaviors.
     """
 
     allowed = {str(level) for level in effort_levels}
@@ -246,8 +249,7 @@ def _opencode_effort_variants(
         if effort not in allowed
     }
     for level in effort_levels:
-        if str(level) not in OPENCODE_OPENAI_COMPATIBLE_DEFAULT_EFFORTS:
-            variants[str(level)] = {"reasoningEffort": str(level)}
+        variants[str(level)] = {"reasoningEffort": str(level)}
     return variants
 
 
