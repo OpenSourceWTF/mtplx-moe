@@ -134,7 +134,7 @@ All notable user-facing changes to MTPLX. The format is based on
   of any swap; macOS pressure and an earlier allocator-relative signal
   drive the existing shedding guard. `/health`, the dashboard snapshot
   and the app carry `memory_plan`, guard events, and a pressure banner.
-  `--memory-budget 48G` reproduces a real 48 GB seat exactly (test-pinned).
+  `MTPLX_MEMORY_BUDGET=48G` reproduces a real 48 GB seat exactly (test-pinned).
 - **Streaming SSD spill for large sessions** (issues #305, #323). Sessions
   above the per-session RAM cap — exactly the 100k+-token coding-agent
   sessions whose re-prefill costs minutes — now persist to the SSD tier
@@ -146,7 +146,13 @@ All notable user-facing changes to MTPLX. The format is based on
   per session naming the entry size, the effective cap, and free disk
   when it refuses a spill (found live on a 4 TB disk at 28 GiB free,
   which caps the lane at ~7 GiB and mutely excluded every 100k+-token
-  session — the same silence class as #278, in a brand-new lane).
+  session — the same silence class as #278, in a brand-new lane). A
+  request arriving mid-write makes the streaming encode abort cleanly
+  and re-dispatch for the next idle window (counted in
+  `encode_yields_foreground`), so a spill in progress can never make a
+  request wait; the dedicated writer thread keeps its own 600 s
+  foreground pause, where waiting is free because nothing queues behind
+  that thread.
 
 - **RAMP: opt-in long-block and fuzzy re-anchor policy for context copy**
   (adapting community PR #375 by @johninthewinter). A fixed 48-token copy
@@ -234,7 +240,12 @@ All notable user-facing changes to MTPLX. The format is based on
   "Memory running high". Receipt for the split: an external 26 GB
   allocation storm dropped decode 65→22 tok/s with the engine's guard
   correctly doing nothing at all — the old copy blamed the engine for
-  weather it didn't make.
+  weather it didn't make. Attribution only claims what it can prove:
+  when macOS and the allocator report pressure in the same tick the
+  banner names the allocator (the "another process" copy asserts the
+  engine's footprint is steady, which is false at a tie), and when the
+  allocator probe cannot read at all the source reports `unknown` and
+  the banner stays neutral.
 - **Long sessions persist to SSD: the writer's backlog budget no longer
   rejects a snapshot bigger than itself** (#384, thanks @sapiens77 for a
   forensic-grade report). The SSD writer bounds queued bytes at 4 GiB by
@@ -432,6 +443,30 @@ All notable user-facing changes to MTPLX. The format is based on
 - **Forge routes official NVIDIA Nemotron-H configs** by deriving the
   MTP pattern from `mtp_layers_block_type` (#341); load no longer
   crashes with an AttributeError.
+- **`mtplx remove` is fenced to the models cache and asks first.** The
+  removal path ran `rmtree` on whatever the ref resolved to: a bare
+  `.` or `/` resolved to the models cache directory itself and `..` to
+  the whole `~/.mtplx` home (bin, config, session bank, every model),
+  deleted without a word and exit 0. A ref must now resolve to a direct
+  child of the models cache or the command refuses, a tty gets a
+  confirmation naming the resolved path and size, `--yes` skips it for
+  scripts, and a non-tty run without `--yes` refuses with the hint.
+- **A malformed `config.toml` no longer bricks every command.** A
+  truncated or hand-edited config raised a raw TOMLDecodeError through
+  `status`, `doctor`, even `stop`, so the one file meant to hold
+  preferences could lock the user out of the CLI entirely. The loader
+  now degrades to defaults with one stderr line naming the file, the
+  parse error, and `mtplx config show`; a bad value for a single key
+  degrades that key only.
+- **The daemonless CLI generate lanes couple the draft greedy under a
+  greedy target.** One-shot `run`, the terminal chat, and `tune` call
+  the engine directly and never pass the server's draft-sampler
+  resolver, so `--temperature 0` kept the pack's stamped sampled draft
+  (temperature 1.0) and paid the sampled-draft acceptance collapse
+  ([79/65/42]% by depth vs [96/87/76]% coupled) on exactly the lane
+  outside benchmarks run. The lanes now share one coupling helper; a
+  user-typed `--draft-temperature` still wins, and a spec-less lane
+  already mirrored the target and is unchanged.
 
 ## [2.9.3] - 2026-08-26 (internal build — never published; ships as part of 2.10.0)
 
