@@ -214,3 +214,33 @@ def test_kv_quant_policy_27b_keeps_the_validated_modes() -> None:
     assert policy.supported
     assert policy.to_dict()["modes"] == ["off", "q8", "q4"]
     assert policy.to_dict()["disabled_reason"] is None
+
+
+def test_flash_next_pack_stamp_owns_the_boot_sampler(tmp_path) -> None:
+    """qwen4_exp launch sampler comes from the artifact's mtplx_runtime.json.
+
+    After the app stopped forwarding the coding-target 0.6 pin (2026-08-28),
+    the zero-flag `mtplx serve` boot path is the ONLY thing standing between
+    an OpenCode Flash-Next launch and the generic 0.6 parser default — the
+    stamp reader must keep resolving the pack's official 1.0/0.95/20.
+    """
+    import json
+
+    from mtplx.server.openai import _model_declared_sampler_defaults
+
+    model = tmp_path / "flash-next"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    (model / "mtplx_runtime.json").write_text(
+        json.dumps({"sampler": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}})
+    )
+    assert _model_declared_sampler_defaults(str(model)) == {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+    }
+
+    # A pack without the sampler stamp falls back to None (parser default
+    # stands) instead of crashing the boot.
+    (model / "mtplx_runtime.json").write_text(json.dumps({}))
+    assert _model_declared_sampler_defaults(str(model)) is None
