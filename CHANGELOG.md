@@ -222,8 +222,9 @@ All notable user-facing changes to MTPLX. The format is based on
   12.4 GiB of peak-over-active — so on long coding sessions the bank kept
   entries while the allocator peak kissed 99%+ of the Metal limit, firing
   the warning banner on every deep turn. The ceiling now reserves the
-  spike this process has actually observed (clamped 3-16 GiB), demoting
-  idle entries to SSD before the next spike can slam the ceiling.
+  spike this process has actually observed (clamped between 3 GiB and
+  half the post-weights memory, at most 16 GiB), demoting idle entries
+  to SSD before the next spike can slam the ceiling.
 - **The memory banner now names the culprit.** The daemon reports which
   signal produced the pressure level (`memory_pressure_source`: system-wide
   macOS pressure vs this engine's allocator near its Metal limit, plus the
