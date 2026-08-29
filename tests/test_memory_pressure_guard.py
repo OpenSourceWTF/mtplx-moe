@@ -207,6 +207,19 @@ def test_allocator_pressure_escalates_before_macos(monkeypatch):
     assert state.dashboard.last_memory_pressure_level == 2
     events = list(state.dashboard.memory_guard_events)
     assert events and events[-1]["level_source"] == "allocator"
+    # The dashboard carries the attribution every tick (not only on guard
+    # actions) so the app banner can name the culprit: engine footprint vs
+    # an external process's allocation storm (2026-08-28 A/B receipt).
+    assert state.dashboard.last_memory_pressure_source == "allocator"
+    assert abs(state.dashboard.last_allocator_fraction - 0.99) < 1e-6
+
+
+def test_macos_sourced_warning_stamps_external_attribution(monkeypatch):
+    bank = FakeBank(total=8 << 30, max_bytes=8 << 30)
+    state = make_state(bank)
+    run_one_tick(state, level=2, monkeypatch=monkeypatch)
+    assert state.dashboard.last_memory_pressure_level == 2
+    assert state.dashboard.last_memory_pressure_source == "macos"
 
 
 def test_allocator_pressure_below_threshold_stays_normal():

@@ -16125,6 +16125,12 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
         "memory_pressure_level": int(
             getattr(dashboard, "last_memory_pressure_level", 0) or 0
         ),
+        "memory_pressure_source": str(
+            getattr(dashboard, "last_memory_pressure_source", "macos") or "macos"
+        ),
+        "allocator_fraction": float(
+            getattr(dashboard, "last_allocator_fraction", 0.0) or 0.0
+        ),
         "memory_plan": (
             state.memory_plan.to_dict()
             if getattr(state, "memory_plan", None) is not None
@@ -16448,6 +16454,8 @@ async def _memory_pressure_loop(
                 level = allocator_level
                 level_source = "allocator"
             state.dashboard.last_memory_pressure_level = level
+            state.dashboard.last_memory_pressure_source = level_source
+            state.dashboard.last_allocator_fraction = float(allocator_fraction)
             # Dynamic bank ceiling (memory plan): during a long-context
             # prefill no put() runs for minutes while KV grows, so the
             # put-time budget check alone reacts too late. Enforce here

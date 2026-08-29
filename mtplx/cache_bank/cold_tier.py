@@ -358,8 +358,16 @@ class SessionBankColdTier:
         self._writer_pause_enabled = _env_flag(
             "MTPLX_SSD_WRITER_FOREGROUND_PAUSE", default=True
         )
+        # 600 s, not 60: coding-agent turns run 60-620 s, so a 60 s bound
+        # expired mid-decode and each blob write fired under the live turn —
+        # a ~1 GB/min unified-memory drumbeat that tripped macOS pressure
+        # (banner) and stole decode (gate254-c4s -30%; manifest receipts
+        # 2026-08-28 21:38-22:17, 9+ GB written across live OpenCode turns).
+        # The cold tier is a cache: waiting out even a 10-minute turn costs
+        # only delayed durability, never correctness. Inter-turn gaps drain
+        # the queue (the pause loop samples every 50 ms).
         self._writer_pause_max_s = _env_float(
-            "MTPLX_SSD_WRITER_FOREGROUND_PAUSE_MAX_S", 60.0
+            "MTPLX_SSD_WRITER_FOREGROUND_PAUSE_MAX_S", 600.0
         )
         self._encode_yield_enabled = _env_flag(
             "MTPLX_SSD_ENCODE_FOREGROUND_YIELD", default=True
@@ -413,6 +421,7 @@ class SessionBankColdTier:
             "encode_yields_foreground": 0,
             "writer_foreground_pauses": 0,
             "writer_foreground_pause_s": 0.0,
+            "writer_pause_expired_busy": 0,
         }
         self._ensure_store()
         self._writer = threading.Thread(
@@ -1265,16 +1274,28 @@ class SessionBankColdTier:
         waited = 0.0
         deadline = time.monotonic() + max(0.0, self._writer_pause_max_s)
         paused = False
-        while time.monotonic() < deadline and not self._stop.is_set():
+        expired_busy = False
+        while not self._stop.is_set():
             try:
                 busy = bool(check())
             except Exception:
                 break
             if not busy:
                 break
+            if time.monotonic() >= deadline:
+                # Liveness bound hit with traffic still in flight: the write
+                # proceeds under the live turn. Counted so a saturated server
+                # shows exactly how often durability had to fight decode.
+                expired_busy = True
+                break
             paused = True
             time.sleep(0.05)
             waited += 0.05
+        if expired_busy:
+            with self._stats_lock:
+                self._stats["writer_pause_expired_busy"] = (
+                    int(self._stats.get("writer_pause_expired_busy", 0) or 0) + 1
+                )
         if paused:
             with self._stats_lock:
                 self._stats["writer_foreground_pauses"] = (

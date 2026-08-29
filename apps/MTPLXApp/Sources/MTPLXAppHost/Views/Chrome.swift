@@ -478,6 +478,13 @@ struct ThermalRuleBanner: View {
 struct MemoryGuardBanner: View {
     let pressureLevel: Int
     let recentShed: Bool
+    /// "macos" = system-wide pressure (often another process allocating);
+    /// "allocator" = this engine's Metal footprint near its limit; nil on
+    /// pre-2.10 daemons. Lets the warning copy name the actual culprit
+    /// (2026-08-28 A/B receipt: an external 26 GB allocation storm dropped
+    /// decode 65→22 tok/s with the engine's guard doing nothing at all —
+    /// the old copy blamed the engine for weather it didn't make).
+    let pressureSource: String?
     let plan: MemoryPlanStatus?
 
     var body: some View {
@@ -510,11 +517,12 @@ struct MemoryGuardBanner: View {
         }
     }
 
+    private var externalSource: Bool { pressureSource == "macos" }
+
     private func title(critical: Bool) -> String {
         if critical { return "Critical memory pressure" }
-        return recentShed
-            ? "Memory pressure — engine shedding caches"
-            : "Memory running high"
+        if recentShed { return "Memory pressure — engine shedding caches" }
+        return externalSource ? "System memory pressure" : "Memory running high"
     }
 
     private func message(critical: Bool) -> String {
@@ -523,6 +531,8 @@ struct MemoryGuardBanner: View {
             text = "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD."
         } else if recentShed {
             text = "Warm sessions are being demoted to SSD ahead of any swap. Turns may restore from disk (seconds) instead of RAM."
+        } else if externalSource {
+            text = "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted."
         } else {
             text = "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here."
         }

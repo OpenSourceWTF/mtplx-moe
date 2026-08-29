@@ -175,6 +175,9 @@ public final class MTPLXBackendStore: ObservableObject {
     /// level and the daemon's machine memory plan. 0 / nil until a
     /// governor-aware daemon reports.
     @Published public private(set) var memoryPressureLevel: Int = 0
+    /// "macos" or "allocator" — which signal produced the level above.
+    /// nil until a source-aware (2.10+) daemon reports.
+    @Published public private(set) var memoryPressureSource: String?
     @Published public private(set) var memoryPlan: MemoryPlanStatus?
     /// True when the guard's event ring shows caches actually shed within
     /// the recency window — the banner's "shedding" claim keys off this,
@@ -3702,6 +3705,7 @@ public final class MTPLXBackendStore: ObservableObject {
         mem = snapshot.mem
         thermal = snapshot.thermal
         memoryPressureLevel = snapshot.memoryPressureLevel ?? 0
+        memoryPressureSource = snapshot.memoryPressureSource
         memoryPlan = snapshot.memoryPlan
         memoryGuardRecentShed = Self.guardShedRecently(
             snapshot.memoryGuardEvents,

@@ -620,3 +620,10 @@ class DashboardState:
     # macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warning,
     # 4 critical, 0 unknown. Written by the memory-pressure guard loop.
     last_memory_pressure_level: int = 0
+    # Which signal produced the level above: "macos" (system-wide — often
+    # another process allocating) or "allocator" (this engine's Metal
+    # active+cache near its limit). Lets the app banner name the culprit
+    # instead of implying the engine is misbehaving under an external storm.
+    last_memory_pressure_source: str = "macos"
+    # (active+cache)/metal-limit at the same tick, for the banner detail.
+    last_allocator_fraction: float = 0.0

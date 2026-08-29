@@ -181,6 +181,28 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **SSD spills no longer fire mid-turn: the writer's foreground pause now
+  outlasts a long coding turn.** The writer already stood down while a
+  request was in flight, but its liveness bound was 60 s — shorter than a
+  typical agent turn (60–620 s) — so every multi-GB session spill fired
+  under the live decode: a ~1 GB/min unified-memory drumbeat that tripped
+  macOS memory pressure (the Live-tab banner) and stole decode (measured
+  −30% when a write overlapped a turn). The bound is now 600 s
+  (`MTPLX_SSD_WRITER_FOREGROUND_PAUSE_MAX_S`); writes drain in the gaps
+  between turns, and a bound that still expires into live traffic is
+  counted in `/admin/cache/ssd` as `writer_pause_expired_busy`. The cold
+  tier is a cache — waiting out a turn costs delayed durability, never
+  correctness.
+- **The memory banner now names the culprit.** The daemon reports which
+  signal produced the pressure level (`memory_pressure_source`: system-wide
+  macOS pressure vs this engine's allocator near its Metal limit, plus the
+  live `allocator_fraction`), and the app's warning banner distinguishes
+  "System memory pressure" (another process allocating; decode can dip
+  until it passes — nothing was evicted) from the engine's own
+  "Memory running high". Receipt for the split: an external 26 GB
+  allocation storm dropped decode 65→22 tok/s with the engine's guard
+  correctly doing nothing at all — the old copy blamed the engine for
+  weather it didn't make.
 - **Long sessions persist to SSD: the writer's backlog budget no longer
   rejects a snapshot bigger than itself** (#384, thanks @sapiens77 for a
   forensic-grade report). The SSD writer bounds queued bytes at 4 GiB by

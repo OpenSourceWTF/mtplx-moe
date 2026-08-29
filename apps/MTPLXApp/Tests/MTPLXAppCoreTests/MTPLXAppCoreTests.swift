@@ -11065,4 +11065,20 @@ final class CompletionFingerprintTests: XCTestCase {
         )
         XCTAssertTrue(MTPLXBackendStore.guardShedRecently([allocShed], now: now))
     }
+
+    func testSnapshotPressureAttributionKeys() {
+        // 2.10 daemons stamp which signal produced the pressure level so the
+        // banner can distinguish an external allocation storm ("macos") from
+        // the engine's own footprint ("allocator"). Older daemons omit both
+        // (the properties are Optional), so only the wire names can drift —
+        // pin them.
+        XCTAssertEqual(
+            DashboardSnapshot.CodingKeys.memoryPressureSource.rawValue,
+            "memory_pressure_source"
+        )
+        XCTAssertEqual(
+            DashboardSnapshot.CodingKeys.allocatorFraction.rawValue,
+            "allocator_fraction"
+        )
+    }
 }

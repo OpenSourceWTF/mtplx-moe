@@ -1372,6 +1372,12 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     /// 0/absent unknown) and the machine memory plan. Both absent on
     /// pre-governor daemons.
     public var memoryPressureLevel: Int?
+    /// Which signal produced the level: "macos" (system-wide pressure,
+    /// often another process allocating) or "allocator" (this engine's
+    /// Metal footprint near its limit). Absent on older daemons.
+    public var memoryPressureSource: String?
+    /// (active+cache)/metal-limit at the same guard tick.
+    public var allocatorFraction: Double?
     public var memoryPlan: MemoryPlanStatus?
     /// The guard's action ring (pressure trims, ceiling evictions). The
     /// level alone says "the allocator ran close to its limit for a tick";
@@ -1403,6 +1409,8 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case uptimeS = "uptime_s"
         case retrieval
         case memoryPressureLevel = "memory_pressure_level"
+        case memoryPressureSource = "memory_pressure_source"
+        case allocatorFraction = "allocator_fraction"
         case memoryPlan = "memory_plan"
         case memoryGuardEvents = "memory_guard_events"
     }

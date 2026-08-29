@@ -30,6 +30,7 @@ struct LiveTab: View {
                     MemoryGuardBanner(
                         pressureLevel: backend.memoryPressureLevel,
                         recentShed: backend.memoryGuardRecentShed,
+                        pressureSource: backend.memoryPressureSource,
                         plan: backend.memoryPlan
                     )
 
