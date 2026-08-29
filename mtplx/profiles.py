@@ -315,6 +315,11 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # gather + maskless SDPA instead of dense-bool-mask over full KV.
         # Long-context A/B pending; registered ahead per the same lesson.
         "MTPLX_QSA_GATHER",
+        # Rows-gather routing knobs (2026-08-28, adapting PR #380): S>1
+        # engage floor by KV length and the served row-width ceiling.
+        # Registered ahead of any default flip per the boot-trap law.
+        "MTPLX_QSA_GATHER_MIN_CONTEXT",
+        "MTPLX_QSA_GATHER_MAX_ROWS",
         # QSA block-sparse flash-skip attention (2026-08-27 candidate):
         # selected blocks iterated inside the kernel, no staging/copies.
         "MTPLX_QSA_FLASH",

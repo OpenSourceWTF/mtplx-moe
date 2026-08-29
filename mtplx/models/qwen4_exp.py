@@ -948,6 +948,29 @@ def _qsa_gather_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _qsa_gather_min_context() -> int:
+    """Rows-gather engages only at/past this KV length. Below it the fused
+    dense SDPA over full KV is cheaper (the gather trades one shared O(T)
+    read for per-row O(S*K) materialized copies, and the S=1 lane's own
+    receipt measured the copy overhead at -5.25% on short contexts). The
+    break-even for verify widths lands in the tens of thousands of tokens,
+    where the dense mask chain is also the within-request growth term."""
+    try:
+        return max(0, int(os.environ.get("MTPLX_QSA_GATHER_MIN_CONTEXT") or 16384))
+    except ValueError:
+        return 16384
+
+
+def _qsa_gather_max_rows() -> int:
+    """Rows-gather serves query widths 2..this (default 8: AR pipelining and
+    batched-verify widths). Copy-block rounds (25+ rows) multiply the
+    gathered working set by S and stay on the dense path until measured."""
+    try:
+        return max(2, int(os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") or 8))
+    except ValueError:
+        return 8
+
+
 def _qsa_flash_enabled() -> bool:
     raw = (os.environ.get("MTPLX_QSA_FLASH") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
@@ -1282,6 +1305,40 @@ class QSAIndexer(nn.Module):
             tail_ids = mx.arange(tail_start, T, dtype=mx.int32)
             return mx.concatenate([tok_from_blocks, tail_ids])
 
+        if (
+            S > 1
+            and _qsa_gather_enabled()
+            and S <= _qsa_gather_max_rows()
+            and T >= _qsa_gather_min_context()
+        ):
+            # Rows-gather lane (MTPLX_QSA_GATHER at S>1), adapting the
+            # per-query gather + GQA-broadcast attention from community PR
+            # #380 by @maceip. Every S>1 forward previously staged a dense
+            # [S, T] bool mask and read the FULL KV through fused SDPA in
+            # each of the 12 QSA layers, an O(T)-per-round chain that grows
+            # with the generation. Here each row hands attention its own
+            # token list instead: k_eff selected blocks plus its visible
+            # tail, padded to one constant width (k_eff*ratio + ratio) so
+            # gather shapes stay stable across the whole generation.
+            # Selected blocks are complete blocks strictly below each row's
+            # tail start, so the lists never double-count a token; invalid
+            # slots carry valid=False and are re-pointed at token 0 for the
+            # take.
+            blk_ok = mx.take_along_axis(valid, top_idx.astype(mx.int64), axis=-1)
+            tok_blocks = (
+                top_idx.astype(mx.int32)[:, :, None] * self.ratio
+                + mx.arange(self.ratio, dtype=mx.int32)
+            ).reshape(S, -1)
+            blocks_ok = mx.repeat(blk_ok, self.ratio, axis=1)
+            tail_tok = nb_q[:, None] * self.ratio + mx.arange(
+                self.ratio, dtype=mx.int32
+            )
+            tail_ok = tail_tok <= qpos[:, None]
+            token_idx = mx.concatenate([tok_blocks, tail_tok], axis=1)
+            token_ok = mx.concatenate([blocks_ok, tail_ok], axis=1)
+            token_idx = mx.where(token_ok, token_idx, mx.array(0, dtype=mx.int32))
+            return ("gather_rows", token_idx, token_ok)
+
         # Blocks -> tokens, plus the visible tail, intersected with causal.
         tok_sel = mx.repeat(selected, self.ratio, axis=1)  # [S, nb*ratio]
         if nb_total * self.ratio < T:
@@ -1292,6 +1349,56 @@ class QSAIndexer(nn.Module):
         causal = tpos[None, :] <= qpos[:, None]
         mask = (tok_sel | tail) & causal  # [S, T]
         return mask[None, None]  # [1, 1, S, T]
+
+
+def _qsa_rows_gather_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    token_idx: mx.array,
+    token_ok: mx.array,
+    scale: float,
+) -> mx.array:
+    """Attention over per-row gathered tokens (rows-gather lane).
+
+    Adapting the per-query single-take gather + GQA head-group broadcast
+    from community PR #380 by @maceip, minus its mask re-gather (the
+    selection itself carries validity here, so no second gathered copy is
+    ever built — the S=1 lane's receipt priced each extra copy at -5.25%).
+
+    q is [1, H, S, D]; k/v are the cache's [1, H_kv, T, D] slices;
+    token_idx/token_ok are [S, K]. Keys differ per row, so fused SDPA over
+    a shared KV sequence cannot serve this; the whole S stays in-graph as
+    one broadcast GEMM pair, and the 12x-repeated K/V working set is never
+    materialized: q is viewed [1, H_kv, rep, S, 1, D] against
+    [1, H_kv, 1, S, D, K]. Invalid slots score -inf before the fp32
+    softmax, identical math to the dense bool-mask product over the same
+    visible set.
+    """
+    B, H, S, D = q.shape
+    H_kv = int(k.shape[1])
+    K = int(token_idx.shape[-1])
+    flat = token_idx.reshape(-1)
+    k_sel = mx.take(k, flat, axis=2).reshape(1, H_kv, S, K, D)
+    v_sel = mx.take(v, flat, axis=2).reshape(1, H_kv, S, K, D)
+    neg = mx.array(-mx.inf, dtype=mx.float32)
+    if H != H_kv:
+        rep = H // H_kv
+        q_view = q.reshape(1, H_kv, rep, S, 1, D)
+        k_view = k_sel.swapaxes(-1, -2).reshape(1, H_kv, 1, S, D, K)
+        scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * scale
+        scores = mx.where(token_ok[None, None, None], scores, neg)
+        probs = mx.softmax(scores, axis=-1).astype(q.dtype)
+        v_view = v_sel.reshape(1, H_kv, 1, S, K, D)
+        out = mx.matmul(probs[..., None, :], v_view).squeeze(-2)
+        return out.reshape(1, H, S, D)
+    scores = (
+        mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(mx.float32)
+        * scale
+    )
+    scores = mx.where(token_ok[None, None], scores, neg)
+    probs = mx.softmax(scores, axis=-1).astype(q.dtype)
+    return mx.matmul(probs[..., None, :], v_sel).squeeze(-2)
 
 
 class Attention(nn.Module):
@@ -1395,6 +1502,16 @@ class Attention(nn.Module):
                 self.scale,
             )
             out = out.reshape(B, S, -1)
+            return self.o_proj(out * mx.sigmoid(gate))
+
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "gather_rows":
+            # Rows-gather lane (S>1): each verify/pipeline row reads only
+            # its own selected blocks + tail instead of the full context
+            # through a dense [S, T] mask. See _qsa_rows_gather_attention
+            # (adapting community PR #380 by @maceip).
+            _, tok_idx, tok_ok = sel_mask
+            out = _qsa_rows_gather_attention(q, k, v, tok_idx, tok_ok, self.scale)
+            out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
             return self.o_proj(out * mx.sigmoid(gate))
 
         if sel_mask is not None and sel_mask.ndim == 1:
