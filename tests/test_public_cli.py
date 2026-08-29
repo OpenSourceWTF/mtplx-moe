@@ -2339,6 +2339,10 @@ def test_quickstart_public_quality_alias_missing_cache_is_not_no_mtp(tmp_path, c
             "--yes",
             "--warmup-tokens",
             "0",
+            # A real daemon on the default port must not fail this test at
+            # the preflight (exit 2) before the missing-cache path runs.
+            "--port",
+            "18091",
         ]
     )
 
@@ -2363,6 +2367,8 @@ def test_quickstart_model_id_quality_without_model_loads_quality(tmp_path, capsy
             "--yes",
             "--warmup-tokens",
             "0",
+            "--port",
+            "18092",
         ]
     )
 
@@ -2385,6 +2391,8 @@ def test_serve_model_id_quality_without_model_loads_quality(tmp_path, capsys):
             "--yes",
             "--warmup-tokens",
             "0",
+            "--port",
+            "18093",
         ]
     )
 
@@ -2409,6 +2417,8 @@ def test_quickstart_default_missing_cache_is_not_legacy_models_path(
             "--yes",
             "--warmup-tokens",
             "0",
+            "--port",
+            "18094",
         ]
     )
 
