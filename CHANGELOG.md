@@ -181,6 +181,14 @@ All notable user-facing changes to MTPLX. The format is based on
 
 ### Fixed
 
+- **The KV-quantization control explains itself on Flash-Next.** The
+  setting showed the anonymous "not supported for this model" line because
+  the family had no entry in the KV-quant policy table. The policy is
+  unchanged — the validated q8/q4 paged lane is wired to the dense-27B
+  attention call sites, not to Flash-Next's QSA layers — but the app now
+  states the architecture truth: the hybrid design keeps KV on 12 of 48
+  layers (~24 KB/token), and a quantized QSA lane has no validation
+  receipts yet. Qwen 3.5/3.6/3.8 keep the full q8/q4 control.
 - **The warm ladder yields to live traffic and no longer stamps the
   traffic clock** (adapting community PR #300 by @Blakeolson21). A request
   that had arrived but not yet completed read as an idle daemon, so the

@@ -461,6 +461,24 @@ QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
     maximum=5,
     unit="depth",
 )
+# Flash-Next KV-quant stance (2026-08-28): the paged KV-quant lane (memo +
+# 2-pass q8 kernel, F29 routing, graphbank promotion) is wired to the
+# qwen3_next SDPA call sites. This family's 12 QSA layers run hand-rolled
+# attention (pooled-score indexer + dense mask / rows-gather) over a plain
+# KVCache the paged installer never converts, so a q8/q4 request would be
+# silently inert — the boot gate downgrades it to off. The hybrid design
+# also keeps KV small by construction: 12 of 48 layers x 2 KV heads x 256
+# head_dim = ~24 KB/token (~2.4 GB bf16 at 100k). A quantized QSA lane
+# (gather-then-dequant over the rows-gather path) is a post-release
+# candidate; until it carries parity + memory receipts the policy stays
+# unsupported with an architecture-truth reason instead of the generic one.
+QWEN4_EXP_KV_QUANT_POLICY = KVQuantPolicy(
+    supported=False,
+    disabled_reason=(
+        "Flash-Next keeps KV on 12 of 48 layers (~24 KB/token), and its QSA "
+        "attention has no validated quantized-cache lane yet."
+    ),
+)
 QWEN3_8_REASONING_CODEC = ReasoningCodec(
     parser="qwen3",
     display_name="Qwen think tags",
@@ -1259,6 +1277,8 @@ def kv_quant_policy_for_model(
         return GLM_MTP_DESCRIPTOR.kv_quant_policy
     if family == "deepseek":
         return DEEPSEEK_MTP_DESCRIPTOR.kv_quant_policy
+    if family == "qwen4_exp":
+        return QWEN4_EXP_KV_QUANT_POLICY
     return KVQuantPolicy(supported=False)
 
 

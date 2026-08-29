@@ -178,3 +178,39 @@ def test_marker_fallback_without_provenance(tmp_path) -> None:
         )
         == "qwen3_8"
     )
+
+
+# --------------------------------------------------- KV-quant policy per family
+
+
+def test_kv_quant_policy_flash_next_reason_is_specific() -> None:
+    # 2026-08-28 release QA: the app surfaced the anonymous default reason
+    # ("not supported for this model") for Flash-Next because the family had
+    # no branch in kv_quant_policy_for_model. The policy stays unsupported —
+    # the paged KV-quant lane never converts the QSA caches — but the reason
+    # must state the architecture truth, not the generic line.
+    from mtplx.backends.descriptors import kv_quant_policy_for_model
+
+    policy = kv_quant_policy_for_model(
+        model_ref="Qwen3.8-Flash-Next-MTPLX-Bare-Speed"
+    )
+    assert not policy.supported
+    assert policy.to_dict()["modes"] == ["off"]
+    reason = policy.disabled_reason or ""
+    assert "Flash-Next" in reason
+    assert "12 of 48" in reason
+    assert reason != "KV quantization is not supported for this model."
+
+
+def test_kv_quant_policy_27b_keeps_the_validated_modes() -> None:
+    # The dense-27B contract keeps the validated q8/q4 paged lane (memo +
+    # 2-pass q8 kernel, F29 routing) — the Flash-Next branch must not have
+    # narrowed it.
+    from mtplx.backends.descriptors import kv_quant_policy_for_model
+
+    policy = kv_quant_policy_for_model(
+        model_ref="Youssofal/Qwen3.8-27B-MTPLX-Bare-Speed"
+    )
+    assert policy.supported
+    assert policy.to_dict()["modes"] == ["off", "q8", "q4"]
+    assert policy.to_dict()["disabled_reason"] is None
