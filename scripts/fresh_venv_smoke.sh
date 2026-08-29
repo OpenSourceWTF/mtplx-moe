@@ -33,11 +33,19 @@ printf '{"model_type":"llama"}\n' > "$MODEL_DIR/config.json"
 "$VENV/bin/mtplx" --help >/dev/null
 "$VENV/bin/mtplx" doctor --json >/dev/null
 set +e
-"$VENV/bin/mtplx" inspect "$MODEL_DIR" --json >/dev/null
+INSPECT_JSON="$("$VENV/bin/mtplx" inspect "$MODEL_DIR" --json)"
 INSPECT_STATUS=$?
 set -e
-if [ "$INSPECT_STATUS" -ne 2 ]; then
-  echo "expected no-MTP inspect to exit 2, got $INSPECT_STATUS" >&2
+# 2.10.0 contract: constructable models always run, MTP is an accelerator
+# and not a gate. In this no-deps venv there is no bundled mlx-lm module
+# either, so a plain llama config classifies as a capability gap (exit 4),
+# not the old hard refusal (exit 2).
+if [ "$INSPECT_STATUS" -ne 4 ]; then
+  echo "expected no-MTP inspect in a no-mlx-lm venv to exit 4, got $INSPECT_STATUS" >&2
+  exit 1
+fi
+if ! printf '%s' "$INSPECT_JSON" | grep -q '"exit_code": 4'; then
+  echo "inspect payload does not carry the capability-gap exit_code" >&2
   exit 1
 fi
 "$VENV/bin/mtplx" init --dry-run --json --config "$WORKDIR/config.toml" >/dev/null
