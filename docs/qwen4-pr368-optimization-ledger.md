@@ -68,6 +68,7 @@ not be treated as retained work.
 | Larger monolithic stage-2/stage-3 MoE fusion | Stage 3 owns a routed/shared reduction and BF16 accumulator rounding; direct fusion needs a global barrier or recomputation and can delay concurrent dispatch | investigate only with an exact arithmetic design and isolated kernel evidence |
 | Dedicated MLX/Metal stream | Upstream `mlx-serve` attempt crashed under thread-local stream behavior and was reverted | rejected; use earlier dependency-chained submission on the default stream |
 | M=2 split-K verifier QMM | Isolated medians beat stock by 3.75% at `K2560xN13952`, 2.76% at `K2560xN16480`, and 0.60% at the LM head; forced two-way split was best for the Q4 attention output. The exact production run fell from the 69.7388 TPS frontier to 68.4443 TPS (-1.86%). Artifact inspection also proved the 36 GDN output projections are Q5/G128, so the synthetic Q4 `K7680xN2560` split sweep was not a production fit | rejected and fully reverted; isolated wins did not survive mixed scheduling |
+| Fuse top-10 normalization into the row-owned router | Focused parity passed, but the exact production run fell from the 69.7388 TPS frontier to 62.3136 TPS (-10.65%) and decode time rose to 16.4330 seconds | rejected and fully reverted; the extra router synchronization disrupted the mixed dispatch window |
 
 ## `mlx-serve` candidates
 
@@ -107,7 +108,6 @@ not be treated as retained work.
 
 | Candidate | Intended reduction | Required gate |
 |---|---|---|
-| Fuse top-10 route normalization into the row-owned MoE router | Remove the separate FP32 `block_softmax` launch after each routed layer without building a monolithic MoE kernel | Preserve precise-softmax semantics closely enough for end-to-end parity, measure launch savings, and verify no dispatch-overlap regression |
 | Construction-bound device stochastic decision graph | Collapse p/q acceptance, residual correction, accepted-prefix selection, and the next lazy token submission | Preserve temperature-1 top-k/top-p probability and RNG laws; prove Qwen4 cache/QSA/GDN/PLE ownership at the committed prefix |
 | Draft-dependent n-gram row pipeline | Hide synchronous row acquisition behind already-enqueued draft work | Prove exact row identity and storage layout; report row-hit/miss timing outside the measured hot path and exact production TPS |
 
@@ -130,8 +130,9 @@ of the same pressure and must not be added to the 2.3191-second GPU-idle total.
 
 ## Next measured gates
 
-1. Fuse selected top-10 normalization into the existing row-owned route
-   finalizer and remove only the separate tiny softmax launch.
+1. Measure the already-supported construction-time M=2 batched target-array
+   arm against the lazy production default; retain only if its reduced
+   accepted-cycle synchronization outweighs the extra rejected-row work.
 2. Prototype a construction-bound M=2 device p/q acceptance plus residual
    decision graph; no enabled hot-path eligibility checks or fallback.
 3. Re-profile exact 16K/1K and retain only if repeated decode TPS improves and
