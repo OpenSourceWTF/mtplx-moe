@@ -697,8 +697,10 @@ struct ModelPickStep: View {
     }
 
     private nonisolated static func formatBytes(_ bytes: Int64) -> String {
-        let gib = Double(bytes) / 1_073_741_824.0
-        return String(format: "%.0f GB", gib.rounded())
+        // Decimal GB, matching the CLI catalog: the 106 GB pack must not
+        // read 99 GB here and 106 GB in `mtplx models`.
+        let gb = Double(bytes) / 1_000_000_000.0
+        return String(format: "%.0f GB", gb.rounded())
     }
 
     private func badge(_ text: String, color: Color) -> some View {
