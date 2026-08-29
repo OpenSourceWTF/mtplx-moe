@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 from pathlib import Path
 import sys
@@ -53,6 +54,16 @@ def test_production_workload_is_16k_1k_thinking_sampler_contract() -> None:
 
     assert (args.prompt_tokens, args.max_tokens) == (16_384, 1_024)
     assert args.ngram_cache_gib == 1
+    assert args.context_file == (
+        harness.ROOT
+        / "mtplx/benchmarks/prompts/qwen38_generation_context.py"
+    )
+    assert hashlib.sha256(args.context_file.read_bytes()).hexdigest() == (
+        "c8ae2b1790c0300aa7c1421b55e7cd5d43c93461f7fba5d3a732fd34e156b4c4"
+    )
+    assert harness._PRODUCTION_PROMPT_TOKEN_SHA256 == (
+        "74a389866e6ae77542db2063be379cb220f6045c5c45a260f9beaec472346e26"
+    )
     assert harness._benchmark_lane_environment(args) == {
         "MTPLX_COMPILED_VERIFY": "1",
         "MTPLX_FUSE_PROJ": "gdn,attn,hyper,ple",

@@ -120,10 +120,6 @@ public final class OnboardingOrchestrator: ObservableObject {
         tuneCandidatesLanded = [:]
     }
 
-    public func acknowledgeOtherWarning() {
-        state.hasAcknowledgedOtherWarning = true
-    }
-
     // MARK: - Hardware detection
 
     public func detectHardware() {
@@ -257,6 +253,7 @@ public final class OnboardingOrchestrator: ObservableObject {
         case "qwen3_5": return "Qwen 3.5"
         case "qwen3_6": return "Qwen 3.6"
         case "qwen3_8": return "Qwen 3.8"
+        case "qwen4_exp": return "Flash-Next"
         case "gemma4": return "Gemma"
         case "step": return "Step"
         case "glm": return "GLM"
@@ -463,7 +460,7 @@ public final class OnboardingOrchestrator: ObservableObject {
                     isComplete: false,
                     statusMessage: "Incomplete"
                 )
-                downloadFailure = "Download finished, but the model folder is missing required MTPLX files. Press Retry to resume the Hugging Face download."
+                downloadFailure = "Download finished, but files the source repo ships are still missing from the model folder. Press Retry to resume the Hugging Face download."
                 isDownloading = false
                 return
             }

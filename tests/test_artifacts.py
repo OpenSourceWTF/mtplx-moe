@@ -1096,7 +1096,10 @@ def test_glm4_moe_mtp_with_family_layer_weights_is_runnable_without_contract(tmp
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
-def test_glm4_moe_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
+def test_glm4_moe_mtp_with_unrelated_model_file_serves_ar_mtp_off(tmp_path):
+    # 2026-08-26 (founder): an MTP head this build cannot attach is
+    # "MTP unavailable", never a refusal — the constructable trunk serves
+    # autoregressive with mtp_off.
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -1113,8 +1116,12 @@ def test_glm4_moe_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
     result = inspect_model(tmp_path)
 
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["can_run"] is False
-    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+    assert result.compatibility["can_run"] is True
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-mtp-unsupported"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
 
 
 def test_glm4_moe_mtp_sidecar_layer_keys_are_family_runnable(tmp_path):
@@ -1263,7 +1270,9 @@ def test_mimo_mtp_with_family_layer_weights_is_runnable_without_contract(tmp_pat
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
 
 
-def test_mimo_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
+def test_mimo_mtp_with_unrelated_model_file_serves_ar_mtp_off(tmp_path):
+    # Same 2026-08-26 doctrine as the glm4_moe case above: MTP unavailable
+    # degrades to AR, it does not block a constructable trunk.
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -1280,8 +1289,12 @@ def test_mimo_mtp_with_unrelated_model_file_still_needs_contract(tmp_path):
     result = inspect_model(tmp_path)
 
     assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
-    assert result.compatibility["can_run"] is False
-    assert result.compatibility["runtime_compatibility"] == "needs-contract"
+    assert result.compatibility["can_run"] is True
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-mtp-unsupported"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
 
 
 def test_minimax_m2_with_nextn_marker_is_recognized_backend_pending(tmp_path):
@@ -1410,6 +1423,48 @@ def test_nemotron_h_mtp_with_family_sidecar_is_runnable_without_contract(tmp_pat
 
     result = inspect_model(tmp_path)
 
+    assert result.compatibility["tier"] == "family-compatible-unverified"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["runtime_compatibility"] == "native-family-gated"
+
+
+def test_nemotron_h_mtp_official_block_type_list_config_is_runnable(tmp_path):
+    """Official NVIDIA configs carry mtp_layers_block_type, not
+    mtp_hybrid_override_pattern; the derived pattern must match the runtime
+    routing gate or inspect and serve disagree (issue #341)."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["NemotronHForCausalLM"],
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "num_hidden_layers": 52,
+                # Backbone pattern (M/- chars) must not shadow the MTP stack.
+                "hybrid_override_pattern": "M-M-M*-M-M-M*-E",
+                "mtp_layers_block_type": ["attention", "moe"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {
+            "mtp.layers.0.enorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.hnorm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.eh_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.0.mixer.q_proj.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.norm.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.mixer.gate.weight": np.ones((1,), dtype=np.float32),
+            "mtp.layers.1.final_layernorm.weight": np.ones((1,), dtype=np.float32),
+        },
+        tmp_path / "mtp.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.mtp_pattern == "*E"
+    assert result.compatibility["arch_id"] == "nemotron-h-mtp"
     assert result.compatibility["tier"] == "family-compatible-unverified"
     assert result.compatibility["can_run"] is True
     assert result.compatibility["runtime_compatibility"] == "native-family-gated"
@@ -1884,8 +1939,11 @@ def test_laguna_config_only_directory_is_not_runnable(tmp_path):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_complete_laguna_s_2_1_mlx_4bit_is_runnable_ar_only(
@@ -1918,8 +1976,11 @@ def test_laguna_shard_with_wrong_size_is_not_runnable(tmp_path, monkeypatch):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_laguna_without_poolside_chat_template_is_not_runnable(
@@ -1934,8 +1995,11 @@ def test_laguna_without_poolside_chat_template_is_not_runnable(
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1957,8 +2021,11 @@ def test_laguna_with_mutated_pinned_sidecar_is_not_runnable(
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_non_4bit_laguna_is_not_admitted_by_target_only_gate(tmp_path):
@@ -1974,8 +2041,11 @@ def test_non_4bit_laguna_is_not_admitted_by_target_only_gate(tmp_path):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_superseded_pipenetwork_laguna_is_not_admitted(tmp_path, monkeypatch):
@@ -1991,8 +2061,11 @@ def test_superseded_pipenetwork_laguna_is_not_admitted(tmp_path, monkeypatch):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_laguna_config_with_remote_model_file_is_blocked(tmp_path):
@@ -2003,8 +2076,11 @@ def test_laguna_config_with_remote_model_file_is_blocked(tmp_path):
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_wrong_laguna_expert_geometry_is_not_admitted_by_target_only_gate(tmp_path):
@@ -2015,8 +2091,11 @@ def test_wrong_laguna_expert_geometry_is_not_admitted_by_target_only_gate(tmp_pa
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_wrong_laguna_attention_geometry_is_not_admitted_by_target_only_gate(
@@ -2031,8 +2110,11 @@ def test_wrong_laguna_attention_geometry_is_not_admitted_by_target_only_gate(
 
     result = inspect_model(tmp_path)
 
-    assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["can_run"] is False
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "pinned-artifact-integrity-failed"
+    )
 
 
 def test_hf_qwen_mtp_without_runtime_contract_is_family_runnable(monkeypatch):
@@ -2300,7 +2382,11 @@ def test_gemma4_pair_bundle_root_is_runnable_from_remote_file_listing():
     assert verdict.runtime_compatibility == "assistant-pair-native"
 
 
-def test_gemma4_target_subfolder_alone_still_refuses():
+def test_gemma4_target_subfolder_alone_serves_ar_with_bundle_guidance():
+    # 2026-08-26 (founder): the target trunk loads through the bundled
+    # mlx-lm gemma4 module, so a lone target folder serves autoregressive
+    # (MTP unavailable) while the verdict still points at the assistant-pair
+    # bundle root for full speculative speed.
     from mtplx.artifacts import ModelInspection
     from mtplx.backends.registry import compatibility_for_inspection
 
@@ -2319,8 +2405,164 @@ def test_gemma4_target_subfolder_alone_still_refuses():
 
     verdict = compatibility_for_inspection(inspection)
 
-    assert verdict.can_run is False
-    assert verdict.runtime_compatibility == "incomplete-assistant-pair"
+    assert verdict.can_run is True
+    assert verdict.runtime_compatibility == "native-ar-only-mtp-unsupported"
+    assert "bundle root" in verdict.message
+
+
+def test_mlx_lm_loadable_family_without_mtp_serves_ar(tmp_path):
+    # 2026-08-26 (founder): any trunk this build can construct runs — MTP
+    # is an accelerator, never a load requirement. An mlx-lm-loadable
+    # family with no MTP head serves autoregressive at exit 0.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["SmolLM3ForCausalLM"],
+                "model_type": "smollm3",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "AR-only"
+    assert result.compatibility["can_run"] is True
+    assert result.compatibility["exit_code"] == 0
+    assert (
+        result.compatibility["runtime_compatibility"]
+        == "native-ar-only-missing-mtp"
+    )
+    assert "MTP unavailable" in result.compatibility["message"]
+
+
+def test_unknown_family_without_any_implementation_refuses_honestly(tmp_path):
+    # A model_type nothing in this build implements is a capability gap and
+    # says so — never "Model has no MTP head" (that message was a lie for
+    # models that ship one) and never a verification excuse.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["TotallyNovelForCausalLM"],
+                "model_type": "totally_novel_arch",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert "No MLX implementation" in result.compatibility["message"]
+    assert "capability gap" in result.compatibility["message"]
+    assert "MTP-equipped" not in result.compatibility["message"]
+
+
+def test_qwen4_flash_next_family_is_recognized(tmp_path):
+    # The real T-0 strings (config landed 2026-08-26 15:00 UTC) resolve to
+    # the qwen4-next catalog row even without MTP markers — recognition is
+    # not can_run, and a trunk-only checkpoint still belongs to the family.
+    # With the in-tree backend shipped, the trunk is constructable: AR-only.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen4ExpForConditionalGeneration"],
+                "model_type": "qwen4_exp",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] == "qwen4-next"
+    assert result.compatibility["recognized"] is True
+    assert result.compatibility["can_run"] is True
+    assert "autoregressive" in result.compatibility["message"]
+
+
+def test_qwen4_speculative_predrop_names_are_not_swallowed(tmp_path):
+    # #268 family-collision law: the speculative pre-drop names
+    # (qwen3_8_flash_next and friends) were purged from the catalog and must
+    # never be swallowed into the qwen4-next family — or any other.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3_8FlashNextForConditionalGeneration"],
+                "model_type": "qwen3_8_flash_next",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["arch_id"] is None
+    assert result.compatibility["tier"] == "incompatible-architecture"
+    assert result.compatibility["can_run"] is False
+
+
+def test_auto_map_is_ignored_when_trunk_is_constructable(tmp_path):
+    # MTPLX never executes repository code, so declared custom classes are
+    # irrelevant when this build ships its own implementation and a fast
+    # tokenizer is present — auto_map alone must not refuse the checkpoint.
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "auto_map": {"AutoModelForCausalLM": "modeling_x.CustomModel"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is True
+
+
+def test_auto_map_without_native_implementation_still_refuses(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["TotallyNovelForCausalLM"],
+                "model_type": "totally_novel_arch",
+                "auto_map": {"AutoModelForCausalLM": "modeling_x.CustomModel"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": np.ones((1,), dtype=np.float32)},
+        tmp_path / "model.safetensors",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["can_run"] is False
+    assert "auto_map" in result.compatibility["message"]
 
 
 def test_user_promoted_contract_runs_as_unverified_label(monkeypatch, tmp_path):
@@ -2660,3 +2902,48 @@ def test_remote_code_checkpoints_refuse_cleanly(tmp_path):
     assert result.compatibility["runtime_compatibility"] == "trust-remote-code-required"
     assert result.compatibility["can_run"] is False
     assert "trust_remote_code" in result.compatibility["message"]
+
+
+def test_public_model_id_alias_tables_agree():
+    """Every public model id must resolve, by id and by HF folder basename.
+
+    Three hand-maintained alias tables carry these pairs (mtplx/artifacts.py,
+    mtplx/model_catalog.py, mtplx/commands/public.py). They drifted once: the
+    Flash-Next rows were missing from artifacts.py, so the release notes' own
+    `mtplx pull mtplx-flash-next-bare-speed` died with "pull requires a Hugging
+    Face repo id or URL" and `serve --model mtplx-flash-next-bare-speed` raised
+    FileNotFoundError. Enumerating from mtplx.profiles (rather than listing the
+    ids here) means a newly added public id joins this test automatically.
+    """
+
+    from pathlib import Path as _Path
+
+    from mtplx import profiles
+    from mtplx.hf_loader import repo_id_from_model_ref
+
+    public_id_names = sorted(
+        name for name in dir(profiles) if name.endswith("_PUBLIC_MODEL_ID")
+    )
+    assert public_id_names, "no public model ids exported by mtplx.profiles"
+
+    checked = set()
+    for name in public_id_names:
+        hf_name = name.replace("_PUBLIC_MODEL_ID", "_HF_MODEL_ID")
+        assert hasattr(profiles, hf_name), f"{name} has no {hf_name} pair"
+        public_id = getattr(profiles, name)
+        hf_repo_id = getattr(profiles, hf_name)
+
+        assert (
+            repo_id_from_model_ref(public_id) == hf_repo_id
+        ), f"{name} ({public_id!r}) does not resolve to {hf_repo_id!r}"
+        basename = _Path(hf_repo_id).name
+        assert (
+            repo_id_from_model_ref(basename) == hf_repo_id
+        ), f"HF basename {basename!r} does not resolve to {hf_repo_id!r}"
+        checked.add(public_id)
+
+    # The two ids the 2.10.0 release notes tell users to pull by name.
+    assert {
+        "mtplx-flash-next-bare-speed",
+        "mtplx-flash-next-optimized-speed",
+    } <= checked

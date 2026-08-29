@@ -93,6 +93,7 @@ def test_installer_binds_exact_qwen4_capture_route():
         runtime.prepare_compiled_verify_aux.__func__.__name__
         == "_prepare_compiled_verify_aux"
     )
+    assert runtime.context_copy_probation_k == 24
 
 
 def test_installer_can_construct_the_corrected_prefix_route_without_prefetch(

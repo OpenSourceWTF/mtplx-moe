@@ -609,7 +609,11 @@ _RECEIPT_GROUPS: list[tuple[str, list[str]]] = [
              "accept_time_s", "target_forward_time_s", "verify_forward_time_s"]),
     ("sampling", ["effective_temperature", "effective_top_p", "effective_top_k",
                   "draft_sampler_policy", "draft_sampler_policy_source",
-                  "draft_sampler_resolved_temperature"]),
+                  "draft_sampler_resolved_temperature",
+                  # Adaptive-dtemp trajectory (MTPLX_ADAPTIVE_DTEMP): absent
+                  # unless the gate is on; carries current temp, EMA,
+                  # transitions, and the transition log.
+                  "draft_sampler_adaptive_dtemp"]),
     ("caps", ["request_max_tokens", "effective_max_tokens", "server_max_response_tokens",
               "server_cap_applied", "context_cap_applied", "uncapped_response_requested",
               "uncapped_response_lease_applied", "uncapped_repetition_stop_enabled"]),

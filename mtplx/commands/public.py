@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import hashlib
 import json
@@ -87,6 +88,10 @@ from mtplx.profiles import (
     DEFAULT_MODEL_ID,
     DEFAULT_PROFILE_NAME,
     DEFAULT_PUBLIC_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     OPTIMIZED_SPEED_V1_HF_MODEL_ID,
@@ -126,7 +131,10 @@ from mtplx.profiles import (
     restore_profile_env,
     runtime_env_with_contract_overrides,
 )
-from mtplx.reasoning_effort import REASONING_EFFORT_CHOICES
+from mtplx.reasoning_effort import (
+    REASONING_EFFORT_CHOICES,
+    REASONING_EFFORT_LEVELS,
+)
 from mtplx.server_urls import (
     bind_label,
     connect_host_for_bind,
@@ -630,7 +638,10 @@ def _print_command_error(
     if detail:
         print(f"detail: {detail}")
     if error == "model is not available locally":
-        print(f"try: mtplx {command} --download --model {model}")
+        # `--download` only exists on `mtplx start`; every other command's
+        # download path is `mtplx pull` first (the old hint suggested a flag
+        # the parser rejects).
+        print(f"try: mtplx pull {model}")
         print("try: mtplx models")
 
 
@@ -742,6 +753,21 @@ def _apply_runtime_compatibility_mode(
                 "mtp_heads not found -> mtp_off: serving autoregressive "
                 "(no speculative decode acceleration; build an MTP artifact "
                 "with Forge for full speed)."
+            )
+            _set_generation_mode_on_args(args, GENERATION_MODE_AR)
+            setattr(args, "depth", 0)
+        setattr(args, "load_mtp", False)
+        return None
+    if runtime_compatibility == "native-ar-only-mtp-unsupported":
+        # Same directive, generalized 2026-08-26: an MTP head this build
+        # cannot attach (unsupported family, failed tensor gate, pending
+        # backend) is unavailable, never a blocker. The head is left
+        # untouched on disk; the trunk serves autoregressive.
+        if _generation_mode_from_args(args) != GENERATION_MODE_AR:
+            printer(
+                "MTP unavailable in this MTPLX build -> mtp_off: serving "
+                "autoregressive (trunk loads natively; speculative "
+                "acceleration for this model lands with a runtime update)."
             )
             _set_generation_mode_on_args(args, GENERATION_MODE_AR)
             setattr(args, "depth", 0)
@@ -1107,6 +1133,18 @@ _TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
         QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID,
         QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
         QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID,
+        # Qwen 3.8 Flash-Next serve packs (2026-08-27). Turbo here does NOT
+        # ride the 27B NAX/vk verify machinery: the qwen4_exp family carries
+        # its own measured fast lane — the family env octet in
+        # openai.py:_server_runtime_env_overrides (AR pipeline, compiled GDN,
+        # layer-owned capture-commit, fused hc/gdn kernels) — and the same
+        # block family-neutralizes MTPLX_NAX_VERIFY until it earns a receipt
+        # on this family. Newest member's receipt (one-dispatch GDN step,
+        # 2026-08-27): two boot-triples in both arm orders, A/B/A +1.7% and
+        # B/A/B +2.2%, AR 60-62 t/s on 512-tok rows, zero-overlap warm rows
+        # in the confirm triple.
+        FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     }
 )
 
@@ -1291,6 +1329,22 @@ def _gemma4_pair_draft_block_size(inspection: dict[str, Any]) -> int:
 def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None:
     descriptor = descriptor_from_inspection(inspection)
     cli_flags = getattr(args, "_cli_flags", set()) or set()
+    if _inspection_backend_id(inspection) == "qwen4_exp":
+        # Flash-Next verify defaults: the capture-commit verifier walks the
+        # qwen3-next GDN internals, which this family's own GDN classes do
+        # not expose — batched verify snapshots/restores the recurrent caches
+        # generically. A family-native capture backend replaces this default
+        # when it lands. Depth follows the family DraftSemantics ceiling (3)
+        # with the adaptive expected_value policy owning per-step depth —
+        # the 27B contract (founder, 2026-08-26); no static clamp here.
+        if "verify-strategy" not in cli_flags:
+            args.verify_strategy = "batched"
+        # Target + draft sampler flow from the qwen4_exp family policy
+        # (QWEN4_EXP_SAMPLER_DEFAULTS: the model-card thinking-mode set) via
+        # the standard sampler block below. The 08-27 draft-temp 0.1 receipt
+        # was measured at target 0.6 and is superseded by the advised
+        # target-1.0 contract; re-calibrate draft temp under target 1.0
+        # before pinning any non-identity value.
     # Family-aware policy, not the raw lane descriptor: shared lanes (mlx_lm_ar)
     # pin parser=none while a family on that lane (lfm2) has a verified codec.
     # Stamping the lane's "none" here reads as an operator override downstream
@@ -1516,6 +1570,32 @@ def _draft_sampler_from_spec(spec: dict[str, Any] | None) -> Any | None:
     )
 
 
+def _greedy_coupled_draft_spec(
+    spec: dict[str, Any] | None,
+    args: Any,
+    target_temperature: float,
+) -> dict[str, Any] | None:
+    """Force the draft greedy when the target decodes greedily.
+
+    Mirror of the daemon resolver's coupling for the lanes that call
+    generate_mtpk directly and never pass through it: a stamped sampled
+    draft under a greedy target collapses acceptance by depth
+    ([79/65/42]% vs [96/87/76]% coupled on the coding suite), which reads
+    as an engine slowdown. A user-typed --draft-temperature keeps its
+    value; a None spec already mirrors the target sampler downstream
+    (_effective_draft_sampler) and needs nothing.
+    """
+    if spec is None or target_temperature > 0:
+        return spec
+    if float(spec.get("temperature", 0.0)) <= 0:
+        return spec
+    if "draft-temperature" in set(getattr(args, "_cli_flags", set()) or set()):
+        return spec
+    coupled = dict(spec)
+    coupled["temperature"] = 0.0
+    return coupled
+
+
 _DRAFT_SAMPLER_FLAG_ATTRS = {
     "draft-temperature": "draft_temperature",
     "draft-top-p": "draft_top_p",
@@ -1659,6 +1739,36 @@ def _enable_thinking_for_reasoning(mode: str) -> bool | None:
     if mode == "auto":
         return None
     return mode == "on"
+
+
+def _one_shot_reasoning_effort(
+    args: Any, enable_thinking: bool | None, model_ref: str | None
+) -> str | None:
+    """Resolve --reasoning-effort for the in-process one-shot lanes
+    (run/chat/quickstart) with the server's semantics: thinking off or a
+    family without declared levels -> None; auto -> the family default; an
+    undeclared-but-real tier maps to the nearest declared tier up the
+    global ladder, else nearest below."""
+
+    if enable_thinking is False:
+        return None
+    codec = reasoning_policy_for_model(model_ref=str(model_ref or ""))
+    levels = tuple(codec.effort_levels) if codec.supported else ()
+    if not levels:
+        return None
+    requested = str(getattr(args, "reasoning_effort", None) or "auto").strip().lower()
+    if requested in levels:
+        return requested
+    if requested not in REASONING_EFFORT_LEVELS:
+        return codec.default_effort
+    rank = REASONING_EFFORT_LEVELS.index(requested)
+    for candidate in REASONING_EFFORT_LEVELS[rank + 1 :]:
+        if candidate in levels:
+            return candidate
+    for candidate in reversed(REASONING_EFFORT_LEVELS[:rank]):
+        if candidate in levels:
+            return candidate
+    return codec.default_effort
 
 
 def _redact_secret_value(value: Any) -> Any:
@@ -3704,6 +3814,9 @@ def _cmd_tune_candidate(args: Any) -> int:
                 else (draft_sampler or {}).get("top_k", 20)
             ),
         }
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, float(getattr(args, "temperature", 0.6))
+    )
     result = _depth_sweep_native60(
         model=runtime_model,
         prompt_suite=prompt_suite_path(
@@ -4761,6 +4874,7 @@ def _tune_candidate_command(
 ) -> list[str]:
     command = [
         sys.executable,
+        "-P",  # never let the caller's cwd shadow the environment's mtplx
         "-m",
         "mtplx.cli",
         "tune",
@@ -5815,8 +5929,38 @@ def cmd_list_public(args: Any) -> int:
 
 
 def cmd_remove_public(args: Any) -> int:
-    from mtplx.hf_loader import remove_cached_model
+    from mtplx.hf_loader import (
+        directory_size_bytes,
+        remove_cached_model,
+        resolve_cached_model_target,
+    )
 
+    # Resolve through the same containment fence the remover uses, so a
+    # traversal ref is refused before we offer to delete anything.
+    try:
+        repo_id, target = resolve_cached_model_target(
+            args.model, cache_dir=args.cache_dir
+        )
+    except ValueError as exc:
+        print(f"mtplx remove: {exc}", file=sys.stderr)
+        return 1
+    if target.exists() and not getattr(args, "yes", False):
+        size = _format_bytes(directory_size_bytes(target))
+        if not sys.stdin.isatty():
+            print(
+                f"mtplx remove: refusing to delete {target} ({size}) without "
+                "confirmation; pass --yes to remove it non-interactively",
+                file=sys.stderr,
+            )
+            return 1
+        print("MTPLX remove")
+        print(f"model: {repo_id}")
+        print(f"path: {target}")
+        print(f"size: {size}")
+        answer = input("Delete this cached model? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("aborted: nothing was removed")
+            return 1
     result = remove_cached_model(args.model, cache_dir=args.cache_dir)
     if getattr(args, "json", False):
         _print(result)
@@ -8160,6 +8304,7 @@ def cmd_thermal_public(args: Any) -> int:
     run_id = args.run_id or f"cli-fanmax-{time.strftime('%Y%m%d-%H%M%S')}"
     child = [
         sys.executable,
+        "-P",  # never let the caller's cwd shadow the environment's mtplx
         "-m",
         "mtplx.cli",
         "bench",
@@ -8885,6 +9030,16 @@ def _model_ref_from_public_model_id(model_id: str | None) -> str | None:
         Path(
             QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID
         ).name.lower(): QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+        FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_BARE_SPEED_HF_MODEL_ID.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        Path(
+            FLASH_NEXT_BARE_SPEED_HF_MODEL_ID
+        ).name.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+        Path(
+            FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID
+        ).name.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
         "qwen3.6-35b-a3b-mtplx-official4-cyankiwimtp-cleanrecipe": QWEN36_35B_OPTIMIZED_SPEED_HF_MODEL_ID,
     }
     for candidate in lookup_keys:
@@ -9337,6 +9492,13 @@ def cmd_serve_public(args: Any) -> int:
         _print_serve_handoff(args, runtime_model, profile.name)
     cmd = [
         sys.executable,
+        # -P (safe path, 3.11+): -m alone puts the CWD on sys.path, so
+        # serving from any directory containing an mtplx/ package silently
+        # swapped the daemon's runtime to that directory's code — measured
+        # live 2026-08-27 when an A/B battery's "shipped 2.9.2" arm imported
+        # the checkout instead of its own venv. The daemon must run the code
+        # of the environment that launched it, never the caller's cwd.
+        "-P",
         "-m",
         "mtplx.server.openai",
         "--model",
@@ -9968,11 +10130,37 @@ class _MaxIdleWatchdog:
                 self._is_max = False
 
 
+def _piped_prompt_text() -> str:
+    """Prompt text waiting on a piped stdin, or ``""`` when there is none.
+
+    ``echo "..." | mtplx run`` is the shape every other CLI honors. Returns
+    ``""`` — never raises — when stdin is a terminal, is absent, or is a stream
+    that refuses reads (a captured test stdin, a detached daemon), so callers
+    keep their own "requires a prompt" error for exactly those cases.
+    """
+
+    stream = getattr(sys, "stdin", None)
+    if stream is None:
+        return ""
+    try:
+        if stream.isatty():
+            return ""
+        return str(stream.read() or "").strip()
+    except (OSError, ValueError):
+        # An unreadable stdin means "no piped prompt", not a failure worth
+        # reporting on its own — the caller's own error is the useful one.
+        return ""
+
+
 def _generate_one_shot_public(
     args: Any, *, command: str
 ) -> tuple[int, dict[str, Any], list[Any]]:
     fan_mode = _fan_mode_from_args(args)
     prompt = getattr(args, "prompt", None) or getattr(args, "prompt_arg", None)
+    if not prompt:
+        # Nothing on the command line: accept the prompt from a pipe before
+        # giving up, so `cat bug.py | mtplx run` works like every other tool.
+        prompt = _piped_prompt_text()
     if not prompt:
         raise SystemExit(f"mtplx {command} requires a prompt")
     depth_error = _validate_public_depth(args, printer=lambda _line: None)
@@ -10038,6 +10226,9 @@ def _generate_one_shot_public(
         _model_draft_sampler_spec(inspection, profile)
         if generation_mode == GENERATION_MODE_MTP
         else None
+    )
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, float(args.temperature)
     )
 
     max_session: Any | None = None
@@ -10108,11 +10299,15 @@ def _generate_one_shot_public(
         )
         reasoning_mode = _reasoning_mode(args)
         enable_thinking = _enable_thinking_for_reasoning(reasoning_mode)
+        reasoning_effort = _one_shot_reasoning_effort(
+            args, enable_thinking, runtime_model
+        )
         prompt_ids = encode_prompt_case(
             rt.tokenizer,
             case,
             chat_template=True,
             enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
         )
         budget = _cli_generation_budget(
             tokenizer=rt.tokenizer,
@@ -10334,6 +10529,41 @@ def _handle_quickstart_reasoning_command(args: Any, prompt: str) -> bool:
     return True
 
 
+def _handle_quickstart_effort_command(args: Any, prompt: str) -> bool:
+    """`/effort <level|status>` — the live twin of ``--reasoning-effort``.
+
+    ``_quickstart_generate`` re-reads ``args.reasoning_effort`` on every turn
+    (through ``_one_shot_reasoning_effort``), so setting it here really does
+    change the next answer, exactly like ``/reasoning`` does for the mode.
+    """
+
+    parts = prompt.strip().split()
+    if not parts or parts[0].lower() not in {"/effort", "--effort"}:
+        return False
+    levels = "|".join(REASONING_EFFORT_CHOICES)
+    if len(parts) == 1 or parts[1].lower() == "status":
+        _quickstart_line(f"Reasoning effort: {_quickstart_effort_label(args)}")
+        _quickstart_line(f"try: /effort {levels}")
+        return True
+    if len(parts) == 2 and parts[1].lower() in REASONING_EFFORT_CHOICES:
+        setattr(args, "reasoning_effort", parts[1].lower())
+        _quickstart_line(f"Reasoning effort: {_quickstart_effort_label(args)}")
+        return True
+    _quickstart_line(f"usage: /effort {levels}|status")
+    return True
+
+
+def _quickstart_effort_label(args: Any) -> str:
+    """How the live effort dial reads to the user.
+
+    ``auto`` is not a level — it defers to the loaded family's default — so
+    say that rather than printing a word the model never sees.
+    """
+
+    effort = str(getattr(args, "reasoning_effort", None) or "auto").strip().lower()
+    return "auto (model default)" if effort == "auto" else effort
+
+
 def _handle_quickstart_mtp_command(
     args: Any, prompt: str, *, runtime: Any | None = None
 ) -> bool:
@@ -10384,6 +10614,50 @@ def _quickstart_console() -> Any:
         return None
 
 
+CHAT_HISTORY_PATH = Path("~/.mtplx/history").expanduser()
+CHAT_HISTORY_LENGTH = 1000
+
+# True once ``readline`` is driving the chat REPL's ``input()`` calls. It
+# changes how the prompt has to be written (see ``_chat_input_prompt``), so the
+# fact has to outlive ``_enable_chat_line_editing``.
+_CHAT_LINE_EDITING = False
+
+
+def _enable_chat_line_editing() -> None:
+    """Give the terminal chat arrow-key editing and a history that persists.
+
+    Importing ``readline`` is the whole trick: bare ``input()`` is a raw line
+    reader, so today an up-arrow arrives as a literal ``^[[A`` and nothing
+    survives the session. The import installs editing; the rest is history.
+
+    Every step is best-effort by design. A Python built without readline, a
+    corrupt history file, or a read-only home must all degrade to a plain
+    prompt — a convenience feature never takes the chat down with it.
+    """
+
+    global _CHAT_LINE_EDITING
+    try:
+        import readline
+    except ImportError:
+        return
+
+    try:
+        readline.read_history_file(CHAT_HISTORY_PATH)
+    except (OSError, ValueError):
+        pass  # no history yet, or a file readline cannot parse: start empty
+    readline.set_history_length(CHAT_HISTORY_LENGTH)
+
+    def _save_history() -> None:
+        try:
+            CHAT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(CHAT_HISTORY_PATH)
+        except OSError:
+            pass  # read-only home or a full disk: losing history is not fatal
+
+    atexit.register(_save_history)
+    _CHAT_LINE_EDITING = True
+
+
 def _chat_input_prompt() -> str:
     """Prompt string for the chat REPL ``input()`` call.
 
@@ -10392,9 +10666,25 @@ def _chat_input_prompt() -> str:
 
     if not sys.stdout.isatty():
         return "\nyou> "
+
     # ANSI bold cyan for "you", reset, then bold "> ", then reset.
     # Avoid using rich here; ``input()`` does not interact well with rich Live.
-    return "\n\033[1;36myou\033[0m\033[1m>\033[0m "
+    # Under readline every non-printing byte must sit inside \001..\002 or it
+    # is counted as prompt width, and editing a wrapped line then redraws over
+    # the prompt itself.
+    def _esc(code: str) -> str:
+        return ("\001" + code + "\002") if _CHAT_LINE_EDITING else code
+
+    return (
+        "\n"
+        + _esc("\033[1;36m")
+        + "you"
+        + _esc("\033[0m")
+        + _esc("\033[1m")
+        + ">"
+        + _esc("\033[0m")
+        + " "
+    )
 
 
 def _print_assistant_fallback(label: str, text: str) -> None:
@@ -10879,11 +11169,17 @@ def _quickstart_generate(
     )
     reasoning_mode = _reasoning_mode(args)
     enable_thinking = _enable_thinking_for_reasoning(reasoning_mode)
+    reasoning_effort = _one_shot_reasoning_effort(
+        args,
+        enable_thinking,
+        getattr(rt, "model_path", getattr(args, "model", "")),
+    )
     prompt_ids = encode_prompt_case(
         rt.tokenizer,
         case,
         chat_template=True,
         enable_thinking=enable_thinking,
+        reasoning_effort=reasoning_effort,
     )
     budget = _cli_generation_budget(
         tokenizer=rt.tokenizer,
@@ -10910,6 +11206,9 @@ def _quickstart_generate(
         temperature=float(getattr(args, "temperature", 0.6)),
         top_p=float(getattr(args, "top_p", 0.95)),
         top_k=int(getattr(args, "top_k", 20)),
+    )
+    draft_sampler = _greedy_coupled_draft_spec(
+        draft_sampler, args, sampler.temperature
     )
     seed = int(getattr(args, "seed", 0)) + turn_index
     generation_mode = _generation_mode_from_args(args)
@@ -11866,12 +12165,13 @@ def _quickstart_opencode_payload(
     )
     enable_thinking = reasoning_mode != "off" and reasoning_policy.supported
     # The app/CLI dial is OpenCode's source of truth for reasoning effort:
-    # an explicit --reasoning-effort wins, otherwise the family default from
-    # the descriptor codec (Qwen3.8: medium). The family's effort levels
-    # drive OpenCode's effort picker so it mirrors the MTPLX dial.
+    # an explicit --reasoning-effort wins, otherwise the family's AGENT-lane
+    # default (codec.agent_effort — Qwen3.8: medium; Flash-Next: medium by
+    # the 2026-08-28 wall-clock A/B, chat default stays xhigh). The family's
+    # effort levels drive OpenCode's effort picker so it mirrors the dial.
     reasoning_effort = getattr(args, "reasoning_effort", None)
     if reasoning_effort in (None, "auto"):
-        reasoning_effort = reasoning_policy.default_effort
+        reasoning_effort = reasoning_policy.agent_effort
     if not enable_thinking:
         reasoning_effort = None
     reasoning_effort_levels = (
@@ -13275,13 +13575,21 @@ def _quickstart_run_terminal_chat_body(
         return run_turn(str(first_prompt), 0)
 
     if not sys.stdin.isatty():
+        # A piped prompt is a one-shot, not a broken REPL: answer it through
+        # the same turn path `--prompt` uses above. Only an *empty* pipe is
+        # the no-terminal case the refusal below was written for.
+        piped_prompt = _piped_prompt_text()
+        if piped_prompt:
+            return run_turn(piped_prompt, 0)
         _quickstart_line("error: no interactive terminal detected")
         prompt_hint = _start_invocation(args, ' --prompt "Say hi"')
         _quickstart_line(f"try: {prompt_hint}")
         return 2
 
+    _enable_chat_line_editing()
     _quickstart_line(
-        "Chat is ready. Type /mtp on|off|status, /stats, /speed, /reasoning on|off|auto, or /exit."
+        "Chat is ready. Type /mtp on|off|status, /stats, /speed, "
+        "/reasoning on|off|auto, /effort <level>, or /exit."
     )
     turn_index = 0
     worst_code = 0
@@ -13298,6 +13606,8 @@ def _quickstart_run_terminal_chat_body(
             _quickstart_line("bye")
             return worst_code
         if _handle_quickstart_reasoning_command(args, prompt):
+            continue
+        if _handle_quickstart_effort_command(args, prompt):
             continue
         if _handle_quickstart_mtp_command(args, prompt, runtime=rt):
             continue
@@ -14130,7 +14440,10 @@ def cmd_integrate_public(args: Any) -> int:
             },
         }
     elif action == "opencode":
-        from mtplx.opencode import build_opencode_provider_config
+        from mtplx.opencode import (
+            build_opencode_provider_config,
+            write_opencode_config,
+        )
 
         api_key_suffix = _api_key_command_suffix(args)
         reasoning_policy = reasoning_policy_for_model(model_ref=model_id)
@@ -14168,6 +14481,25 @@ def cmd_integrate_public(args: Any) -> int:
                 "Use MTPLX server settings or --reasoning on|off to change reasoning policy.",
             ],
         }
+        # `connect opencode` used to only PRINT the config while claiming
+        # "Config path: ..." — the file was never touched, so a new model id
+        # (e.g. a day-0 family) stayed missing from the provider's models map
+        # and OpenCode failed with ProviderModelNotFoundError surfaced as
+        # "Unexpected server error" (found live wiring Flash-Next, 2026-08-27).
+        # Write through the same merge-preserving writer the app flow uses.
+        payload["config_write"] = write_opencode_config(
+            base_url=api_base_url,
+            model_id=model_id,
+            model_name=f"MTPLX {model_id}",
+            api_key=getattr(args, "api_key", None),
+            enable_thinking=reasoning_policy.supported,
+            reasoning_effort=reasoning_policy.default_effort,
+            reasoning_effort_levels=(
+                tuple(reasoning_policy.effort_levels)
+                if reasoning_policy.supported
+                else None
+            ),
+        )
     elif action == "swival":
         from mtplx.swival import (
             build_swival_command,
@@ -14657,7 +14989,9 @@ def _architecture_qa_fixtures() -> list[dict[str, Any]]:
                 "tier": "no-MTP",
                 "arch_id": None,
                 "can_run": False,
-                "runtime_compatibility": "unsupported",
+                # Config-only fixture: the weights check precedes the
+                # unsupported label for constructable trunks.
+                "runtime_compatibility": "missing-model-weights",
             },
         },
         {
@@ -14955,17 +15289,16 @@ def cmd_config_public(args: Any) -> int:
         raise SystemExit("thermal_control must be auto or none")
     if key == "paged_kv_quantization":
         value = normalize_paged_kv_quantization(value)
-    if key == "scheduler_mode" and value not in {
-        "serial",
-        "cooperative",
-        "ar_batch",
-        "mtp_batch",
-        "mtp_cohort_experimental",
-    }:
-        raise SystemExit(
-            "scheduler_mode must be serial, cooperative, ar_batch, mtp_batch, "
-            "or mtp_cohort_experimental"
-        )
+    if key == "scheduler_mode":
+        # Single source of truth: the SchedulerMode enum (also feeds the CLI
+        # choices), so `mtplx config set` can never trail a new server mode.
+        from mtplx.batching.state import SchedulerMode
+
+        valid_modes = tuple(mode.value for mode in SchedulerMode)
+        if value not in valid_modes:
+            raise SystemExit(
+                "scheduler_mode must be one of: " + ", ".join(valid_modes)
+            )
     if key == "batching_preset" and value not in {
         "solo",
         "latency",

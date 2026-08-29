@@ -23,6 +23,12 @@ compilation behavior, then beat the unchanged production control.
   report decode-window GPU busy time, idle time, and utilization.
 - Current repeatable frontier: 69.8365 and 69.6411 TPS; mean 69.7388 TPS.
 
+The production prompt is frozen at
+`mtplx/benchmarks/prompts/qwen38_generation_context.py`; the harness rejects a
+non-smoke run unless its 16,384-token digest is
+`74a389866e6ae77542db2063be379cb220f6045c5c45a260f9beaec472346e26`.
+This prevents source edits from silently changing the workload.
+
 The current profiler receipt measured 12.6535 seconds GPU-active and 2.3191
 seconds GPU-idle over the 14.9725-second decode window, or 84.51% utilization.
 The most expensive active command-buffer families are the 22-op linear blocks
@@ -71,6 +77,8 @@ not be treated as retained work.
 | Fuse top-10 normalization into the row-owned router | Focused parity passed, but the exact production run fell from the 69.7388 TPS frontier to 62.3136 TPS (-10.65%) and decode time rose to 16.4330 seconds | rejected and fully reverted; the extra router synchronization disrupted the mixed dispatch window |
 | M=2 MoE stage-3 threadgroup sweep | The corrected exact-shape 256-thread route produced 69.5864 TPS and the 64-thread route produced 69.6382 TPS versus the 69.7388 TPS frontier mean. Both retained the production digest, 391/600 acceptance, 605 verifier calls, and zero repair | rejected and fully reverted; the existing 128-thread geometry remains best in the mixed production schedule |
 | Proposal-only draft-temperature sweep | With the target sampler fixed at temperature 1.0/top-p 0.95/top-k 20, draft temperature 0.8 produced 69.0417 TPS, 393/591 accepted drafts, and 601 verifier calls; draft temperature 1.2 produced 61.8749 TPS, 378/596 accepted drafts, and 607 verifier calls. The mirrored 1.0 control remains 69.7388 TPS mean, 391/600, and 605 calls. Different output trajectories were allowed because exact p/q correction preserves the target marginal | rejected and fully reverted; retain the production proposal sampler at 1.0/0.95/20 |
+| Generic 8-token context-copy probation after syncing upstream `4ce96908` | 65.1788 TPS, 17 copy rounds, 180 proposed copy tokens, 363/578 accepted drafts, and 595 verifier calls; this changed the stochastic trajectory and regressed 6.54% from the 69.7388 frontier mean | rejected for the exact Qwen4 lane; upstream default retained for other families |
+| Construction-bound Qwen4 24-token context-copy probation | No environment override: 69.6408 TPS, the original 5 copy rounds / 56 proposals, 391/600 accepted drafts, 605 verifier calls, zero repair, and the original output digest | retained; restores the proven schedule on current upstream main |
 
 ## `mlx-serve` candidates
 

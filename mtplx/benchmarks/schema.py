@@ -84,6 +84,7 @@ def encode_prompt_case(
     *,
     chat_template: bool = False,
     enable_thinking: bool | None = None,
+    reasoning_effort: str | None = None,
 ) -> list[int]:
     if chat_template:
         messages = case.messages or [{"role": "user", "content": case.prompt}]
@@ -99,6 +100,10 @@ def encode_prompt_case(
         kwargs: dict[str, Any] = {}
         if enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking
+        # Only pass a validated family level: the Qwen 3.8 template
+        # raise_exceptions on unknown effort values.
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
         try:
             return list(
                 tokenizer.apply_chat_template(

@@ -184,7 +184,14 @@ class InFlightRegistry:
             handle = self._handles.get(request_id)
         if handle is None:
             return False
-        handle.cancel_event.set()
+        # Duck-typed: attributed events record that THIS trip really came
+        # from the POST /v1/mtplx/cancel endpoint, so the stream's terminal
+        # frame can stop blaming the endpoint for internal cancels (#381).
+        set_origin = getattr(handle.cancel_event, "set_origin", None)
+        if set_origin is not None:
+            set_origin("post_endpoint")
+        else:
+            handle.cancel_event.set()
         return True
 
     def update_progress(self, request_id: str, progress: dict[str, Any]) -> None:
@@ -209,6 +216,17 @@ class InFlightRegistry:
     def count(self) -> int:
         with self._lock:
             return len(self._handles)
+
+    def session_ids(self) -> list[str]:
+        """Session ids of live requests (memory guard: these sessions'
+        bank entries must keep dynamic-ceiling protection even when one
+        turn outlives the bank's activity-pin TTL)."""
+        with self._lock:
+            return [
+                handle.session_id
+                for handle in self._handles.values()
+                if handle.session_id
+            ]
 
     def _reap_stale_locked(self) -> None:
         now = time.time()
@@ -602,3 +620,10 @@ class DashboardState:
     # macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warning,
     # 4 critical, 0 unknown. Written by the memory-pressure guard loop.
     last_memory_pressure_level: int = 0
+    # Which signal produced the level above: "macos" (system-wide — often
+    # another process allocating) or "allocator" (this engine's Metal
+    # active+cache near its limit). Lets the app banner name the culprit
+    # instead of implying the engine is misbehaving under an external storm.
+    last_memory_pressure_source: str = "macos"
+    # (active+cache)/metal-limit at the same tick, for the banner detail.
+    last_allocator_fraction: float = 0.0

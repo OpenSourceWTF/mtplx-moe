@@ -21,6 +21,7 @@ from .artifacts import (
     mtp_weights_present_on_disk,
     text_config,
 )
+from .backends.registry import ARCHITECTURE_DECLARED_MODULES
 from .mtp_adapters import (
     install_saved_mtp_lora_adapter,
     merge_installed_mtp_lora_adapters,
@@ -231,6 +232,7 @@ class MTPLXRuntime:
     ngram_memory_report: dict[str, Any] | None = None
     ngram_preflight_report: dict[str, Any] | None = None
     qwen4_depth1_batched_target_arrays: bool = field(default=False, init=False)
+    context_copy_probation_k: int | None = field(default=None, init=False)
     _a3b_whole_moe_request_preflights: dict[str, dict[str, Any]] = field(
         default_factory=dict,
         init=False,
@@ -600,7 +602,15 @@ class MTPLXRuntime:
 
     def make_cache(self):
         inner = getattr(self.model, "language_model", self.model)
-        cache = inner.make_cache()
+        if hasattr(inner, "make_cache"):
+            cache = inner.make_cache()
+        else:
+            # Plain mlx-lm models (the generic AR fallback lane) declare no
+            # custom cache; mlx-lm's own factory builds their default
+            # KVCache list, exactly as mlx_lm.generate would.
+            from mlx_lm.models.cache import make_prompt_cache
+
+            cache = make_prompt_cache(inner)
         from .cache_state import (
             configure_owned_recurrent_state_cache,
             configure_tail_owned_attention_kv_cache,
@@ -661,17 +671,11 @@ class LagunaARRuntime(MTPLXRuntime):
 
 
 # HF class name (as declared in config ``architectures``) -> mlx-lm module
-# implementing it. Extend this table only with verified schema-compatible
-# pairs; an architecture absent here keeps the fail-loud unknown-model_type
-# behavior.
-_ARCHITECTURE_DECLARED_MODULES = {
-    "Qwen3_5ForConditionalGeneration": "qwen3_5",
-    "Qwen3_5ForCausalLM": "qwen3_5",
-    "Qwen3_5TextForCausalLM": "qwen3_5",
-    "Qwen3_5MoeForConditionalGeneration": "qwen3_5_moe",
-    "Qwen3_5MoeForCausalLM": "qwen3_5_moe",
-    "Qwen3_5MoeTextForCausalLM": "qwen3_5_moe",
-}
+# implementing it. The table lives in backends.registry (single source of
+# truth shared with the compatibility verdicts); extend it only with
+# verified schema-compatible pairs — an architecture absent there keeps the
+# fail-loud unknown-model_type behavior.
+_ARCHITECTURE_DECLARED_MODULES = ARCHITECTURE_DECLARED_MODULES
 
 
 def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool:
@@ -912,6 +916,10 @@ def load(
             inject_deepseek_v4_mtp_support,
             is_deepseek_v4_mtp_config,
         )
+        from .models.qwen4_exp import (
+            inject_qwen4_exp_mtp_support,
+            is_qwen4_exp_mtp_config,
+        )
         from .qwen3_5_mtp_patch import inject_qwen3_5_mtp_support
 
         if str(config.get("model_type") or "").lower() == "qwen4_exp":
@@ -937,6 +945,11 @@ def load(
             mtp_enabled = inject_step3p5_mtp_support(model, path, config, contract)
         elif is_hy_v3_mtp_config(config):
             mtp_enabled = inject_hy_v3_mtp_support(model, path, config, contract)
+        elif is_qwen4_exp_mtp_config(config):
+            # Flash-Next native draft head: attach_mtp builds it from the
+            # pack's self-describing mtp.safetensors sidecar and publishes
+            # the runtime surface on language_model.
+            mtp_enabled = inject_qwen4_exp_mtp_support(model, path, config, contract)
         elif is_qwen3_5_mtp_config(config):
             mtp_enabled = inject_qwen3_5_mtp_support(model, path, config, contract)
         elif is_deepseek_mtp_config(config):
@@ -1263,18 +1276,42 @@ def _is_laguna_s_2_1_mlx_4bit_config(config: dict[str, Any]) -> bool:
     return is_laguna_s_2_1_mlx_4bit_config(config)
 
 
+def _deepseek_v4_model_classes() -> tuple[type, type]:
+    from .models.deepseek_v4 import Model, ModelArgs
+
+    return Model, ModelArgs
+
+
+def _qwen4_exp_model_classes() -> tuple[type, type]:
+    from .models.qwen4_omlx import Model, ModelArgs
+
+    return Model, ModelArgs
+
+
+# model_type -> loader of MTPLX-owned (Model, ModelArgs) classes for
+# architectures the pinned mlx-lm does not implement. A new in-tree
+# architecture (e.g. the Qwen3.8-Flash-Next backend) registers its loader
+# here AND its model_type in backends.registry._INTREE_MODEL_TYPES, keeping
+# the compatibility verdict and the loader in lockstep. Laguna stays a
+# geometry-gated special case below because its match is not model_type-keyed.
+_INTREE_MODEL_CLASS_LOADERS: dict[str, Callable[[], tuple[type, type]]] = {
+    "deepseek_v4": _deepseek_v4_model_classes,
+    "qwen4_exp": _qwen4_exp_model_classes,
+    # Text-config spelling of the same family: inspection prefers the nested
+    # text_config.model_type for multimodal checkpoints, and text-only
+    # re-exports carry it at top level. Same trunk, same classes.
+    "qwen4_exp_text": _qwen4_exp_model_classes,
+}
+
+
 def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | None:
     """Return MTPLX-owned model classes for architectures missing in mlx-lm."""
 
-    model_type = str(config.get("model_type") or "").lower()
-    if model_type == "deepseek_v4":
-        from .models.deepseek_v4 import Model, ModelArgs
-
-        return Model, ModelArgs
-    if model_type == "qwen4_exp":
-        from .models.qwen4_omlx import Model, ModelArgs
-
-        return Model, ModelArgs
+    loader = _INTREE_MODEL_CLASS_LOADERS.get(
+        str(config.get("model_type") or "").lower()
+    )
+    if loader is not None:
+        return loader()
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
         return None
     from .models.laguna import Model, ModelArgs
@@ -1312,6 +1349,11 @@ def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
                 "quantization_config": module_quantization,
             }
         model, _loaded_config = load_model(path, **load_kwargs)
+        # In-tree models with SSD-resident sidecars (e.g. the qwen4_exp
+        # n-gram table) finish wiring here — after weights, before serving.
+        post_load = getattr(model, "post_weight_load", None)
+        if callable(post_load):
+            post_load(path)
         return model, tokenizer
 
     from mlx_lm.utils import load as mlx_lm_load

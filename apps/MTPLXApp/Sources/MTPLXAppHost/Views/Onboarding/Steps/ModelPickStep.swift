@@ -622,18 +622,6 @@ struct ModelPickStep: View {
                     .foregroundStyle(Brand.typeTertiary)
                     .padding(.leading, 20)
             }
-            if probe.verdict == .noMTP {
-                Toggle(isOn: Binding(
-                    get: { orchestrator.state.hasAcknowledgedOtherWarning },
-                    set: { newValue in if newValue { orchestrator.acknowledgeOtherWarning() } }
-                )) {
-                    Text("Continue anyway - I know it'll be slower")
-                        .font(.caption)
-                        .foregroundStyle(Brand.typeSecondary)
-                }
-                .toggleStyle(.checkbox)
-                .padding(.leading, 20)
-            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -684,7 +672,9 @@ struct ModelPickStep: View {
         switch verdict {
         case .ready: return ("checkmark.circle.fill", Brand.success)
         case .missingSidecar: return ("exclamationmark.triangle.fill", Brand.warning)
-        case .noMTP: return ("xmark.octagon.fill", Brand.danger)
+        // MTP unavailable is informational (the model still runs, AR),
+        // so it wears the warning treatment, never the blocked one.
+        case .noMTP: return ("info.circle.fill", Brand.warning)
         case .probeFailed: return ("wifi.exclamationmark", Brand.danger)
         }
     }
@@ -707,8 +697,10 @@ struct ModelPickStep: View {
     }
 
     private nonisolated static func formatBytes(_ bytes: Int64) -> String {
-        let gib = Double(bytes) / 1_073_741_824.0
-        return String(format: "%.0f GB", gib.rounded())
+        // Decimal GB, matching the CLI catalog: the 106 GB pack must not
+        // read 99 GB here and 106 GB in `mtplx models`.
+        let gb = Double(bytes) / 1_000_000_000.0
+        return String(format: "%.0f GB", gb.rounded())
     }
 
     private func badge(_ text: String, color: Color) -> some View {
@@ -783,6 +775,10 @@ private struct RecommendedModelRow: Identifiable, Sendable {
             return .qwen38BareSpeed
         case "qwen38-27b-optimized-quality", "qwen38-27b-optimized-quality-fp16":
             return .qwen38OptimizedQuality
+        case "flash-next-bare-speed":
+            return .flashNextBareSpeed
+        case "flash-next-optimized-speed":
+            return .flashNextOptimizedSpeed
         case "optimized-speed-v2":
             return .qwen27SpeedV2
         case "optimized-speed", "optimized-speed-fp16":
@@ -838,6 +834,22 @@ private struct RecommendedModelRow: Identifiable, Sendable {
         logo: .qwen,
         title: "Qwen 3.8 27B Optimized Quality",
         detail: "8-bit dynamic quant. Good coding speeds and perfect quality."
+    )
+
+    static let flashNextBareSpeed = RecommendedModelRow(
+        choice: .curatedFlashNextBareSpeed,
+        modelID: "flash-next-bare-speed",
+        logo: .qwen,
+        title: "Qwen 3.8 Flash-Next Bare Speed",
+        detail: "Flat 4-bit quantization. Quickest Flash-Next speeds for chat and coding."
+    )
+
+    static let flashNextOptimizedSpeed = RecommendedModelRow(
+        choice: .curatedFlashNextOptimizedSpeed,
+        modelID: "flash-next-optimized-speed",
+        logo: .qwen,
+        title: "Qwen 3.8 Flash-Next Optimized Speed",
+        detail: "Dynamic 4-bit quant with 8-bit attention. Higher quality and slightly slower. Recommended."
     )
 
     static let qwen27SpeedV2 = RecommendedModelRow(

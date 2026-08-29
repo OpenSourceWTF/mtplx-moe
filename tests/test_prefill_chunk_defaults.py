@@ -25,9 +25,13 @@ from mtplx.profiles import SUSTAINED_PREFILL_ENV
 
 
 def test_sustained_profile_keeps_dense_decode_through_128k() -> None:
+    # 2.9.3: the fixed 131072 literal became the memory-aware "auto" ceiling
+    # (the literal was the 147.4k decode cliff). The resolver floors at
+    # 131072, so the through-128k guarantee this test exists for still holds
+    # — the floor itself is pinned in test_dense_decode_max_context.py.
     assert (
         SUSTAINED_PREFILL_ENV["MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT"]
-        == "131072"
+        == "auto"
     )
 
 

@@ -1,0 +1,3037 @@
+# Copyright © 2026 MTPLX.
+#
+# Qwen4-Exp (Qwen3.8-Flash-Next) — MTPLX-owned MLX backend.
+#
+# The pinned mlx-lm has no implementation for model_type "qwen4_exp"
+# (Qwen4ExpForConditionalGeneration). This module implements the text trunk
+# natively, reusing the pinned mlx-lm building blocks where the architecture
+# genuinely overlaps (GatedDeltaNet, the qwen3_next MoE block) and adding the
+# four genuinely new pieces:
+#
+#   * Gated Residual ("hyper-connections"): hc_count widened residual streams
+#     with a learned low-rank read mix and per-stream scalar write gates.
+#     There are NO input/post-attention layernorms and no final model.norm in
+#     this family — the per-block hc_norm and the final hyper_connection_mixer
+#     play those roles.
+#   * QSA (Qwen Sparse Attention): standard gated GQA whose causal mask is
+#     intersected with a per-query token selection produced by a
+#     DeepSeek-V3.2-class indexer (relu-scored mean-pooled key blocks,
+#     top-(budget/ratio) blocks + the incomplete tail block).
+#   * PLE (Per-Layer Embedding): a hashed n-gram lookup memory (~51B params,
+#     320M rows x 160) injected on one early linear-attention layer through a
+#     per-stream sigmoid gate and a dilated depthwise convolution. The table
+#     is deliberately NEVER materialized: it stays an SSD-resident sidecar
+#     (ngram-table.safetensors) gathered row-wise through numpy memmaps, so
+#     the OS page cache is the hot-row cache.
+#   * mrope carried by the family config; for text-only serving with equal
+#     t/h/w positions the interleaved mrope is numerically identical to the
+#     standard partial rotary embedding, which is what this module applies
+#     (same treatment the pinned mlx-lm gives qwen3_5).
+#
+# Reference: transformers' modular_qwen4_exp.py (read 2026-08-26, T+9h after
+# the weight drop). Norm convention: the Qwen4ExpTextRMSNorm family is stored
+# zero-centered ((1+w) convention) in HF checkpoints and shifted by +1.0 in
+# sanitize; the GDN gated norm is stored one-centered and is NOT shifted.
+
+from __future__ import annotations
+
+import contextlib
+import contextvars
+import json
+import math
+import os
+import re
+import struct
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from mlx_lm.models.base import BaseModelArgs, create_ssm_mask
+from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.qwen3_5 import GatedDeltaNet as _Qwen3_5GatedDeltaNet
+from mlx_lm.models.qwen3_next import (
+    Qwen3NextSparseMoeBlock as _Qwen3NextSparseMoeBlock,
+)
+
+
+@dataclass
+class TextArgs(BaseModelArgs):
+    model_type: str = "qwen4_exp_text"
+    hidden_size: int = 2560
+    num_hidden_layers: int = 48
+    num_attention_heads: int = 24
+    num_key_value_heads: int = 2
+    head_dim: int = 256
+    rms_norm_eps: float = 1e-6
+    vocab_size: int = 248320
+    max_position_embeddings: int = 262144
+    tie_word_embeddings: bool = False
+    attention_bias: bool = False
+    layer_types: Optional[List[str]] = None
+    full_attention_interval: int = 4
+
+    # GatedDeltaNet (names shared with qwen3_5 so the mlx-lm module reads them)
+    linear_num_value_heads: int = 48
+    linear_num_key_heads: int = 16
+    linear_key_head_dim: int = 128
+    linear_value_head_dim: int = 128
+    linear_conv_kernel_dim: int = 4
+    output_gate_type: str = "sigmoid"
+
+    # MoE (names shared with qwen3_next's SparseMoeBlock)
+    num_experts: int = 512
+    num_experts_per_tok: int = 10
+    moe_intermediate_size: int = 640
+    shared_expert_intermediate_size: int = 640
+    norm_topk_prob: bool = True
+    decoder_sparse_step: int = 1
+
+    # Gated Residual / hyper-connections
+    hc_count: int = 4
+    hc_lowrank: int = 320
+
+    # QSA indexer
+    indexer_n_heads: Optional[int] = 4
+    indexer_kv_heads: Optional[int] = 1
+    indexer_head_dim: Optional[int] = 128
+    indexer_budget: Optional[int] = 2048
+    indexer_compress_ratio: Optional[int] = 4
+
+    # PLE / n-gram embedding
+    ple_layer_ids: Optional[List[int]] = None  # ONE-indexed, per the HF config
+    ple_embed_dim: Optional[int] = None
+    ple_conv_kernel_size: int = 4
+    ngram_size: int = 3
+    heads_per_ngram: int = 8
+    ngram_vocab_size_base: int = 20_000_000
+    make_ngram_vocab_size_divisible_by: int = 128
+    seed: int = 1234
+    eos_token_id: Union[int, List[int], None] = None
+    # True in MTPLX packs: the table ships as ngram-table.safetensors and is
+    # gathered lazily from SSD — no weight parameter is ever constructed.
+    ngram_sidecar: bool = False
+
+    # Rope
+    rope_parameters: Optional[Dict[str, Any]] = None
+    partial_rotary_factor: float = 0.25
+    rope_theta: float = 10_000_000.0
+
+    def __post_init__(self):
+        if self.rope_parameters:
+            self.partial_rotary_factor = self.rope_parameters.get(
+                "partial_rotary_factor", self.partial_rotary_factor
+            )
+            self.rope_theta = self.rope_parameters.get("rope_theta", self.rope_theta)
+        if self.layer_types is None:
+            self.layer_types = [
+                "linear_attention"
+                if (i + 1) % self.full_attention_interval
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        # The shipped config says "full_attention"; those layers carry the
+        # indexer whenever the QSA fields are set.
+        self.ple_layer_ids = sorted(set(self.ple_layer_ids or []))
+        if self.ple_embed_dim is None:
+            self.ple_embed_dim = self.hidden_size
+
+    @property
+    def rotary_dim(self) -> int:
+        return int(self.head_dim * self.partial_rotary_factor)
+
+    @property
+    def eos_id(self) -> int:
+        eos = self.eos_token_id
+        if isinstance(eos, list):
+            return int(eos[0])
+        return int(eos if eos is not None else 0)
+
+
+def _rope_cos_sin(positions: mx.array, inv_freq: mx.array) -> tuple[mx.array, mx.array]:
+    """Non-interleaved (rotate-half) rope tables for arbitrary integer positions."""
+    angles = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
+    emb = mx.concatenate([angles, angles], axis=-1)
+    return mx.cos(emb), mx.sin(emb)
+
+
+def _apply_partial_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+    """Rotate the first `2 * inv_freq.size` features of the last axis of
+    x[..., S, H, D] with per-position tables cos/sin of shape [S, rot]."""
+    rot = cos.shape[-1]
+    x_rope = x[..., :rot]
+    x_pass = x[..., rot:]
+    half = rot // 2
+    x1 = x_rope[..., :half]
+    x2 = x_rope[..., half:]
+    rotated = mx.concatenate([-x2, x1], axis=-1)
+    cos = cos[:, None, :]
+    sin = sin[:, None, :]
+    x_rope = (x_rope.astype(mx.float32) * cos + rotated.astype(mx.float32) * sin).astype(
+        x.dtype
+    )
+    return mx.concatenate([x_rope, x_pass], axis=-1)
+
+
+class GroupedRMSNorm(nn.Module):
+    """RMSNorm normalized per contiguous group of `group_size` features, with a
+    full-width weight. Used by every hc_norm and the PLE norms (weight arrives
+    +1-shifted from sanitize)."""
+
+    def __init__(self, dims: int, group_size: int, eps: float = 1e-6):
+        super().__init__()
+        if dims % group_size:
+            raise ValueError(f"dims ({dims}) not divisible by group_size ({group_size})")
+        self.weight = mx.ones((dims,))
+        self.group_size = group_size
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        shape = x.shape
+        grouped = x.reshape(*shape[:-1], -1, self.group_size)
+        normed = mx.fast.rms_norm(grouped, None, self.eps)
+        return normed.reshape(shape) * self.weight
+
+
+class SigmoidRMSNormGated(nn.Module):
+    """GDN output norm with a sigmoid (not silu) gate — output_gate_type of
+    this family. Stored one-centered; NOT +1-shifted in sanitize."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = mx.ones((hidden_size,))
+        self.eps = eps
+
+    def __call__(self, hidden_states: mx.array, gate: Optional[mx.array] = None):
+        x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
+        if gate is None:
+            return x.astype(hidden_states.dtype)
+        g = mx.sigmoid(gate.astype(mx.float32))
+        return (g * x.astype(mx.float32)).astype(hidden_states.dtype)
+
+
+class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
+    """qwen3_5's GDN with the family's output gate activation (sigmoid) and
+    the reference q/k normalization.
+
+    mlx-lm folds the attention scale through mx.fast.rms_norm, whose eps sits
+    on mean(x²) — an effective d²·1e-6 on Σx² versus the reference FLA
+    l2norm's d·1e-6 (transformers qwen3_5 l2norm: x·rsqrt(Σx²+1e-6)). At
+    d=128 that skew is a measured, systematic ~1e-4-class divergence per
+    layer (pinned by CPU-exact stage bisection, 2026-08-26), so this forward
+    is mlx-lm's verbatim except the two q/k lines reproduce l2norm exactly.
+    """
+
+    def __init__(self, args: TextArgs):
+        super().__init__(args)
+        if getattr(args, "output_gate_type", "sigmoid") == "sigmoid":
+            self.norm = SigmoidRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        from mlx_lm.models.gated_delta import gated_delta_update
+
+        B, S, _ = inputs.shape
+
+        fused_in = getattr(self, "in_proj_fused", None)
+        if fused_in is not None:
+            qkv, z, b, a = fused_in(inputs)
+            z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
+        else:
+            qkv = self.in_proj_qkv(inputs)
+            z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
+            b = self.in_proj_b(inputs)
+            a = self.in_proj_a(inputs)
+
+        if cache is not None and cache[0] is not None:
+            conv_state = cache[0]
+        else:
+            conv_state = mx.zeros(
+                (B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype
+            )
+
+        if mask is not None:
+            qkv = mx.where(mask[..., None], qkv, 0)
+        if self._fused_step_applies(B, S, mask, cache):
+            # One-dispatch GDN step: conv+silu+l2norm + g/beta + delta +
+            # gated norm in a single kernel between the two library GEMVs.
+            # Verify rows (S>1) never take this branch, so capture-commit's
+            # stash contract below is untouched.
+            from mtplx.kernels.gdn_step_fused import fused_gdn_step
+
+            y, new_conv, new_delta = fused_gdn_step(
+                qkv.reshape(-1),
+                z.reshape(-1),
+                a.reshape(-1),
+                b.reshape(-1),
+                conv_state.reshape(self.conv_kernel_size - 1, self.conv_dim),
+                self.conv1d.weight,
+                self.A_log,
+                self.dt_bias,
+                cache[1],
+                self.norm.weight,
+            )
+            cache[0] = new_conv.reshape(B, self.conv_kernel_size - 1, self.conv_dim)
+            cache[1] = new_delta.reshape(
+                B, self.num_v_heads, self.head_v_dim, self.head_k_dim
+            )
+            cache.advance(S)
+            return self.out_proj(y.reshape(B, S, -1))
+        if self._fused_conv_norm_applies(B, S, mask, cache):
+            from mtplx.kernels.gdn_conv_norm import fused_gdn_conv_norm
+
+            q_f, k_f, v_f, new_state = fused_gdn_conv_norm(
+                qkv.reshape(-1),
+                conv_state.reshape(self.conv_kernel_size - 1, self.conv_dim),
+                self.conv1d.weight,
+            )
+            cache[0] = new_state.reshape(B, self.conv_kernel_size - 1, self.conv_dim)
+            q = q_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
+            k = k_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
+            v = v_f.reshape(B, S, self.num_v_heads, self.head_v_dim)
+            state = cache[1] if cache else None
+        elif self._fused_conv_norm_rows_applies(B, S, mask, cache):
+            from mtplx.kernels.gdn_conv_norm import fused_gdn_conv_norm_rows
+
+            q_f, k_f, v_f, new_state = fused_gdn_conv_norm_rows(
+                qkv.reshape(S, -1),
+                conv_state.reshape(self.conv_kernel_size - 1, self.conv_dim),
+                self.conv1d.weight,
+            )
+            cache[0] = new_state.reshape(B, self.conv_kernel_size - 1, self.conv_dim)
+            q = q_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
+            k = k_f.reshape(B, S, self.num_k_heads, self.head_k_dim)
+            v = v_f.reshape(B, S, self.num_v_heads, self.head_v_dim)
+            state = cache[1] if cache else None
+        else:
+            conv_input = mx.concatenate([conv_state, qkv], axis=1)
+            if cache is not None:
+                n_keep = self.conv_kernel_size - 1
+                if cache.lengths is not None:
+                    ends = mx.clip(cache.lengths, 0, S)
+                    positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                    cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                else:
+                    cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            conv_out = nn.silu(self.conv1d(conv_input))
+
+            q, k, v = [
+                t.reshape(B, S, h, d)
+                for t, h, d in zip(
+                    mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                    [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                    [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+                )
+            ]
+
+            state = cache[1] if cache else None
+            inv_scale = k.shape[-1] ** -0.5
+
+            def _l2norm(x: mx.array) -> mx.array:
+                xf = x.astype(mx.float32)
+                return (
+                    xf * mx.rsqrt((xf * xf).sum(-1, keepdims=True) + 1e-6)
+                ).astype(x.dtype)
+
+            q = inv_scale * _l2norm(q)
+            k = _l2norm(k)
+
+        if cache is not None and _VERIFY_CAPTURE.get():
+            # Family capture-commit: retain the exact rows gated_delta_update
+            # consumed (plus the pre-conv stream for the conv-state tail) so a
+            # rejected speculative window commits by replaying ONLY this
+            # recurrence from the pre-verify state — no trunk re-forward.
+            # These references are already materialized by this forward; at
+            # mx.compile trace time they are tracers the compiled step
+            # surfaces as extra outputs.
+            cache._mtplx_verify_rows = (qkv, q, k, v, a, b)
+
+        out, state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state,
+            mask,
+            use_kernel=not self.training,
+        )
+
+        if cache is not None:
+            cache[1] = state
+            cache.advance(S)
+
+        if self._fused_out_applies(B, S):
+            from mtplx.kernels.gdn_out_fused import fused_gdn_out
+
+            proj = self.out_proj
+            y = fused_gdn_out(
+                out.reshape(-1),
+                z.reshape(-1),
+                self.norm.weight,
+                proj.weight,
+                proj.scales,
+                proj.biases,
+                group_size=int(proj.group_size),
+            )
+            return y.reshape(B, S, -1)
+
+        out = self.norm(out, z)
+        return self.out_proj(out.reshape(B, S, -1))
+
+    def _fused_conv_norm_applies(self, B, S, mask, cache) -> bool:
+        # Fused conv+silu+l2norm (MTPLX_FUSED_GDN_CONVNORM): the decode-row
+        # chain between the input GEMV and gated_delta_update. Family
+        # geometry only (conv_dim 10240 / key_dim 2048 / heads of 128 — the
+        # kernel's TG alignment depends on 2*key_dim being a threadgroup
+        # multiple), dense rows, no conv bias, no ragged lengths. bf16
+        # rounding happens after the norm instead of before (tolerance
+        # class, same as the fallback re-forward's own noise).
+        if B != 1 or S != 1 or mask is not None or cache is None:
+            return False
+        if not _fused_gdn_conv_norm_enabled() or self.training:
+            return False
+        if getattr(cache, "lengths", None) is not None:
+            return False
+        if self.conv_dim != 10240 or self.key_dim != 2048:
+            return False
+        if self.conv_kernel_size != 4 or self.head_k_dim != 128:
+            return False
+        if getattr(self.conv1d, "bias", None) is not None:
+            return False
+        return True
+
+    def _fused_conv_norm_rows_applies(self, B, S, mask, cache) -> bool:
+        # Verify-width conv+silu+l2norm (MTPLX_FUSED_CONVNORM_VERIFY): the
+        # same chain the S=1 kernel replaces, for speculative verify blocks
+        # of 2..6 sequential rows. Deliberately ALLOWED under the capture
+        # scope — the kernel produces exactly the q/k/v rows the
+        # capture-commit stash retains, in the S=1 kernel's tolerance class.
+        # The recurrence stays in the library gated_delta_update dispatch.
+        if B != 1 or S < 2 or S > 6 or mask is not None or cache is None:
+            return False
+        if not _fused_conv_norm_rows_enabled() or self.training:
+            return False
+        if getattr(cache, "lengths", None) is not None:
+            return False
+        if self.conv_dim != 10240 or self.key_dim != 2048:
+            return False
+        if self.conv_kernel_size != 4 or self.head_k_dim != 128:
+            return False
+        if getattr(self.conv1d, "bias", None) is not None:
+            return False
+        return True
+
+    def _fused_step_applies(self, B, S, mask, cache) -> bool:
+        # One-dispatch GDN step (MTPLX_FUSED_GDN_STEP): decode rows only,
+        # family geometry, sigmoid-gated norm, live fp32 delta state. Mirrors
+        # _fused_conv_norm_applies plus the recurrence/epilogue requirements;
+        # anything else runs the staged chain.
+        if B != 1 or S != 1 or mask is not None or cache is None:
+            return False
+        if not _fused_gdn_step_enabled() or self.training:
+            return False
+        if _VERIFY_CAPTURE.get():
+            return False
+        if getattr(cache, "lengths", None) is not None:
+            return False
+        if cache[1] is None:
+            return False
+        if self.conv_dim != 10240 or self.key_dim != 2048:
+            return False
+        if self.conv_kernel_size != 4 or self.head_k_dim != 128:
+            return False
+        if self.num_v_heads != 48 or self.head_v_dim != 128 or self.num_k_heads != 16:
+            return False
+        if getattr(self.conv1d, "bias", None) is not None:
+            return False
+        if not isinstance(self.norm, SigmoidRMSNormGated):
+            return False
+        return cache[1].dtype == mx.float32
+
+    def _fused_out_applies(self, B: int, S: int) -> bool:
+        # Fused norm+gate+out_proj (MTPLX_FUSED_GDN_OUT): decode rows only,
+        # family geometry (48x128 values -> 2560), 4-bit affine out_proj at a
+        # shipped forge group size, sigmoid-gated norm. Anything else runs
+        # the stock chain. The capture-commit stash is upstream of this
+        # boundary (it retains the gated_delta_update INPUTS), so the fused
+        # output path is invisible to replay.
+        if B * S != 1 or not _fused_gdn_out_enabled():
+            return False
+        if self.num_v_heads != 48 or self.head_v_dim != 128:
+            return False
+        if not isinstance(self.norm, SigmoidRMSNormGated):
+            return False
+        proj = self.out_proj
+        return (
+            getattr(proj, "bits", None) == 4
+            and getattr(proj, "group_size", None) in (32, 64)
+            and getattr(proj, "weight", None) is not None
+            and proj.weight.dtype == mx.uint32
+        )
+
+
+class GatedResidual(nn.Module):
+    """The Gated Residual read/write mixer (hyper-connections)."""
+
+    def __init__(self, args: TextArgs, use_combine: bool = True):
+        super().__init__()
+        self.hc_count = args.hc_count
+        self.hidden_size = args.hidden_size
+        hc_hidden = self.hc_count * self.hidden_size
+        self.hc_norm = GroupedRMSNorm(hc_hidden, args.hidden_size, eps=args.rms_norm_eps)
+        self.input_mix_weight_down = nn.Linear(hc_hidden, args.hc_lowrank, bias=False)
+        self.input_mix_weight_up = nn.Linear(args.hc_lowrank, hc_hidden, bias=False)
+        if use_combine:
+            self.block_inject_weight = nn.Linear(hc_hidden, self.hc_count, bias=False)
+
+    def _fused_read_applies(self, hyper_input: mx.array) -> bool:
+        # The fused kernel hardcodes the family geometry and reads bf16
+        # module weights directly; anything else (quantized hc mixes, other
+        # dims, prefill widths) stays on the eager chain.
+        if not _fused_hc_enabled():
+            return False
+        if self.hc_count != 4 or self.hidden_size != 2560:
+            return False
+        down = self.input_mix_weight_down
+        if hasattr(down, "scales") or down.weight.shape[0] != 320:
+            return False
+        if down.weight.dtype != hyper_input.dtype:
+            return False
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        return 1 <= rows <= 8
+
+    def _v3_read_applies(self, hyper_input: mx.array) -> bool:
+        # v3 (two-dispatch, kernel-private 8-bit pack): single-row decode
+        # reads on the combine variant with bf16 module weights. Verify
+        # widths (rows 2..8) and prefill stay on the eager chain.
+        if not _fused_hc_v3_enabled():
+            return False
+        if self.hc_count != 4 or self.hidden_size != 2560:
+            return False
+        if "block_inject_weight" not in self:
+            return False
+        if hasattr(self.input_mix_weight_down, "scales"):
+            return False
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        if rows != 1:
+            return False
+        if getattr(self, "_v3_pack", None) is None:
+            from mtplx.kernels.hyper_connection_v3 import prepare_v3_pack
+
+            self._v3_pack = prepare_v3_pack(self)
+        return True
+
+    def __call__(self, hyper_input: mx.array):
+        if self._v3_read_applies(hyper_input):
+            from mtplx.kernels.hyper_connection_v3 import fused_hyper_read_v3
+
+            x2 = hyper_input.reshape(-1)
+            mixed, inject = fused_hyper_read_v3(
+                x2, self.hc_norm.weight, self._v3_pack
+            )
+            mixed = mixed.reshape(*hyper_input.shape[:-1], self.hidden_size)
+            inject = inject.reshape(*hyper_input.shape[:-1], self.hc_count)
+            return mixed, hyper_input, inject
+        if self._fused_read_applies(hyper_input):
+            from mtplx.kernels.hyper_connection import fused_hyper_read
+
+            combine = "block_inject_weight" in self
+            x2 = hyper_input.reshape(-1, self.hc_count * self.hidden_size)
+            mixed, inject = fused_hyper_read(
+                x2,
+                self.hc_norm.weight,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.block_inject_weight.weight if combine else None,
+            )
+            mixed = mixed.reshape(*hyper_input.shape[:-1], self.hidden_size)
+            if not combine:
+                return mixed
+            inject = inject.reshape(*hyper_input.shape[:-1], self.hc_count)
+            return mixed, hyper_input, inject
+        normed = self.hc_norm(hyper_input)
+        mix = nn.silu(self.input_mix_weight_down(normed) / self.hc_count)
+        mix = mx.sigmoid(self.input_mix_weight_up(mix))
+        mix = mix.reshape(*mix.shape[:-1], self.hc_count, self.hidden_size)
+        grouped = normed.reshape(*normed.shape[:-1], self.hc_count, self.hidden_size)
+        mixed_input = mx.mean(mix * grouped, axis=-2)
+        if "block_inject_weight" not in self:
+            return mixed_input
+        inject = 2.0 * mx.sigmoid(self.block_inject_weight(normed) / self.hc_count)
+        return mixed_input, hyper_input, inject
+
+
+class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
+    def __call__(self, x: mx.array) -> mx.array:
+        # Fused decode path (MTPLX_FUSED_MOE_DECODE=1 + sanitize-fused gu
+        # weights): collapses gate_up -> GLU -> down -> weighted-sum into two
+        # dispatches. Requires 4-bit affine at a shipped forge group size
+        # (32 or 64 — the 2026-08-27 01:35 reforge moved the pack to g64);
+        # anything else runs the stock chain.
+        sw = self.switch_mlp
+        if (
+            x.shape[-2] == 1
+            and x.size == x.shape[-1]  # B*S == 1
+            and _fused_moe_decode_enabled()
+            and isinstance(sw, _FusedGateUpSwitchGLU)
+            and sw.bits == 4
+            and sw.group_size in (32, 64)
+            and getattr(sw.down_proj, "bits", None) == 4
+            and getattr(sw.down_proj, "group_size", None) in (32, 64)
+        ):
+            from mtplx.kernels.moe_glu_decode import moe_glu_decode
+
+            flat = x.reshape(-1)
+            # Routing math mirrors the parent exactly: softmax over ALL
+            # experts first, then top-k of the probabilities.
+            gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+            idx = mx.argpartition(gates, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+            w = mx.take_along_axis(gates, idx, axis=-1)
+            if self.norm_topk_prob:
+                w = w / w.sum(axis=-1, keepdims=True)
+            dn = sw.down_proj
+            y = moe_glu_decode(
+                flat,
+                sw.gu_weight,
+                sw.gu_scales,
+                sw.gu_biases,
+                dn.weight,
+                dn.scales,
+                dn.biases,
+                idx.reshape(-1).astype(mx.uint32),
+                w.reshape(-1).astype(mx.float32),
+                gu_group_size=int(sw.group_size),
+                dn_group_size=int(dn.group_size),
+            ).reshape(x.shape)
+            shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+            return (y + shared).astype(x.dtype)
+        return super().__call__(x)
+
+
+class _FusedGateUpSwitchGLU(nn.Module):
+    """SwitchGLU with gate_proj and up_proj concatenated into ONE
+    gather_qmm (N=2*moe_intermediate) for the small-M decode/verify regime.
+
+    Rationale (2026-08-26 attribution campaign): at qL=1 the MoE runs three
+    gather_qmm dispatches per layer at N=640 — grids too small to fill the
+    M5's 40 cores. Concatenating gate+up along the output-rows axis halves
+    the large dispatches and doubles rows in flight. Per-row dot products
+    are unchanged, so results match the split path up to within-row
+    accumulation order. Large-M (prefill) calls fall through to the original
+    SwitchGLU, keeping its expert-sorted access pattern."""
+
+    def __init__(self, down_proj, gu_weight, gu_scales, gu_biases, group_size, bits, mode):
+        super().__init__()
+        self.gu_weight = gu_weight
+        self.gu_scales = gu_scales
+        self.gu_biases = gu_biases
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self.down_proj = down_proj
+        # Built ONLY at sanitize time with placeholder params that strict
+        # load_weights replaces by the lazily concatenated pack tensors —
+        # the per-projection originals never materialize. A mid-session
+        # module swap cannot reclaim their memory (freed tensors keep their
+        # multi-GB safetensors shard buffers pinned via siblings; measured
+        # +0.31G per fused module straight into a Metal OOM).
+
+    def _gu(self, x, idx, sorted_indices=False):
+        gu = mx.gather_qmm(
+            x,
+            self.gu_weight,
+            self.gu_scales,
+            self.gu_biases,
+            rhs_indices=idx,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=sorted_indices,
+        )
+        return mx.split(gu, 2, axis=-1)
+
+    def __call__(self, x, indices) -> mx.array:
+        from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        gate, up = self._gu(x, idx, sorted_indices=do_sort)
+        x = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=do_sort)
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+
+class _FusedGateUpMLP(nn.Module):
+    """Shared-expert MLP with gate_proj+up_proj as one quantized matmul
+    (same fusion rationale and build-time contract as
+    _FusedGateUpSwitchGLU; N=640 -> 1280)."""
+
+    def __init__(self, down_proj, gu_weight, gu_scales, gu_biases, group_size, bits, mode):
+        super().__init__()
+        self.gu_weight = gu_weight
+        self.gu_scales = gu_scales
+        self.gu_biases = gu_biases
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self.down_proj = down_proj
+
+    def __call__(self, x) -> mx.array:
+        gu = mx.quantized_matmul(
+            x,
+            self.gu_weight,
+            self.gu_scales,
+            self.gu_biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        gate, up = mx.split(gu, 2, axis=-1)
+        return self.down_proj(nn.silu(gate) * up)
+
+
+class _FusedGDNInProj(nn.Module):
+    """GDN qkv/z/b/a input projections as ONE quantized matmul.
+
+    All four share the layer input row; at qL=1 they are four separate GEMV
+    dispatches per GDN layer (35 layers = 140 dispatches/step). Row-axis
+    concat of quantized packs is bit-exact per output row — each row's dot
+    and its quant groups are unchanged — so the fused output just splits at
+    the recorded row offsets. Same placeholder-at-build/load-fills contract
+    as _FusedGateUpSwitchGLU."""
+
+    def __init__(self, weight, scales, biases, group_size, bits, mode, splits):
+        super().__init__()
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self._splits = list(splits)  # cumulative row offsets: qkv|z|b|a
+
+    def __call__(self, x):
+        y = mx.quantized_matmul(
+            x,
+            self.weight,
+            self.scales,
+            self.biases,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        return mx.split(y, self._splits, axis=-1)
+
+
+_LAYER_GDN_RE = re.compile(
+    r"^(.*\.layers\.(\d+)\.linear_attn)\.in_proj_qkv\.weight$"
+)
+_GDN_IN_PROJS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+
+
+def _fuse_gdn_in_proj_sanitize(model, out: dict) -> dict:
+    """Sanitize-time GDN input fusion (MTPLX_FUSED_GDN_INPROJ=1).
+
+    Concatenates the four quantized input projections of every GDN layer
+    along the output-rows axis on the LAZY weight dict (originals never
+    materialize) and swaps in a _FusedGDNInProj child. Fuses only when all
+    four are affine-quantized at one (group_size, bits); anything else keeps
+    the stock modules."""
+    if not _fused_gdn_in_proj_enabled():
+        return out
+    fused = 0
+    hits = [
+        (m.group(1), int(m.group(2)))
+        for m in (_LAYER_GDN_RE.match(k) for k in list(out))
+        if m is not None
+    ]
+    for prefix, idx in hits:
+        parts = []
+        for sub in _GDN_IN_PROJS:
+            w = out.get(f"{prefix}.{sub}.weight")
+            s = out.get(f"{prefix}.{sub}.scales")
+            b = out.get(f"{prefix}.{sub}.biases")
+            if w is None or s is None or b is None:
+                parts = None
+                break
+            parts.append((w, s, b))
+        if parts is None:
+            continue
+        k_words = parts[0][0].shape[-1]
+        n_groups = parts[0][1].shape[-1]
+        if any(w.shape[-1] != k_words or s.shape[-1] != n_groups for w, s, _ in parts):
+            continue  # mixed packing: stay stock
+        gdn = model.layers[idx].linear_attn
+        k_in = 2560  # in_proj input dim = hidden (same contract as gate_up)
+        group_size = k_in // n_groups
+        bits = (k_words * 32) // k_in
+        if bits not in (4, 8):
+            continue
+        rows = [w.shape[0] for w, _, _ in parts]
+        splits = [rows[0], rows[0] + rows[1], rows[0] + rows[1] + rows[2]]
+        f_w = mx.concatenate([w for w, _, _ in parts], axis=0)
+        f_s = mx.concatenate([s for _, s, _ in parts], axis=0)
+        f_b = mx.concatenate([b for _, _, b in parts], axis=0)
+        gdn.in_proj_fused = _FusedGDNInProj(
+            mx.zeros(f_w.shape, dtype=f_w.dtype),
+            mx.zeros(f_s.shape, dtype=f_s.dtype),
+            mx.zeros(f_b.shape, dtype=f_b.dtype),
+            group_size,
+            bits,
+            "affine",
+            splits,
+        )
+        for sub in _GDN_IN_PROJS:
+            gdn.pop(sub, None)
+        out[f"{prefix}.in_proj_fused.weight"] = f_w
+        out[f"{prefix}.in_proj_fused.scales"] = f_s
+        out[f"{prefix}.in_proj_fused.biases"] = f_b
+        for sub in _GDN_IN_PROJS:
+            for part in ("weight", "scales", "biases"):
+                out.pop(f"{prefix}.{sub}.{part}", None)
+        fused += 1
+    if fused:
+        print(f"[qwen4_exp] sanitize fused GDN in_proj: {fused} layers", flush=True)
+    return out
+
+
+_LAYER_ATTN_RE = re.compile(r"^(.*\.layers\.(\d+)\.self_attn)\.q_proj\.weight$")
+_QSA_QKV_PROJS = ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
+
+
+def _fuse_qsa_qkv_sanitize(model, out: dict) -> dict:
+    """Sanitize-time QSA attention input fusion (MTPLX_FUSED_QSA_QKV).
+
+    q/k/v and the indexer's qk projection all consume the layer input row;
+    row-axis concat of the quantized packs is bit-exact per output row (same
+    contract as the GDN in_proj fusion), so the 13 attention layers run one
+    shared-input GEMV instead of four. Biased checkpoints and mixed packings
+    keep the stock chain."""
+    if not _fused_qsa_qkv_enabled():
+        return out
+    fused = 0
+    hits = [
+        (m.group(1), int(m.group(2)))
+        for m in (_LAYER_ATTN_RE.match(k) for k in list(out))
+        if m is not None
+    ]
+    for prefix, idx in hits:
+        if any(f"{prefix}.{p}.bias" in out for p in _QSA_QKV_PROJS):
+            continue
+        parts = []
+        fused_subs = []
+        for sub in _QSA_QKV_PROJS:
+            w = out.get(f"{prefix}.{sub}.weight")
+            s = out.get(f"{prefix}.{sub}.scales")
+            b = out.get(f"{prefix}.{sub}.biases")
+            if w is None or s is None or b is None:
+                if sub == "indexer.index_qk_proj":
+                    continue  # optional member
+                parts = None
+                break
+            parts.append((w, s, b))
+            fused_subs.append(sub)
+        if parts is None:
+            continue
+        k_words = parts[0][0].shape[-1]
+        n_groups = parts[0][1].shape[-1]
+        if any(
+            w.shape[-1] != k_words or s.shape[-1] != n_groups
+            for w, s, _ in parts[:3]
+        ):
+            continue
+        # The shipped forge keeps the indexer projection at 8-bit (selection
+        # precision) while q/k/v are 4-bit — a mixed-bits member cannot join
+        # one GEMV, so it drops out and keeps its own dispatch.
+        if len(parts) == 4 and (
+            parts[3][0].shape[-1] != k_words or parts[3][1].shape[-1] != n_groups
+        ):
+            parts = parts[:3]
+            fused_subs = fused_subs[:3]
+        attn = model.layers[idx].self_attn
+        if getattr(attn, "indexer", None) is None:
+            continue
+        k_in = 2560  # attention input dim = hidden (same contract as gate_up)
+        group_size = k_in // n_groups
+        bits = (k_words * 32) // k_in
+        if bits not in (4, 8):
+            continue
+        rows = [w.shape[0] for w, _, _ in parts]
+        splits = [sum(rows[: i + 1]) for i in range(len(rows) - 1)]
+        f_w = mx.concatenate([w for w, _, _ in parts], axis=0)
+        f_s = mx.concatenate([s for _, s, _ in parts], axis=0)
+        f_b = mx.concatenate([b for _, _, b in parts], axis=0)
+        attn.qkv_fused = _FusedGDNInProj(
+            mx.zeros(f_w.shape, dtype=f_w.dtype),
+            mx.zeros(f_s.shape, dtype=f_s.dtype),
+            mx.zeros(f_b.shape, dtype=f_b.dtype),
+            group_size,
+            bits,
+            "affine",
+            splits,
+        )
+        for name in ("q_proj", "k_proj", "v_proj"):
+            attn.pop(name, None)
+        if "indexer.index_qk_proj" in fused_subs:
+            attn.indexer.pop("index_qk_proj", None)
+        out[f"{prefix}.qkv_fused.weight"] = f_w
+        out[f"{prefix}.qkv_fused.scales"] = f_s
+        out[f"{prefix}.qkv_fused.biases"] = f_b
+        for sub in fused_subs:
+            for part in ("weight", "scales", "biases"):
+                out.pop(f"{prefix}.{sub}.{part}", None)
+        fused += 1
+    if fused:
+        print(f"[qwen4_exp] sanitize fused QSA qkv: {fused} layers", flush=True)
+    return out
+
+
+def _fused_gate_up_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GATE_UP") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_qsa_qkv_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_QSA_QKV") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_gdn_in_proj_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GDN_INPROJ") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_gdn_out_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GDN_OUT") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_gdn_conv_norm_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GDN_CONVNORM") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_gdn_step_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_GDN_STEP") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_conv_norm_rows_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_CONVNORM_VERIFY") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _qsa_gather_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_QSA_GATHER") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _qsa_gather_decode_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_QSA_GATHER_DECODE") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _qsa_gather_min_context() -> int:
+    """Rows-gather engages only at/past this KV length. Below it the fused
+    dense SDPA over full KV is cheaper (the gather trades one shared O(T)
+    read for per-row O(S*K) materialized copies, and the S=1 lane's own
+    receipt measured the copy overhead at -5.25% on short contexts). The
+    break-even for verify widths lands in the tens of thousands of tokens,
+    where the dense mask chain is also the within-request growth term."""
+    try:
+        return max(0, int(os.environ.get("MTPLX_QSA_GATHER_MIN_CONTEXT") or 16384))
+    except ValueError:
+        return 16384
+
+
+def _qsa_gather_max_rows() -> int:
+    """Rows-gather serves query widths 2..this (default 8: AR pipelining and
+    batched-verify widths). Copy-block rounds (25+ rows) multiply the
+    gathered working set by S and stay on the dense path until measured."""
+    try:
+        return max(2, int(os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") or 8))
+    except ValueError:
+        return 8
+
+
+def _qsa_flash_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_QSA_FLASH") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_hc_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_HC") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_hc_v3_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_HC_V3") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fused_moe_decode_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_FUSED_MOE_DECODE") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+_LAYER_MLP_RE = re.compile(r"^(.*\.layers\.(\d+)\.mlp)\.switch_mlp\.gate_proj\.weight$")
+
+
+def _fuse_gate_up_sanitize(model, out: dict) -> dict:
+    """Sanitize-time MoE gate+up fusion (MTPLX_FUSED_GATE_UP=1).
+
+    Runs on the LAZY, file-backed weight dict before quantize/load: swaps
+    each layer's switch_mlp and shared_expert modules for the fused
+    variants (placeholder params), moves the pack tensors into the dict as
+    lazy concatenations under the fused names, and drops the per-projection
+    keys. Materialization then only ever builds fused buffers — the split
+    originals never come off the shards. down_proj children keep their
+    stock modules and tree paths, so the quantize predicate and strict
+    load_weights treat them exactly as before."""
+    if not _fused_gate_up_enabled():
+        return out
+    fused = 0
+    layer_hits = [
+        (m.group(1), int(m.group(2)))
+        for m in (_LAYER_MLP_RE.match(k) for k in list(out))
+        if m is not None
+    ]
+    for prefix, idx in layer_hits:
+        layer = model.layers[idx]
+        for sub, cat_axis in (("switch_mlp", 1), ("shared_expert", 0)):
+            base = f"{prefix}.{sub}"
+            gw = out.get(f"{base}.gate_proj.weight")
+            uw = out.get(f"{base}.up_proj.weight")
+            gs = out.get(f"{base}.gate_proj.scales")
+            us = out.get(f"{base}.up_proj.scales")
+            gb = out.get(f"{base}.gate_proj.biases")
+            ub = out.get(f"{base}.up_proj.biases")
+            if gw is None or uw is None or gs is None or us is None:
+                continue  # bf16/tiny checkpoints: stock path
+            if (gb is None) != (ub is None):
+                continue
+            k_in = 2560  # gate/up input dim = hidden for both blocks
+            group_size = k_in // gs.shape[-1]
+            bits = (gw.shape[-1] * 32) // k_in
+            if gb is None:
+                continue  # non-affine packing: unknown mode, stay stock
+            mod = getattr(layer.mlp, sub)
+            cls = _FusedGateUpSwitchGLU if sub == "switch_mlp" else _FusedGateUpMLP
+            gu_w = mx.concatenate([gw, uw], axis=cat_axis)
+            gu_s = mx.concatenate([gs, us], axis=cat_axis)
+            gu_b = mx.concatenate([gb, ub], axis=cat_axis)
+            setattr(
+                layer.mlp,
+                sub,
+                cls(
+                    mod.down_proj,
+                    mx.zeros(gu_w.shape, dtype=gu_w.dtype),
+                    mx.zeros(gu_s.shape, dtype=gu_s.dtype),
+                    mx.zeros(gu_b.shape, dtype=gu_b.dtype),
+                    group_size,
+                    bits,
+                    "affine",
+                ),
+            )
+            out[f"{base}.gu_weight"] = gu_w
+            out[f"{base}.gu_scales"] = gu_s
+            out[f"{base}.gu_biases"] = gu_b
+            for proj in ("gate_proj", "up_proj"):
+                for part in ("weight", "scales", "biases"):
+                    out.pop(f"{base}.{proj}.{part}", None)
+            fused += 1
+    if fused:
+        print(f"[qwen4_exp] sanitize fused gate+up: {fused} modules", flush=True)
+    return out
+
+
+# Armed around a speculative verify forward: GDN layers retain the exact
+# recurrence rows so a rejected window commits by replaying only the
+# gated-delta recurrence (see Qwen4ExpTextModel.commit_verified_window).
+_VERIFY_CAPTURE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "qwen4_exp_verify_capture", default=False
+)
+
+
+@contextlib.contextmanager
+def verify_capture_scope():
+    token = _VERIFY_CAPTURE.set(True)
+    try:
+        yield
+    finally:
+        _VERIFY_CAPTURE.reset(token)
+
+
+class QSACache:
+    """Cache for one QSA layer: the attention KV plus the indexer's raw key
+    stream and the incrementally maintained pooled (mean->norm->rope) block
+    keys. Single-sequence.
+
+    The raw/pooled streams are POSITIONAL buffers keyed to ``kv.offset``, not
+    append-only logs: every write lands at the absolute row range of the
+    tokens being forwarded and the valid lengths derive from ``kv.offset``.
+    That keeps the indexer streams in lockstep with the KV through every
+    mutation the runtime performs — per-round speculative rollback,
+    verified-window trims, and session-bank ``state`` round-trips — which
+    also makes the layer trimmable like a plain ``KVCache`` instead of being
+    deep-cloned every verify round. (Append-only streams desynced from the
+    KV on the first rollback and, past the indexer's engage threshold, built
+    a selection mask longer than the KV: the 2026-08-27 OpenCode
+    ``broadcast_shapes (1,1,4,3719) vs (1,24,4,3715)`` crash.)"""
+
+    step = 256
+
+    def __init__(self, compress_ratio: int = 4):
+        self.kv = KVCache()
+        self.ratio = max(1, int(compress_ratio))
+        self.raw_keys: Optional[mx.array] = None  # [1, cap, index_head_dim]
+        self.pooled: Optional[mx.array] = None  # [1, cap_blocks, index_head_dim]
+        self.pooled_len = 0  # valid pooled blocks
+
+    @property
+    def offset(self) -> int:
+        return self.kv.offset
+
+    def write_raw(self, keys: mx.array) -> None:
+        """Store this forward's indexer keys at their absolute positions.
+
+        Called before ``kv.update_and_fetch`` advances the offset, so
+        ``kv.offset`` IS the absolute position of ``keys[:, 0]``. After a
+        trim the same positions are simply overwritten."""
+        start = self.kv.offset
+        end = start + keys.shape[1]
+        if self.raw_keys is None or end > self.raw_keys.shape[1]:
+            cap = ((end + self.step - 1) // self.step) * self.step
+            grown = mx.zeros((1, cap, keys.shape[2]), keys.dtype)
+            if self.raw_keys is not None:
+                grown[:, : self.raw_keys.shape[1], :] = self.raw_keys
+            self.raw_keys = grown
+        self.raw_keys[:, start:end, :] = keys
+
+    def write_pooled(self, blocks: mx.array, nb_start: int, nb_total: int) -> None:
+        if self.pooled is None or nb_total > self.pooled.shape[1]:
+            cap = ((nb_total + self.step - 1) // self.step) * self.step
+            grown = mx.zeros((1, cap, blocks.shape[2]), blocks.dtype)
+            if self.pooled is not None:
+                grown[:, : self.pooled.shape[1], :] = self.pooled
+            self.pooled = grown
+        self.pooled[:, nb_start:nb_total, :] = blocks
+        self.pooled_len = nb_total
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        trimmed = self.kv.trim(n)
+        # Pooled blocks past the new frontier were built from now-rejected
+        # rows. The raw buffer needs no touch: future writes land at the same
+        # absolute positions and overwrite.
+        self.pooled_len = min(self.pooled_len, self.kv.offset // self.ratio)
+        return trimmed
+
+    @property
+    def nbytes(self) -> int:
+        total = self.kv.nbytes
+        if self.raw_keys is not None:
+            total += self.raw_keys.nbytes
+        if self.pooled is not None:
+            total += self.pooled.nbytes
+        return total
+
+    @property
+    def state(self):
+        off = self.kv.offset
+        nb = min(self.pooled_len, off // self.ratio)
+        raw = None if self.raw_keys is None else self.raw_keys[:, :off, :]
+        pooled = None if self.pooled is None or nb == 0 else self.pooled[:, :nb, :]
+        return (*self.kv.state, raw, pooled)
+
+    @state.setter
+    def state(self, v):
+        if len(v) != 4:
+            raise ValueError(
+                "QSACache.state expects (keys, values, raw_keys, pooled); got "
+                f"{len(v)} leaves — a session snapshot from an older build; "
+                "drop it and re-prefill"
+            )
+        keys, values, raw, pooled = v
+        self.kv.state = (keys, values)
+        self.raw_keys = raw
+        self.pooled = pooled
+        self.pooled_len = 0 if pooled is None else pooled.shape[1]
+
+
+class QSAIndexer(nn.Module):
+    """Vectorized exact port of the reference indexer for the single-sequence
+    causal case (B=1, no padding): every query selects its top
+    (budget/compress_ratio) complete key blocks by relu-scored pooled keys,
+    plus the visible incomplete tail."""
+
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        self.n_heads = args.indexer_n_heads
+        self.kv_heads = args.indexer_kv_heads
+        self.head_dim = args.indexer_head_dim
+        self.budget = args.indexer_budget
+        self.ratio = args.indexer_compress_ratio
+        self.block_topk = self.budget // self.ratio
+        self.index_qk_proj = nn.Linear(
+            args.hidden_size, (self.n_heads + self.kv_heads) * self.head_dim, bias=False
+        )
+        self.q_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_layernorm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        rot = args.rotary_dim
+        self._inv_freq = args.rope_theta ** (
+            -mx.arange(0, rot, 2, dtype=mx.float32) / rot
+        )
+
+    def _extend_pooled(self, cache: QSACache, total: int) -> Optional[mx.array]:
+        nb_total = total // self.ratio
+        nb_old = min(cache.pooled_len, nb_total)
+        if nb_total > nb_old:
+            fresh = cache.raw_keys[:, nb_old * self.ratio : nb_total * self.ratio, :]
+            fresh = fresh.reshape(1, nb_total - nb_old, self.ratio, self.head_dim)
+            pooled = mx.mean(fresh.astype(mx.float32), axis=2).astype(fresh.dtype)
+            pooled = self.k_layernorm(pooled)
+            starts = mx.arange(nb_old, nb_total, dtype=mx.int32) * self.ratio
+            cos, sin = _rope_cos_sin(starts, self._inv_freq)
+            pooled = _apply_partial_rope(pooled[:, :, None, :], cos, sin)[:, :, 0, :]
+            cache.write_pooled(pooled, nb_old, nb_total)
+        if nb_total == 0:
+            return None
+        return cache.pooled[:, :nb_total, :]
+
+    def __call__(
+        self,
+        hidden: mx.array,
+        pos_start: int,
+        cache: QSACache,
+        qk_rows: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
+        B, S, _ = hidden.shape
+        if B != 1:
+            raise NotImplementedError("qwen4_exp QSA serves single sequences (B=1)")
+        # qk_rows: the layer's fused shared-input GEMV already produced this
+        # projection (MTPLX_FUSED_QSA_QKV) — same rows bit-exactly.
+        qk = self.index_qk_proj(hidden) if qk_rows is None else qk_rows
+        q, k = mx.split(qk, [self.n_heads * self.head_dim], axis=-1)
+        q = q.reshape(B, S, self.n_heads, self.head_dim)
+        k = k.reshape(B, S, self.head_dim)
+        q = self.q_layernorm(q)
+        positions = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
+        cos, sin = _rope_cos_sin(positions, self._inv_freq)
+        q = _apply_partial_rope(q, cos, sin)
+
+        cache.write_raw(k)
+        T = pos_start + S  # == the KV length after this forward's update
+        pooled = self._extend_pooled(cache, T)
+        nb_total = 0 if pooled is None else pooled.shape[1]
+
+        # Per-query complete-block counts. If every visible prefix fits inside
+        # the budget the selection is the full causal mask — skip the work.
+        last_nb = (pos_start + S) // self.ratio
+        if last_nb <= self.block_topk:
+            return None  # dense == sparse in this regime
+
+        pooled_t = mx.swapaxes(pooled.astype(mx.float32), 1, 2)[:, None]  # [1,1,D,nb]
+        scores = mx.matmul(q.astype(mx.float32), pooled_t)  # [1,S,H,nb]
+        scores = mx.maximum(scores, 0.0).sum(axis=2) / math.sqrt(self.head_dim)
+        scores = scores[0]  # [S, nb]
+
+        qpos = mx.arange(pos_start, pos_start + S, dtype=mx.int32)  # abs position
+        nb_q = (qpos + 1) // self.ratio  # complete blocks visible per query [S]
+        blk = mx.arange(nb_total, dtype=mx.int32)
+        valid = blk[None, :] < nb_q[:, None]  # [S, nb]
+        neg = mx.array(-mx.inf, dtype=mx.float32)
+        masked_scores = mx.where(valid, scores, neg)
+        # torch.topk tie-break (lowest index wins). Exact ties are common:
+        # a block whose every head-dot is negative relu-scores exactly 0.0.
+        masked_scores = masked_scores - blk.astype(mx.float32)[None, :] * 1e-12
+
+        k_eff = min(self.block_topk, nb_total)
+        top_idx = mx.argpartition(masked_scores, kth=nb_total - k_eff, axis=-1)[
+            :, nb_total - k_eff :
+        ]
+        selected = mx.zeros((S, nb_total), dtype=mx.bool_)
+        selected = mx.put_along_axis(
+            selected, top_idx.astype(mx.int64), mx.array(True), axis=-1
+        )
+        selected = selected & valid  # -inf padding rows never select
+
+        if S == 1 and _qsa_flash_enabled():
+            # Flash-skip lane (MTPLX_QSA_FLASH): hand attention the sorted
+            # selected BLOCK ids + host-side tail bounds; the block-sparse
+            # flash kernel iterates exactly that visible set in place — no
+            # dense mask staged, no gathered copies (both measured slower:
+            # dense = full-context reads, gather = -5.25% from two
+            # materialized copies per layer per token, d6171d2c).
+            blk_idx = mx.sort(top_idx[0].astype(mx.int32))  # [k_eff]
+            tail_start = ((pos_start + 1) // self.ratio) * self.ratio
+            return ("flash", blk_idx, tail_start)
+
+        if S == 1 and _qsa_gather_decode_enabled():
+            # Decode gather lane (MTPLX_QSA_GATHER_DECODE, dormant opt-in —
+            # FALSIFIED d6171d2c, clean A/B/A -5.25% at 22.9k, so the
+            # rows-gather family default must never arm it): return the
+            # selected TOKEN INDICES instead of a dense [T] mask so
+            # attention reads only budget+tail keys/values. Every returned
+            # token is visible by construction (complete selected blocks
+            # are < the tail start; the tail runs to the current position),
+            # so the gathered SDPA needs no mask — identical math to the
+            # masked dense product over the same visible set.
+            blk_idx = mx.sort(top_idx[0].astype(mx.int32))  # [k_eff]
+            tok_from_blocks = (
+                blk_idx[:, None] * self.ratio + mx.arange(self.ratio, dtype=mx.int32)
+            ).reshape(-1)
+            # Host-side int (no .item() sync — a per-layer eval would stall
+            # the AR pipeline): for the single decode row qpos == pos_start,
+            # so the visible-complete-block count is (pos_start+1) // ratio.
+            tail_start = ((pos_start + 1) // self.ratio) * self.ratio
+            tail_ids = mx.arange(tail_start, T, dtype=mx.int32)
+            return mx.concatenate([tok_from_blocks, tail_ids])
+
+        if (
+            S > 1
+            and _qsa_gather_enabled()
+            and S <= _qsa_gather_max_rows()
+            and T >= _qsa_gather_min_context()
+        ):
+            # Rows-gather lane (MTPLX_QSA_GATHER at S>1), adapting the
+            # per-query gather + GQA-broadcast attention from community PR
+            # #380 by @maceip. Every S>1 forward previously staged a dense
+            # [S, T] bool mask and read the FULL KV through fused SDPA in
+            # each of the 12 QSA layers, an O(T)-per-round chain that grows
+            # with the generation. Here each row hands attention its own
+            # token list instead: k_eff selected blocks plus its visible
+            # tail, padded to one constant width (k_eff*ratio + ratio) so
+            # gather shapes stay stable across the whole generation.
+            # Selected blocks are complete blocks strictly below each row's
+            # tail start, so the lists never double-count a token; invalid
+            # slots carry valid=False and are re-pointed at token 0 for the
+            # take.
+            blk_ok = mx.take_along_axis(valid, top_idx.astype(mx.int64), axis=-1)
+            tok_blocks = (
+                top_idx.astype(mx.int32)[:, :, None] * self.ratio
+                + mx.arange(self.ratio, dtype=mx.int32)
+            ).reshape(S, -1)
+            blocks_ok = mx.repeat(blk_ok, self.ratio, axis=1)
+            tail_tok = nb_q[:, None] * self.ratio + mx.arange(
+                self.ratio, dtype=mx.int32
+            )
+            tail_ok = tail_tok <= qpos[:, None]
+            token_idx = mx.concatenate([tok_blocks, tail_tok], axis=1)
+            token_ok = mx.concatenate([blocks_ok, tail_ok], axis=1)
+            token_idx = mx.where(token_ok, token_idx, mx.array(0, dtype=mx.int32))
+            return ("gather_rows", token_idx, token_ok)
+
+        # Blocks -> tokens, plus the visible tail, intersected with causal.
+        tok_sel = mx.repeat(selected, self.ratio, axis=1)  # [S, nb*ratio]
+        if nb_total * self.ratio < T:
+            pad = mx.zeros((S, T - nb_total * self.ratio), dtype=mx.bool_)
+            tok_sel = mx.concatenate([tok_sel, pad], axis=1)
+        tpos = mx.arange(T, dtype=mx.int32)
+        tail = tpos[None, :] >= (nb_q[:, None] * self.ratio)
+        causal = tpos[None, :] <= qpos[:, None]
+        mask = (tok_sel | tail) & causal  # [S, T]
+        return mask[None, None]  # [1, 1, S, T]
+
+
+def _qsa_rows_gather_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    token_idx: mx.array,
+    token_ok: mx.array,
+    scale: float,
+) -> mx.array:
+    """Attention over per-row gathered tokens (rows-gather lane).
+
+    Adapting the per-query single-take gather + GQA head-group broadcast
+    from community PR #380 by @maceip, minus its mask re-gather (the
+    selection itself carries validity here, so no second gathered copy is
+    ever built — the S=1 lane's receipt priced each extra copy at -5.25%).
+
+    q is [1, H, S, D]; k/v are the cache's [1, H_kv, T, D] slices;
+    token_idx/token_ok are [S, K]. Keys differ per row, so fused SDPA over
+    a shared KV sequence cannot serve this; the whole S stays in-graph as
+    one broadcast GEMM pair, and the 12x-repeated K/V working set is never
+    materialized: q is viewed [1, H_kv, rep, S, 1, D] against
+    [1, H_kv, 1, S, D, K]. Invalid slots score -inf before the fp32
+    softmax, identical math to the dense bool-mask product over the same
+    visible set.
+    """
+    B, H, S, D = q.shape
+    H_kv = int(k.shape[1])
+    K = int(token_idx.shape[-1])
+    flat = token_idx.reshape(-1)
+    k_sel = mx.take(k, flat, axis=2).reshape(1, H_kv, S, K, D)
+    v_sel = mx.take(v, flat, axis=2).reshape(1, H_kv, S, K, D)
+    neg = mx.array(-mx.inf, dtype=mx.float32)
+    if H != H_kv:
+        rep = H // H_kv
+        q_view = q.reshape(1, H_kv, rep, S, 1, D)
+        k_view = k_sel.swapaxes(-1, -2).reshape(1, H_kv, 1, S, D, K)
+        scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * scale
+        scores = mx.where(token_ok[None, None, None], scores, neg)
+        probs = mx.softmax(scores, axis=-1).astype(q.dtype)
+        v_view = v_sel.reshape(1, H_kv, 1, S, K, D)
+        out = mx.matmul(probs[..., None, :], v_view).squeeze(-2)
+        return out.reshape(1, H, S, D)
+    scores = (
+        mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(mx.float32)
+        * scale
+    )
+    scores = mx.where(token_ok[None, None], scores, neg)
+    probs = mx.softmax(scores, axis=-1).astype(q.dtype)
+    return mx.matmul(probs[..., None, :], v_sel).squeeze(-2)
+
+
+class Attention(nn.Module):
+    """Gated GQA (qwen3_5 style: double-width q_proj, sigmoid output gate,
+    per-head q/k RMSNorm, partial rotary) masked by the QSA indexer."""
+
+    # The QSA indexer mask is part of this module's semantics (and __call__
+    # takes (x, cache)): any generic dense-SDPA rewrite that replaces
+    # __call__ would silently drop the sparse selection. attention_split
+    # honors this and never hooks the class.
+    _mtplx_generic_sdpa_rewrites_unsupported = True
+
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        self.n_heads = args.num_attention_heads
+        self.n_kv_heads = args.num_key_value_heads
+        self.head_dim = args.head_dim
+        self.scale = self.head_dim**-0.5
+        self.q_proj = nn.Linear(
+            args.hidden_size, self.n_heads * self.head_dim * 2, bias=args.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.n_kv_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.n_kv_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            self.n_heads * self.head_dim, args.hidden_size, bias=args.attention_bias
+        )
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.indexer = QSAIndexer(args) if args.indexer_n_heads else None
+        rot = args.rotary_dim
+        self._inv_freq = args.rope_theta ** (
+            -mx.arange(0, rot, 2, dtype=mx.float32) / rot
+        )
+
+    def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
+        B, S, _ = x.shape
+        pos_start = cache.offset
+
+        fused = getattr(self, "qkv_fused", None)
+        if fused is not None:
+            # One shared-input GEMV replaces q/k/v (+ indexer qk when its
+            # pack precision matches — the shipped forge keeps it 8-bit, so
+            # it usually keeps its own dispatch). Row-concat is bit-exact
+            # per row; MTPLX_FUSED_QSA_QKV sanitize fusion.
+            outs = fused(x)
+            if len(outs) == 4:
+                q, k, v, idx_rows = outs
+            else:
+                q, k, v = outs
+                idx_rows = None
+            sel_mask = (
+                self.indexer(x, pos_start, cache, qk_rows=idx_rows)
+                if self.indexer is not None
+                else None
+            )
+        else:
+            sel_mask = None
+            if self.indexer is not None:
+                sel_mask = self.indexer(x, pos_start, cache)
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+
+        q, gate = mx.split(q.reshape(B, S, self.n_heads, -1), 2, axis=-1)
+        gate = gate.reshape(B, S, -1)
+        k = k.reshape(B, S, self.n_kv_heads, -1)
+        v = v.reshape(B, S, self.n_kv_heads, -1)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        positions = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
+        cos, sin = _rope_cos_sin(positions, self._inv_freq)
+        q = _apply_partial_rope(q, cos, sin)
+        k = _apply_partial_rope(k, cos, sin)
+
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        k, v = cache.kv.update_and_fetch(k, v)
+        T = k.shape[2]
+
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash":
+            # Block-sparse flash attention over the indexer's exact visible
+            # set. Reads the cache BACKING arrays in place at their
+            # allocation stride — the :T slice above is non-contiguous, and
+            # forcing it contiguous would copy the entire KV.
+            from mtplx.kernels.qsa_flash_skip import qsa_flash_skip
+
+            _, blk_idx, tail_start = sel_mask
+            out = qsa_flash_skip(
+                q.reshape(self.n_heads, self.head_dim),
+                cache.kv.keys,
+                cache.kv.values,
+                blk_idx,
+                T,
+                tail_start,
+                self.scale,
+            )
+            out = out.reshape(B, S, -1)
+            return self.o_proj(out * mx.sigmoid(gate))
+
+        if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "gather_rows":
+            # Rows-gather lane (S>1): each verify/pipeline row reads only
+            # its own selected blocks + tail instead of the full context
+            # through a dense [S, T] mask. See _qsa_rows_gather_attention
+            # (adapting community PR #380 by @maceip).
+            _, tok_idx, tok_ok = sel_mask
+            out = _qsa_rows_gather_attention(q, k, v, tok_idx, tok_ok, self.scale)
+            out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+            return self.o_proj(out * mx.sigmoid(gate))
+
+        if sel_mask is not None and sel_mask.ndim == 1:
+            # QSA gather lane (decode): the indexer returned the selected
+            # token indices — attention reads budget+tail keys/values
+            # instead of the full context through a dense bool mask. All
+            # gathered tokens are visible, so no mask is needed; the
+            # softmax over the same visible set is identical math.
+            k = mx.take(k, sel_mask, axis=2)
+            v = mx.take(v, sel_mask, axis=2)
+            mask = None
+        elif sel_mask is not None:
+            mask = sel_mask
+        elif S > 1:
+            qpos = mx.arange(pos_start, pos_start + S, dtype=mx.int32)
+            tpos = mx.arange(T, dtype=mx.int32)
+            mask = (tpos[None, :] <= qpos[:, None])[None, None]
+        else:
+            mask = None
+
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=mask
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+        return self.o_proj(out * mx.sigmoid(gate))
+
+
+_MASK64 = (1 << 64) - 1
+_SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+_SPLITMIX_M1 = 0xBF58476D1CE4E5B9
+_SPLITMIX_M2 = 0x94D049BB133111EB
+_PRIME_1 = 10007
+
+
+def _splitmix64(value: int) -> int:
+    value = (value + _SPLITMIX_GAMMA) & _MASK64
+    value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
+    value = ((value ^ (value >> 27)) * _SPLITMIX_M2) & _MASK64
+    return (value ^ (value >> 31)) & _MASK64
+
+
+def _build_layer_multipliers(vocab: int, ngram_size: int, ple_index: int, seed: int):
+    max_long = (1 << 63) - 1
+    half_bound = max(1, (max_long // max(vocab, 1)) // 2)
+    base_seed = seed + _PRIME_1 * ple_index
+    out = []
+    for i in range(ngram_size):
+        v = (base_seed + _SPLITMIX_GAMMA * (i + 1)) & _MASK64
+        out.append(2 * (_splitmix64(v) % half_bound) + 1)
+    return out
+
+
+def _is_prime(v: int) -> bool:
+    if v < 2:
+        return False
+    if v % 2 == 0:
+        return v == 2
+    for d in range(3, math.isqrt(v) + 1, 2):
+        if v % d == 0:
+            return False
+    return True
+
+
+def _head_vocab_layout(base: int, heads: int, ple_index: int):
+    sizes, offsets, total = [], [], 0
+    prime = base - 1
+    # global head index runs across PLE layers; sizes are consecutive primes
+    for h in range(ple_index * heads + heads):
+        prime += 1
+        while not _is_prime(prime):
+            prime += 1
+        if h >= ple_index * heads:
+            sizes.append(prime)
+            offsets.append(total)
+            total += prime
+    return sizes, offsets, total
+
+
+class NGramTable(nn.Module):
+    """The hashed n-gram embedding. Two modes:
+
+    * materialized (tiny/test configs): a QuantizedEmbedding-shaped or plain
+      `weight` parameter, gathered with mx.take.
+    * sidecar (the real 51B table): `attach_sidecar()` points row gathers at
+      numpy memmaps over ngram-table.safetensors. Rows are dequantized after
+      the gather; only touched pages ever become resident. No parameter is
+      registered, so the table never counts as loadable weight.
+    """
+
+    def __init__(self, rows: int, dim: int, sidecar: bool = False):
+        super().__init__()
+        self.rows = rows
+        self.dim = dim
+        self._sidecar_mode = sidecar
+        if not sidecar:
+            self.weight = mx.zeros((max(rows, 1), dim))
+        self._sidecar = None
+
+    def attach_sidecar(self, path: Path):
+        self.pop("weight", None)
+        header, data_start = _read_safetensors_header(path)
+        meta = header.get("__metadata__", {})
+        entries = {}
+        names = ("weight",) if int(meta.get("ngram_bits", 4)) == 0 else ("weight", "scales", "biases")
+        for name in names:
+            info = header[f"ngram.{name}"]
+            entries[name] = (info, data_start)
+        self._sidecar = _SidecarGather(
+            path,
+            entries,
+            bits=int(meta.get("ngram_bits", 4)),
+            group_size=int(meta.get("ngram_group_size", 32)),
+        )
+
+    def attach_resident(self, path: Path) -> bool:
+        """Materialize the table as RESIDENT mx arrays for in-graph gathers.
+
+        mx.load's lazy arrays are NOT page-granular — the first eval reads
+        the whole tensor (measured: a mid-request ~32G materialization train
+        collapsed decode to 8 t/s and trips the GPU watchdog in a bare
+        process). So residency is paid ONCE, up front, at model load — and
+        only on machines whose memory plan can afford it (the pipelined AR
+        lane needs in-graph gathers on LAZY ids; smaller machines keep the
+        pread sidecar + staged classic loop, which SSD serves at zero cost).
+        """
+        try:
+            header, _ = _read_safetensors_header(path)
+            meta = header.get("__metadata__", {})
+            bits = int(meta.get("ngram_bits", 4))
+            started = time.perf_counter()
+            raw = mx.load(str(path))
+            if bits == 0:
+                parts = (raw["ngram.weight"], None, None)
+                mx.eval(parts[0])
+                nbytes = parts[0].nbytes
+            else:
+                parts = (
+                    raw["ngram.weight"],
+                    raw["ngram.scales"],
+                    raw["ngram.biases"],
+                )
+                mx.eval(*parts)
+                nbytes = sum(p.nbytes for p in parts)
+            self._lazy_parts = parts
+            self._lazy_bits = bits
+            self._lazy_group = int(meta.get("ngram_group_size", 32))
+            self.prefer_lazy = False
+            print(
+                f"[qwen4_exp] ngram table resident: {nbytes / 2**30:.1f}G in "
+                f"{time.perf_counter() - started:.1f}s (pipelined-AR lane armed)",
+                flush=True,
+            )
+            return True
+        except Exception as exc:
+            print(f"[qwen4_exp] ngram resident bind failed: {exc!r}", flush=True)
+            self._lazy_parts = None
+            return False
+
+    def _lazy_gather(self, ids: mx.array) -> mx.array:
+        w, s, b = self._lazy_parts
+        rows_w = w[ids]
+        if self._lazy_bits == 0:
+            return rows_w
+        return mx.dequantize(
+            rows_w, s[ids], b[ids], group_size=self._lazy_group, bits=self._lazy_bits
+        )
+
+    def __call__(self, ids: mx.array) -> mx.array:
+        if getattr(self, "prefer_lazy", False) and getattr(self, "_lazy_parts", None) is not None:
+            return self._lazy_gather(ids)
+        if self._sidecar is not None:
+            return self._sidecar(ids, self.dim)
+        if self._sidecar_mode:
+            raise RuntimeError(
+                "qwen4_exp n-gram table sidecar was never attached — "
+                "ngram-table.safetensors is missing from the model directory"
+            )
+        return self.weight[ids]
+
+
+class _SidecarGather:
+    """Row gather over the SSD-resident table.
+
+    The row ids are a pure function of the token ids, so every gather is
+    known before it is needed. Cold mmap faults are serial (~60us each on
+    M5-class NVMe) while os.pread releases the GIL — so a threaded pread
+    warm-up pass first (QD16, ~12.6us effective) then the numpy fancy-index
+    hits page-cache-warm rows (~1.2us). Measured 2026-08-26: without this,
+    a cold 100k-token prefill pays ~36s of serial faults; with it, ~7.5s of
+    parallel IO that overlaps page-cache warming. MTPLX_NGRAM_PREFETCH=0
+    disables it (A/B arm); prefetch_batches is the engagement receipt.
+    """
+
+    # Decode-step gathers are a few dozen rows; the LRU serves those. A
+    # prefill gather is millions of ids — per-row cache bookkeeping there
+    # would cost more than the IO, so big gathers bypass to the vectorized
+    # memmap path (which still warms the page cache for later decode).
+    _HOT_PATH_MAX_ROWS = 4096
+
+    def __init__(self, path: Path, entries, bits: int, group_size: int):
+        import mmap as _mmap
+        import numpy as np
+        from collections import OrderedDict
+
+        self.bits = bits
+        self.group_size = group_size
+        self._maps = {}
+        self._row_meta = []
+        self._fd = os.open(str(path), os.O_RDONLY)
+        for name, (info, data_start) in entries.items():
+            dtype = {"U32": np.uint32, "BF16": np.uint16, "F16": np.uint16}[info["dtype"]]
+            shape = tuple(info["shape"])
+            offset = data_start + info["data_offsets"][0]
+            mm = np.memmap(path, mode="r", dtype=dtype, offset=offset, shape=shape)
+            try:
+                # Row ids are hash-scattered: sequential readahead on these
+                # maps is pure wasted IO (the pread pool is the prefetch).
+                mm._mmap.madvise(_mmap.MADV_RANDOM)
+            except (AttributeError, OSError, ValueError):
+                pass
+            self._maps[name] = (mm, info["dtype"])
+            itemsize = 4 if info["dtype"] == "U32" else 2
+            self._row_meta.append((offset, int(shape[1]) * itemsize))
+        self._pool = None
+        self.prefetch_batches = 0
+        if os.environ.get("MTPLX_NGRAM_PREFETCH", "1") != "0":
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(
+                max_workers=16, thread_name_prefix="ngram-prefetch"
+            )
+        # Hot-row LRU: raw row bytes per map, keyed by row id. Row
+        # popularity is Zipf (common n-grams recur constantly) even though
+        # row PLACEMENT is hash-uniform, so a bounded RAM-held hot set
+        # serves most decode gathers with zero pread and zero memmap touch
+        # — and keeps its speed when macOS reclaims the file's page cache
+        # under memory pressure. All access is on the single generation
+        # thread (stage()/forward); the pread pool only warms pages and
+        # never touches this dict. MTPLX_NGRAM_HOT_MB sizes it
+        # (default 1024; 0 disables).
+        self._hot = OrderedDict()
+        self._hot_row_bytes = max(1, sum(rb for _, rb in self._row_meta))
+        try:
+            hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "1024"))
+        except ValueError:
+            hot_mb = 1024
+        self._hot_cap_rows = (max(0, hot_mb) * 2**20) // self._hot_row_bytes
+        self.hot_hits = 0
+        self.hot_misses = 0
+
+    def _warm(self, rows) -> None:
+        fd = self._fd
+        metas = self._row_meta
+
+        def touch(chunk):
+            for r in chunk:
+                for base, rb in metas:
+                    os.pread(fd, rb, base + int(r) * rb)
+
+        step = max(1, min(64, (len(rows) + 31) // 32))
+        chunks = [rows[i : i + step] for i in range(0, len(rows), step)]
+        list(self._pool.map(touch, chunks))
+        self.prefetch_batches += 1
+
+    def _rows_matrices(self, flat, names):
+        """Raw row matrices (one per map, flat order) — through the hot-row
+        LRU for decode-sized gathers, straight off the memmaps otherwise.
+        Values are identical either way: the cache stores the same raw row
+        bytes the maps would return."""
+        import numpy as np
+
+        uniq, inverse = np.unique(flat, return_inverse=True)
+        if not (0 < len(uniq) <= self._HOT_PATH_MAX_ROWS and self._hot_cap_rows):
+            if self._pool is not None and len(uniq):
+                self._warm(uniq)
+            return {
+                name: np.ascontiguousarray(self._maps[name][0][uniq])[inverse]
+                for name in names
+            }
+        hot = self._hot
+        miss = [int(r) for r in uniq if int(r) not in hot]
+        if miss:
+            miss_np = np.asarray(miss, dtype=np.int64)
+            if self._pool is not None:
+                self._warm(miss_np)
+            fetched = {
+                name: np.ascontiguousarray(self._maps[name][0][miss_np])
+                for name in names
+            }
+            for i, r in enumerate(miss):
+                hot[r] = tuple(fetched[name][i] for name in names)
+        self.hot_hits += len(uniq) - len(miss)
+        self.hot_misses += len(miss)
+        rows = []
+        for r in uniq:
+            key = int(r)
+            rows.append(hot[key])
+            hot.move_to_end(key)
+        while len(hot) > self._hot_cap_rows:
+            hot.popitem(last=False)
+        return {
+            name: np.stack([row[j] for row in rows])[inverse]
+            for j, name in enumerate(names)
+        }
+
+    def gather_np(self, flat) -> mx.array:
+        """Gather+dequantize rows for MATERIALIZED numpy int64 ids — the
+        staged fast path: no graph tensor is evaluated here, so calling
+        this before the step's graph is built costs no GPU sync."""
+        if self.bits == 0:  # raw bf16 rows, no dequantize
+            mats = self._rows_matrices(flat, ("weight",))
+            dt = self._maps["weight"][1]
+            rows = mx.array(mats["weight"])
+            return rows.view(mx.bfloat16 if dt == "BF16" else mx.float16)
+        names = ("weight", "scales", "biases")
+        mats = self._rows_matrices(flat, names)
+        parts = []
+        for name in names:
+            dt = self._maps[name][1]
+            rows = mx.array(mats[name])
+            if dt == "BF16":
+                rows = rows.view(mx.bfloat16)
+            elif dt == "F16":
+                rows = rows.view(mx.float16)
+            parts.append(rows)
+        w, s, b = parts
+        return mx.dequantize(w, s, b, group_size=self.group_size, bits=self.bits)
+
+    def __call__(self, ids: mx.array, dim: int) -> mx.array:
+        import numpy as np
+
+        flat = np.asarray(ids.reshape(-1), dtype=np.int64)
+        return self.gather_np(flat).reshape(*ids.shape, dim)
+
+
+def _read_safetensors_header(path: Path):
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+    return header, 8 + n
+
+
+def _ngram_resident_policy() -> bool:
+    """Should the n-gram table go RAM-resident (arming the pipelined AR
+    lane)? Delegates to memory_plan.ngram_table_resident_policy — THE
+    single source: the server's Metal floor and the memory plan consult
+    the same function, so gather behavior and memory accounting can never
+    disagree. (History: resident on 128G wired ~99G and kernel-panicked
+    the machine twice, 2026-08-26 — auto arms only at >=160G.)"""
+    from mtplx.memory_plan import ngram_table_resident_policy
+
+    return ngram_table_resident_policy()
+
+
+class NGramEmbedding(nn.Module):
+    def __init__(self, args: TextArgs, ple_index: int):
+        super().__init__()
+        self.ngram_size = args.ngram_size
+        self.context_len = args.ngram_size - 1
+        self.heads_per_ngram = args.heads_per_ngram
+        self.ngram_heads = (args.ngram_size - 1) * args.heads_per_ngram
+        self.eos_id = args.eos_id
+        head_dim = args.ple_embed_dim // self.ngram_heads
+
+        sizes, offsets, total = _head_vocab_layout(
+            args.ngram_vocab_size_base, self.ngram_heads, ple_index
+        )
+        div = args.make_ngram_vocab_size_divisible_by
+        padded = math.ceil(total / div) * div
+        # Checkpoint buffers overwrite these derived values on load.
+        self.layer_multipliers = mx.array(
+            _build_layer_multipliers(args.vocab_size, args.ngram_size, ple_index, args.seed),
+            dtype=mx.int64,
+        )
+        self.ngram_heads_vocab_sizes = mx.array(sizes, dtype=mx.int64)
+        self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
+        self.ngram_embedding = NGramTable(
+            padded, head_dim, sidecar=getattr(args, "ngram_sidecar", False)
+        )
+
+    def _shift_ignore_eos(self, ids: mx.array, shift: int) -> mx.array:
+        if shift == 0:
+            return ids
+        B, L = ids.shape
+        pos = mx.arange(L, dtype=mx.int64)[None, :]
+        eos_pos = mx.where(ids == self.eos_id, pos, mx.array(-1, dtype=mx.int64))
+        prev_incl = mx.cummax(eos_pos, axis=1)
+        prev = mx.concatenate(
+            [mx.full((B, 1), -1, dtype=mx.int64), prev_incl[:, :-1]], axis=1
+        )
+        seg_start = prev + 1
+        pos_in_seg = pos - seg_start
+        src = pos - shift
+        gather = mx.maximum(src, 0)
+        shifted = mx.take_along_axis(ids, gather, axis=1)
+        valid = (pos_in_seg >= shift) & (src >= 0)
+        return mx.where(valid, shifted, mx.array(self.eos_id, dtype=mx.int64))
+
+    # ---- staged fast path -------------------------------------------------
+    # The row ids are a pure function of the token ids, so they can be
+    # computed in numpy BEFORE the step's graph exists. The in-graph path
+    # below forces a mid-forward GPU sync at layer 1 of every step
+    # (np.asarray on a graph tensor + CPU gather while the pipeline
+    # stalls); staging moves all of that to the top of Model.__call__,
+    # where the previous step is already evaluated and the sync is free.
+    # MTPLX_NGRAM_STAGE=0 disables; MTPLX_NGRAM_STAGE_VERIFY=1 also runs
+    # the graph path and asserts equality (QA mode).
+
+    def _np_consts(self):
+        import numpy as np
+
+        c = getattr(self, "_np_consts_cache", None)
+        if c is None:
+            c = (
+                np.array(self.layer_multipliers, dtype=np.int64),
+                np.array(self.ngram_heads_vocab_sizes, dtype=np.int64),
+                np.array(self.ngram_heads_offsets, dtype=np.int64),
+            )
+            self._np_consts_cache = c
+        return c
+
+    def _rows_np(self, ids_np, prev_np):
+        import numpy as np
+
+        mult, sizes, offs, eos = *self._np_consts(), self.eos_id
+        hist = np.concatenate([prev_np, ids_np], axis=1)
+
+        def shift(h, s):
+            if s == 0:
+                return h
+            b, ln = h.shape
+            pos = np.arange(ln, dtype=np.int64)[None, :]
+            eos_pos = np.where(h == eos, pos, np.int64(-1))
+            prev_incl = np.maximum.accumulate(eos_pos, axis=1)
+            prev = np.concatenate(
+                [np.full((b, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1
+            )
+            pos_in_seg = pos - (prev + 1)
+            src = np.maximum(pos - s, 0)
+            shifted = np.take_along_axis(h, src, axis=1)
+            valid = (pos_in_seg >= s) & (pos - s >= 0)
+            return np.where(valid, shifted, np.int64(eos))
+
+        shifted = [shift(hist, s) for s in range(self.ngram_size)]
+        blocks = []
+        for ngram in range(2, self.ngram_size + 1):
+            start = (ngram - 2) * self.heads_per_ngram
+            end = start + self.heads_per_ngram
+            mixed = shifted[0] * mult[0]
+            for p in range(1, ngram):
+                mixed = mixed ^ (shifted[p] * mult[p])
+            blocks.append(mixed[..., None] % sizes[start:end] + offs[start:end])
+        S = ids_np.shape[1]
+        rows = np.concatenate(blocks, axis=-1)[:, -S:]
+        return rows, hist[:, -self.context_len :]
+
+    def stage(self, input_ids: mx.array, cache: Optional[ArraysCache], state_idx: int):
+        """Precompute this step's rows before any graph is built."""
+        import numpy as np
+
+        sidecar = self.ngram_embedding._sidecar
+        if sidecar is None or os.environ.get("MTPLX_NGRAM_STAGE", "1") == "0":
+            return
+        if getattr(self, "_stage_disabled", False):
+            # Pipelined AR lane: input ids are LAZY — np.asarray below would
+            # force a graph sync and collapse the pipeline. The lane gathers
+            # in-graph via the table's mmap-lazy binding instead.
+            return
+        try:
+            ids_np = np.asarray(input_ids, dtype=np.int64)
+            B, S = ids_np.shape
+            if cache is not None and cache[state_idx] is not None:
+                prev_np = np.asarray(cache[state_idx], dtype=np.int64)
+            else:
+                prev_np = np.full((B, self.context_len), self.eos_id, dtype=np.int64)
+            rows, new_hist = self._rows_np(ids_np, prev_np)
+            emb = sidecar.gather_np(rows.reshape(-1))
+            emb = emb.reshape(B, S, -1)
+            self._staged = (B, S, emb, mx.array(new_hist), mx.array(prev_np))
+        except Exception as exc:  # exact graph fallback stays available
+            if not getattr(self, "_stage_warned", False):
+                self._stage_warned = True
+                print(f"[qwen4_exp] ngram staging disabled after error: {exc!r}",
+                      flush=True)
+            self._staged = None
+
+    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache], state_idx: int):
+        staged = getattr(self, "_staged", None)
+        if staged is not None:
+            self._staged = None
+            sB, sS, emb, new_hist, prev = staged
+            B, S = input_ids.shape
+            if sB == B and sS == S:
+                if os.environ.get("MTPLX_NGRAM_STAGE_VERIFY", "0") == "1":
+                    ref = self._graph_path(input_ids, None, state_idx, prev=prev)
+                    ok = bool(
+                        mx.allclose(
+                            ref.astype(mx.float32), emb.astype(mx.float32)
+                        )
+                    )
+                    if not ok:
+                        raise RuntimeError(
+                            "ngram staged/graph mismatch — staging math broke"
+                        )
+                if cache is not None:
+                    cache[state_idx] = new_hist
+                self._stage_consumed = getattr(self, "_stage_consumed", 0) + 1
+                self._stage_census()
+                return emb
+            # staged rows were computed for a different call shape — count it,
+            # a silent fall-through here is exactly what an A/B cannot survive
+            self._stage_bypassed = getattr(self, "_stage_bypassed", 0) + 1
+        self._graph_calls = getattr(self, "_graph_calls", 0) + 1
+        self._stage_census()
+        return self._graph_path(input_ids, cache, state_idx)
+
+    def _stage_census(self):
+        if os.environ.get("MTPLX_NGRAM_STAGE_DEBUG", "0") != "1":
+            return
+        n = getattr(self, "_stage_consumed", 0) + getattr(self, "_graph_calls", 0)
+        if n in (8, 64) or n % 512 == 0:
+            sidecar = self.ngram_embedding._sidecar
+            hot = (
+                f" hot={sidecar.hot_hits}/{sidecar.hot_hits + sidecar.hot_misses}"
+                if sidecar is not None
+                else ""
+            )
+            print(
+                f"[qwen4_exp] ngram path census: staged={getattr(self, '_stage_consumed', 0)} "
+                f"graph={getattr(self, '_graph_calls', 0)} "
+                f"stale-shape={getattr(self, '_stage_bypassed', 0)}{hot}",
+                flush=True,
+            )
+
+    def _graph_path(self, input_ids, cache, state_idx, prev=None):
+        ids = input_ids.astype(mx.int64)
+        B, S = ids.shape
+        if prev is None:
+            if cache is not None and cache[state_idx] is not None:
+                prev = cache[state_idx]
+            else:
+                prev = mx.full((B, self.context_len), self.eos_id, dtype=mx.int64)
+        history = mx.concatenate([prev, ids], axis=1)
+        if cache is not None:
+            cache[state_idx] = history[:, -self.context_len :]
+
+        shifted = [self._shift_ignore_eos(history, s) for s in range(self.ngram_size)]
+        blocks = []
+        for ngram in range(2, self.ngram_size + 1):
+            start = (ngram - 2) * self.heads_per_ngram
+            end = start + self.heads_per_ngram
+            mixed = shifted[0] * self.layer_multipliers[0]
+            for p in range(1, ngram):
+                mixed = mx.bitwise_xor(mixed, shifted[p] * self.layer_multipliers[p])
+            sizes = self.ngram_heads_vocab_sizes[start:end]
+            offsets = self.ngram_heads_offsets[start:end]
+            head_ids = mx.remainder(mixed[..., None], sizes.reshape(1, 1, -1))
+            blocks.append(head_ids + offsets.reshape(1, 1, -1))
+        ngram_ids = mx.concatenate(blocks, axis=-1)[:, -S:]
+        emb = self.ngram_embedding(ngram_ids)
+        return emb.reshape(B, S, -1)
+
+
+class PLELayer(nn.Module):
+    """Per-Layer Embedding injection (runs on one linear-attention layer,
+    before its hyper-connections). Cache slots: state_idx 2 = conv state,
+    state_idx 3 = n-gram context ids."""
+
+    CONV_IDX = 2
+    NGRAM_IDX = 3
+
+    def __init__(self, args: TextArgs, ple_index: int):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self.hc_count = args.hc_count
+        hc_hidden = args.hidden_size * args.hc_count
+        self.ple_embedding = NGramEmbedding(args, ple_index)
+        self.conv_kernel_size = args.ple_conv_kernel_size
+        self.conv_dilation = args.ngram_size
+        self.conv_state_len = (self.conv_kernel_size - 1) * self.conv_dilation
+        self.key_proj = nn.Linear(args.ple_embed_dim, hc_hidden, bias=False)
+        self.value_proj = nn.Linear(args.ple_embed_dim, args.hidden_size, bias=False)
+        self.norm_key = GroupedRMSNorm(hc_hidden, args.hidden_size, eps=args.rms_norm_eps)
+        self.norm_query = GroupedRMSNorm(hc_hidden, args.hidden_size, eps=args.rms_norm_eps)
+        self.norm_conv = GroupedRMSNorm(hc_hidden, args.hidden_size, eps=args.rms_norm_eps)
+        # Depthwise dilated conv, stored [channels, kernel, 1] (mlx layout).
+        self.conv_weight = mx.zeros((hc_hidden, self.conv_kernel_size, 1))
+
+    def _short_conv(self, x: mx.array, cache: Optional[ArraysCache]) -> mx.array:
+        B, S, C = x.shape
+        if cache is not None and cache[self.CONV_IDX] is not None:
+            state = cache[self.CONV_IDX]
+        else:
+            state = mx.zeros((B, self.conv_state_len, C), dtype=x.dtype)
+        window = mx.concatenate([state, x], axis=1)
+        if cache is not None:
+            cache[self.CONV_IDX] = window[:, -self.conv_state_len :, :]
+        out = mx.conv1d(
+            window,
+            self.conv_weight,
+            stride=1,
+            padding=0,
+            dilation=self.conv_dilation,
+            groups=C,
+        )
+        return nn.silu(out[:, -S:, :])
+
+    def __call__(self, hidden: mx.array, input_ids: mx.array, cache) -> mx.array:
+        emb = self.ple_embedding(input_ids, cache, self.NGRAM_IDX)
+        emb = emb.astype(hidden.dtype)
+        key = self.norm_key(self.key_proj(emb))
+        key = key.reshape(*key.shape[:-1], self.hc_count, self.hidden_size)
+        value = self.value_proj(emb)
+        query = self.norm_query(hidden)
+        query = query.reshape(*query.shape[:-1], self.hc_count, self.hidden_size)
+        gate = (key * query).sum(axis=-1, keepdims=True) / math.sqrt(self.hidden_size)
+        gate = mx.sqrt(mx.maximum(mx.abs(gate), 1e-6)) * mx.sign(gate)
+        gated = mx.sigmoid(gate) * value[..., None, :]
+        gated = gated.reshape(*hidden.shape)
+        return gated + self._short_conv(self.norm_conv(gated), cache)
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, args: TextArgs, layer_idx: int):
+        super().__init__()
+        self.layer_type = args.layer_types[layer_idx]
+        self.is_linear = self.layer_type == "linear_attention"
+        if self.is_linear:
+            self.linear_attn = GatedDeltaNet(args)
+        else:
+            self.self_attn = Attention(args)
+        self.mlp = SparseMoeBlock(args)
+        self.attn_hyper_connection = GatedResidual(args)
+        self.mlp_hyper_connection = GatedResidual(args)
+        if (layer_idx + 1) in args.ple_layer_ids:
+            self.ple = PLELayer(args, args.ple_layer_ids.index(layer_idx + 1))
+        self._hc = args.hc_count
+
+    def __call__(self, hidden, *, input_ids, ssm_mask, cache):
+        if "ple" in self:
+            hidden = hidden + self.ple(hidden, input_ids, cache)
+
+        mixed, hyper, inject = self.attn_hyper_connection(hidden)
+        if self.is_linear:
+            block_out = self.linear_attn(mixed, ssm_mask, cache)
+        else:
+            block_out = self.self_attn(mixed, cache)
+        hidden = hyper + (block_out[..., None, :] * inject[..., :, None]).reshape(
+            *hyper.shape
+        )
+
+        mixed, hyper, inject = self.mlp_hyper_connection(hidden)
+        block_out = self.mlp(mixed)
+        hidden = hyper + (block_out[..., None, :] * inject[..., :, None]).reshape(
+            *hyper.shape
+        )
+        return hidden
+
+
+class Qwen4ExpTextModel(nn.Module):
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        self.args = args
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
+        self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
+        self.ssm_idx = (
+            args.layer_types.index("linear_attention")
+            if "linear_attention" in args.layer_types
+            else 0
+        )
+        self._ple_stage_idx = next(
+            (i for i, l in enumerate(self.layers) if getattr(l, "ple", None) is not None),
+            None,
+        )
+        self.fa_idx = next(
+            (i for i, t in enumerate(args.layer_types) if t != "linear_attention"),
+            self.ssm_idx,
+        )
+        self._gdn_compiled_env = (
+            os.environ.get("MTPLX_COMPILED_GDN", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._gdn_compiled_lane = False
+        self._decode_runs = None
+        self._decode_run_fns = {}
+
+    def __call__(self, inputs, cache=None, input_embeddings=None):
+        h = input_embeddings if input_embeddings is not None else self.embed_tokens(inputs)
+        if cache is None:
+            cache = [None] * len(self.layers)
+        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        if self._ple_stage_idx is not None:
+            ple = self.layers[self._ple_stage_idx].ple
+            ple.ple_embedding.stage(inputs, cache[self._ple_stage_idx], ple.NGRAM_IDX)
+        h = mx.tile(h, (1, 1, self.args.hc_count))
+        if (
+            # S<=4 covers AR decode (S=1) and MTP verify widths (S=2..4,
+            # depth ceiling 3): mx.compile keys its trace cache on input
+            # shapes, so each S gets one retrace then C++ replay, and the
+            # GDN states are S-invariant so the same run fns serve all
+            # widths. Prefill and masked/padded forwards stay eager.
+            1 <= h.shape[1] <= 4
+            and ssm_mask is None
+            and (self._gdn_compiled_env or self._gdn_compiled_lane)
+            and cache[self.ssm_idx] is not None
+        ):
+            h = self._decode_layers_compiled(h, inputs, cache)
+        else:
+            capture = _VERIFY_CAPTURE.get()
+            for layer, c in zip(self.layers, cache):
+                if (
+                    capture
+                    and c is not None
+                    and getattr(layer, "ple", None) is not None
+                ):
+                    c._mtplx_verify_ple = (h, inputs)
+                h = layer(h, input_ids=inputs, ssm_mask=ssm_mask, cache=c)
+        # The MTP head consumes the pre-mixer widened stream; keep the last
+        # one reachable (lazy ref, freed on the next step).
+        self._last_widened = h
+        return self.hyper_connection_mixer(h)
+
+    # ---- compiled GDN decode runs ----------------------------------------
+    # The qL=1 decode step is CPU-dispatch-bound: ~20.8ms of Python graph
+    # construction per token against <=14ms of GPU work (measured 2026-08-27,
+    # ar-lane census: build=20.79ms wait=0.00ms). GDN layers have FIXED state
+    # shapes at decode (conv tape + SSM state), so contiguous non-PLE GDN
+    # runs compile once and replay in C++. QSA layers grow their caches every
+    # step (KV slab + raw-key concat) and the PLE layer consumes token ids —
+    # both stay eager until the slab/graphbank arc.
+
+    def _build_decode_runs(self):
+        runs = []
+        cur = []
+        for i, layer in enumerate(self.layers):
+            if layer.is_linear and "ple" not in layer:
+                cur.append(i)
+            else:
+                if cur:
+                    runs.append(("run", tuple(cur)))
+                    cur = []
+                runs.append(("eager", i))
+        if cur:
+            runs.append(("run", tuple(cur)))
+        return runs
+
+    def _compiled_run_fn(self, idxs, capture: bool = False):
+        layers = [self.layers[i] for i in idxs]
+
+        def step(h, *flat):
+            out_states = []
+            rows = []
+            k = 0
+            for layer in layers:
+                c = ArraysCache(size=2)
+                c[0], c[1] = flat[k], flat[k + 1]
+                k += 2
+                h = layer(h, input_ids=None, ssm_mask=None, cache=c)
+                out_states.extend((c[0], c[1]))
+                if capture:
+                    # __call__ ran under the capture scope during THIS trace,
+                    # so the temp cache carries the tracer rows — surface
+                    # them as compiled outputs.
+                    rows.extend(c._mtplx_verify_rows)
+            return (h, *out_states, *rows)
+
+        return mx.compile(step)
+
+    def _get_run_fn(self, idxs, capture: bool):
+        key = (idxs, bool(capture))
+        fn = self._decode_run_fns.get(key)
+        if fn is None:
+            fn = self._compiled_run_fn(idxs, capture=capture)
+            self._decode_run_fns[key] = fn
+        return fn
+
+    def _decode_layers_compiled(self, h, inputs, cache):
+        if self._decode_runs is None:
+            self._decode_runs = self._build_decode_runs()
+        capture = _VERIFY_CAPTURE.get()
+        for kind, payload in self._decode_runs:
+            if kind == "eager":
+                i = payload
+                if capture and getattr(self.layers[i], "ple", None) is not None:
+                    cache[i]._mtplx_verify_ple = (h, inputs)
+                h = self.layers[i](
+                    h, input_ids=inputs, ssm_mask=None, cache=cache[i]
+                )
+                continue
+            idxs = payload
+            flat = []
+            usable = True
+            for i in idxs:
+                s0, s1 = cache[i][0], cache[i][1]
+                if s0 is None or s1 is None:
+                    usable = False
+                    break
+                flat.extend((s0, s1))
+            if not usable:
+                for i in idxs:
+                    h = self.layers[i](
+                        h, input_ids=inputs, ssm_mask=None, cache=cache[i]
+                    )
+                continue
+            out = self._get_run_fn(idxs, capture)(h, *flat)
+            h = out[0]
+            k = 1
+            for i in idxs:
+                cache[i][0] = out[k]
+                cache[i][1] = out[k + 1]
+                k += 2
+            if capture:
+                for i in idxs:
+                    cache[i]._mtplx_verify_rows = tuple(out[k : k + 6])
+                    k += 6
+        return h
+
+    def clear_verify_capture(self, cache) -> None:
+        for entry in cache:
+            if entry is None:
+                continue
+            for attr in ("_mtplx_verify_rows", "_mtplx_verify_ple"):
+                if getattr(entry, attr, None) is not None:
+                    setattr(entry, attr, None)
+
+    def _refuse_commit(self, layer_index: int, reason: str) -> bool:
+        """A refused capture-commit silently falls back to the rollback +
+        trunk re-forward. Silence hid a whole battery of fallbacks on
+        2026-08-27 — print the first few reasons per process."""
+        count = getattr(self, "_commit_refusals", 0)
+        self._commit_refusals = count + 1
+        if count < 3:
+            print(
+                f"[qwen4_exp] capture-commit refused (layer {layer_index}: "
+                f"{reason}) — falling back to re-forward",
+                flush=True,
+            )
+        return False
+
+    def commit_verified_window(
+        self,
+        cache,
+        snapshot_states,
+        *,
+        keep_tokens: int,
+        verified_tokens: int,
+    ) -> bool:
+        """Repair-free commit of a speculative verify window.
+
+        Trimmable entries (QSA attention) trim their uncommitted tail; each
+        pure-GDN layer replays ONLY its gated-delta recurrence over the kept
+        rows from the pre-verify snapshot state; the single PLE-carrying
+        layer replays its full (cheap, <=window-rows) layer forward from its
+        snapshot slots. Everything is lazy — no eval here; the next round's
+        eval pulls the replay. Validates every entry before mutating any so
+        a refusal leaves the cache intact for the rollback+re-forward
+        fallback. Returns True when the commit landed.
+        """
+        from mlx_lm.models.gated_delta import gated_delta_update
+
+        keep_tokens = int(keep_tokens)
+        verified_tokens = int(verified_tokens)
+        trim_n = verified_tokens - keep_tokens
+        if keep_tokens < 1 or trim_n < 0 or len(cache) != len(self.layers):
+            return False
+
+        plan = []
+        for i, (layer, entry) in enumerate(zip(self.layers, cache)):
+            if entry is None:
+                return self._refuse_commit(i, "entry_missing")
+            if callable(getattr(entry, "is_trimmable", None)) and entry.is_trimmable():
+                plan.append(("trim", i, None))
+                continue
+            pre = snapshot_states[i] if snapshot_states is not None else None
+            if pre is None:
+                return self._refuse_commit(i, "snapshot_missing")
+            if getattr(layer, "ple", None) is not None:
+                cap = getattr(entry, "_mtplx_verify_ple", None)
+                if cap is None:
+                    return self._refuse_commit(i, "ple_rows_missing")
+                if cap[0].shape[1] != verified_tokens:
+                    return self._refuse_commit(
+                        i, f"ple_rows_width_{cap[0].shape[1]}_vs_{verified_tokens}"
+                    )
+                if len(pre) < 4:
+                    return self._refuse_commit(i, "ple_snapshot_short")
+                plan.append(("ple", i, cap))
+                continue
+            rows = getattr(entry, "_mtplx_verify_rows", None)
+            if rows is None:
+                return self._refuse_commit(i, "gdn_rows_missing")
+            if rows[0].shape[1] != verified_tokens:
+                return self._refuse_commit(
+                    i, f"gdn_rows_width_{rows[0].shape[1]}_vs_{verified_tokens}"
+                )
+            if len(pre) < 2 or pre[1] is None:
+                return self._refuse_commit(i, "gdn_snapshot_short")
+            plan.append(("gdn", i, rows))
+
+        for kind, i, payload in plan:
+            entry = cache[i]
+            layer = self.layers[i]
+            if kind == "trim":
+                if trim_n:
+                    entry.trim(trim_n)
+                continue
+            pre = snapshot_states[i]
+            if kind == "gdn":
+                qkv, q, k, v, a, b = payload
+                gdn = layer.linear_attn
+                conv_pre = pre[0]
+                if conv_pre is None:
+                    conv_pre = mx.zeros(
+                        (qkv.shape[0], gdn.conv_kernel_size - 1, qkv.shape[2]),
+                        dtype=qkv.dtype,
+                    )
+                _, new_state = gated_delta_update(
+                    q[:, :keep_tokens],
+                    k[:, :keep_tokens],
+                    v[:, :keep_tokens],
+                    a[:, :keep_tokens],
+                    b[:, :keep_tokens],
+                    gdn.A_log,
+                    gdn.dt_bias,
+                    pre[1],
+                    None,
+                    use_kernel=not gdn.training,
+                )
+                conv_input = mx.concatenate(
+                    [conv_pre, qkv[:, :keep_tokens]], axis=1
+                )
+                entry[0] = mx.contiguous(
+                    conv_input[:, -(gdn.conv_kernel_size - 1) :, :]
+                )
+                entry[1] = new_state
+                entry._mtplx_verify_rows = None
+            else:  # ple
+                h_in, ids = payload
+                for j in range(len(pre)):
+                    entry[j] = pre[j]
+                ple = layer.ple
+                kept_ids = ids[:, :keep_tokens]
+                ple.ple_embedding.stage(kept_ids, entry, ple.NGRAM_IDX)
+                layer(
+                    h_in[:, :keep_tokens],
+                    input_ids=kept_ids,
+                    ssm_mask=None,
+                    cache=entry,
+                )
+                entry._mtplx_verify_ple = None
+        return True
+
+
+class TextModel(nn.Module):
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        self.args = args
+        self.model = Qwen4ExpTextModel(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+    ):
+        # hidden_variant is accepted for the runtime contract's sake but this
+        # family has exactly one draft input: the pre-mixer WIDENED stream.
+        # NOTE: keep this signature explicit — a **kwargs catch-all would make
+        # the runtime's capability probe claim emit_logits/logits_keep support
+        # that does not exist here.
+        out = self.model(inputs, cache, input_embeddings)
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        if return_hidden:
+            return logits, self.model._last_widened
+        return logits
+
+    def _head_logits(self, h):
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(h)
+        return self.lm_head(h)
+
+    # ---- runtime draft surface (validate_mtp_support shape) ---------------
+
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache=None,
+        concat_order: str | None = None,
+        return_hidden: bool = False,
+        mtp_hidden_variant: str | None = None,
+        position_offset: int | None = None,
+    ):
+        """Draft logits from the trunk's widened stream + next token ids.
+
+        ``hidden_states`` is the pre-mixer widened stream [B,S,hc*d] on the
+        first depth and this head's own pre-mixer output on deeper recursion
+        steps (returned via ``return_hidden``). concat_order / hidden_variant
+        have no meaning here (no concat, single variant); positions come from
+        the QSA cache offset (contract mtp_position_mode="cache").
+        """
+        emb = self.model.embed_tokens(next_token_ids)
+        h = self.mtp.fuse_and_run(hidden_states, emb, mtp_cache)
+        logits = self._head_logits(self.mtp.hyper_connection_mixer(h))
+        if return_hidden:
+            return logits, h
+        return logits
+
+    def mtp_update_cache(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache=None,
+        concat_order: str | None = None,
+        mtp_hidden_variant: str | None = None,
+        position_offset: int | None = None,
+        input_embeddings=None,
+    ):
+        """Append committed history to the head's cache (no lm_head cost).
+
+        ``input_embeddings`` (vision splice) supplies exact embedding rows in
+        place of ``embed_tokens(next_token_ids)`` when provided.
+        """
+        if input_embeddings is not None:
+            emb = input_embeddings
+        else:
+            emb = self.model.embed_tokens(next_token_ids)
+        return self.mtp.fuse_and_run(hidden_states, emb, mtp_cache)
+
+    def make_mtp_cache(self):
+        return [QSACache(self.model.args.indexer_compress_ratio or 4)]
+
+    def make_cache(self):
+        ratio = self.model.args.indexer_compress_ratio or 4
+        caches = []
+        for i, layer in enumerate(self.model.layers):
+            if not layer.is_linear:
+                caches.append(QSACache(ratio))
+            elif "ple" in layer:
+                caches.append(ArraysCache(size=4))
+            else:
+                caches.append(ArraysCache(size=2))
+        return caches
+
+
+class Qwen4ExpMTP(nn.Module):
+    """Flash-Next MTP head, reconstructed from the shipped tensors (no public
+    reference implements it — transformers ships only the trunk).
+
+    Wiring (the only reading consistent with every tensor shape): the trunk's
+    pre-mixer WIDENED stream [B,S,hc*d] is RMS-normed at full width
+    (pre_fc_norm_hidden is [hc*d]); each 2560-wide substream goes through the
+    SHARED fc_hidden [d,d]; the normed+projected token embedding
+    (pre_fc_norm_embedding -> fc_embedding, both [d]-sized) is broadcast-added
+    into every substream; the fused widened stream runs ONE full-attention
+    DecoderLayer (QSA + MoE + hyper-connections, its own tensors) and this
+    head's own mixer collapses back to d for the SHARED trunk lm_head.
+
+    Correctness is graded by measured acceptance — the probability-ratio
+    verify contract keeps outputs exact for ANY draft head, so a mis-wiring
+    can only cost speed, never quality.
+    """
+
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        d = args.hidden_size
+        self.pre_fc_norm_embedding = nn.RMSNorm(d, eps=args.rms_norm_eps)
+        self.pre_fc_norm_hidden = nn.RMSNorm(d * args.hc_count, eps=args.rms_norm_eps)
+        self.fc_embedding = nn.Linear(d, d, bias=False)
+        self.fc_hidden = nn.Linear(d, d, bias=False)
+        fa_idx = next(
+            i for i, t in enumerate(args.layer_types)
+            if t != "linear_attention" and (i + 1) not in args.ple_layer_ids
+        )
+        self.layers = [DecoderLayer(args, fa_idx)]
+        self.hyper_connection_mixer = GatedResidual(args, use_combine=False)
+        self._hc = args.hc_count
+
+    def fuse_and_run(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
+        """Fuse (widened, token embedding) and run the head's layer; returns
+        the PRE-mixer widened output — the recursion state for deeper drafts."""
+        B, S, W = widened.shape
+        hn = self.pre_fc_norm_hidden(widened).reshape(B, S, self._hc, -1)
+        en = self.fc_embedding(self.pre_fc_norm_embedding(tok_emb))
+        fused = self.fc_hidden(hn) + en[:, :, None, :]
+        h = fused.reshape(B, S, W)
+        # cache is the make_mtp_cache() list (runtime convention); the single
+        # layer consumes its own QSACache entry
+        layer_cache = cache[0] if cache is not None else None
+        return self.layers[0](h, input_ids=None, ssm_mask=None, cache=layer_cache)
+
+    def __call__(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
+        return self.hyper_connection_mixer(self.fuse_and_run(widened, tok_emb, cache))
+
+
+@dataclass
+class ModelArgs(BaseModelArgs):
+    model_type: str = "qwen4_exp"
+    text_config: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, params):
+        if "text_config" not in params:
+            return cls(model_type=params.get("model_type", "qwen4_exp"), text_config=params)
+        return super().from_dict(params)
+
+
+class Model(nn.Module):
+    """House-shaped wrapper: language_model.{model,lm_head}. Vision tensors
+    ship in the pack (model-vision.safetensors) but are not constructed here —
+    text serving is the phase-1 contract; the honest capability report for
+    image inputs is "not yet supported for this family"."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        text_config = dict(args.text_config)
+        # eos flows from the top-level config when text_config omits it
+        self.language_model = TextModel(TextArgs.from_dict(text_config))
+
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+    ):
+        # Explicit params only (no **kwargs): the runtime capability probe
+        # reads this signature and would treat a catch-all as emit_logits /
+        # logits_keep support this model does not implement.
+        return self.language_model(
+            inputs,
+            cache,
+            input_embeddings,
+            return_hidden=return_hidden,
+            hidden_variant=hidden_variant,
+        )
+
+    @property
+    def layers(self):
+        return self.language_model.model.layers
+
+    def make_cache(self):
+        return self.language_model.make_cache()
+
+    # ---- MTP attach -------------------------------------------------------
+
+    def attach_mtp(self, model_path) -> bool:
+        """Build + load the MTP head from mtp.safetensors. Per-module quant
+        recipes are inferred from the packed tensor shapes (bits from the
+        u32 column count vs the module's in_features, group from the scales
+        columns) — the sidecar is self-describing."""
+        path = Path(model_path) / "mtp.safetensors"
+        if not path.exists():
+            return False
+        raw = mx.load(str(path))
+        args = self.language_model.args
+        mtp = Qwen4ExpMTP(args)
+
+        flat = dict(raw)
+        stripped = {}
+        for name, v in flat.items():
+            if not name.startswith("mtp."):
+                continue
+            stripped[name[len("mtp."):]] = v
+        # The converter's +1 norm shift covers the trunk-suffix norms only;
+        # the head's pre_fc norms ship raw zero-centered ((1+w) convention).
+        for n in ("pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight"):
+            if n in stripped and stripped[n].ndim == 1:
+                stripped[n] = (stripped[n].astype(mx.float32) + 1.0).astype(
+                    stripped[n].dtype
+                )
+
+        from mlx.utils import tree_flatten as _tf
+
+        module_in = {}
+        for pth, arr in _tf(mtp.parameters()):
+            if pth.endswith(".weight") and arr.ndim >= 2:
+                module_in[pth[: -len(".weight")]] = int(arr.shape[-1])
+
+        qmap = {}
+        for mod, in_f in module_in.items():
+            w = stripped.get(f"{mod}.weight")
+            s = stripped.get(f"{mod}.scales")
+            if w is None or s is None or w.dtype != mx.uint32:
+                continue
+            bits = int(w.shape[-1]) * 32 // in_f
+            group = in_f // int(s.shape[-1])
+            qmap[mod] = {"bits": bits, "group_size": group}
+
+        def predicate(pth, module):
+            cfg = qmap.get(pth)
+            return cfg if cfg else False
+
+        nn.quantize(mtp, group_size=64, bits=8, class_predicate=predicate)
+        mtp.load_weights(list(stripped.items()), strict=True)
+        mtp.eval()
+        # publish on the text model — mtp_patch._text_model() resolves
+        # language_model, and registering the module on BOTH trees would
+        # double-count its parameters
+        self.language_model.mtp = mtp
+        return True
+
+    @property
+    def mtp(self):
+        return getattr(self.language_model, "mtp", None)
+
+    # The runtime drives the draft surface on the wrapper (self.model.*)
+    # while validate_mtp_support reads it off language_model — both resolve
+    # to the same TextModel implementation.
+    def mtp_forward(self, hidden_states, next_token_ids, **kwargs):
+        return self.language_model.mtp_forward(hidden_states, next_token_ids, **kwargs)
+
+    def mtp_update_cache(self, hidden_states, next_token_ids, **kwargs):
+        return self.language_model.mtp_update_cache(hidden_states, next_token_ids, **kwargs)
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
+    def mtp_draft_logits(self, widened: mx.array, tok_emb: mx.array, cache) -> mx.array:
+        """Draft logits from the trunk's widened stream + the next token's
+        embedding, through the shared trunk lm_head."""
+        lm = self.language_model
+        return lm._head_logits(lm.mtp(widened, tok_emb, cache))
+
+    def post_weight_load(self, model_path) -> None:
+        """Attach the SSD-resident n-gram sidecar after weights load.
+        (Gate+up fusion happens earlier, at sanitize time — see
+        _fuse_gate_up_sanitize.)"""
+        path = Path(model_path) / "ngram-table.safetensors"
+        if not path.exists():
+            return
+        resident = _ngram_resident_policy()
+        sidecar = None
+        for layer in self.layers:
+            if "ple" in layer:
+                table = layer.ple.ple_embedding.ngram_embedding
+                table.attach_sidecar(path)
+                sidecar = table._sidecar
+                if resident:
+                    table.attach_resident(path)
+        if sidecar is not None and not resident:
+            hot_mb = (sidecar._hot_cap_rows * sidecar._hot_row_bytes) // 2**20
+            print(
+                "[qwen4_exp] ngram table: streamed from SSD (file-backed "
+                f"pages, hot cache {hot_mb}M, prefetch "
+                f"{'on' if sidecar._pool is not None else 'off'}) — "
+                "resident only at >=160G RAM or MTPLX_NGRAM_RESIDENT=1",
+                flush=True,
+            )
+
+    def set_ar_pipeline_mode(self, enabled: bool) -> bool:
+        """Flip the family into (or out of) the pipelined-AR decode contract:
+        n-gram staging off + in-graph mmap-lazy gathers, so a forward built
+        on LAZY token ids records no host sync. Returns False when the lazy
+        table binding is unavailable (lane must not engage)."""
+        ready = True
+        for layer in self.layers:
+            if "ple" not in layer:
+                continue
+            emb = layer.ple.ple_embedding
+            table = emb.ngram_embedding
+            if enabled and getattr(table, "_lazy_parts", None) is None:
+                ready = False
+                continue
+            emb._stage_disabled = bool(enabled)
+            table.prefer_lazy = bool(enabled)
+        if ready:
+            self.language_model.model._gdn_compiled_lane = bool(enabled)
+        return ready
+
+    # -- family capture-commit (repair-free verify rollback) ----------------
+
+    def verify_capture_scope(self):
+        return verify_capture_scope()
+
+    def clear_verify_capture(self, cache) -> None:
+        self.language_model.model.clear_verify_capture(cache)
+
+    def commit_verified_window(
+        self, cache, snapshot_states, *, keep_tokens: int, verified_tokens: int
+    ) -> bool:
+        return self.language_model.model.commit_verified_window(
+            cache,
+            snapshot_states,
+            keep_tokens=keep_tokens,
+            verified_tokens=verified_tokens,
+        )
+
+    # -- weight plumbing ---------------------------------------------------
+
+    _HF_NORM_SHIFT_SUFFIXES = (
+        ".q_norm.weight",
+        ".k_norm.weight",
+        ".q_layernorm.weight",
+        ".k_layernorm.weight",
+        ".hc_norm.weight",
+        ".norm_key.weight",
+        ".norm_query.weight",
+        ".norm_conv.weight",
+    )
+
+    def sanitize(self, weights):
+        # Raw-HF discriminator: unconverted checkpoints carry HF conv layout
+        # ([ch, 1, k]) and the model.language_model prefix.
+        raw = any(
+            k.endswith("conv1d.weight") and v.shape[-1] != 1 for k, v in weights.items()
+        ) or any(k.startswith("model.language_model.") for k in weights)
+
+        out = {}
+        stacked: dict[str, dict[int, mx.array]] = {}
+        for k, v in weights.items():
+            if k.startswith("model.visual.") or k.startswith("vision_tower."):
+                continue
+            if k.startswith("mtp."):
+                continue
+            if k.startswith("model.language_model."):
+                k = k.replace("model.language_model.", "language_model.model.", 1)
+            elif k == "lm_head.weight":
+                k = "language_model.lm_head.weight"
+            elif not k.startswith("language_model."):
+                k = "language_model." + k
+
+            if raw:
+                # numbered per-expert tensors -> stacked switch_mlp
+                if ".mlp.experts." in k and ".weight" in k and "scale_inv" not in k:
+                    prefix, rest = k.split(".mlp.experts.", 1)
+                    idx_s, proj_rest = rest.split(".", 1)
+                    proj = proj_rest.rsplit(".weight", 1)[0]
+                    dest = f"{prefix}.mlp.switch_mlp.{proj}.weight"
+                    stacked.setdefault(dest, {})[int(idx_s)] = v
+                    continue
+                if ".mlp.experts.gate_up_proj" in k or ".mlp.experts.down_proj" in k:
+                    # Two packed layouts exist. transformers save_pretrained
+                    # writes the runtime bmm orientation (gate_up [E, hidden,
+                    # 2*inter], down [E, inter, hidden]); the hub bf16 repo
+                    # ships Linear [out, in] halves (gate_up [E, 2*inter,
+                    # hidden], down [E, hidden, inter]). Keyed on which axis
+                    # equals hidden; square (test-config) tensors resolve to
+                    # the transformers branch, which parity validated.
+                    prefix = k.split(".mlp.experts.", 1)[0]
+                    hid = self.language_model.args.hidden_size
+                    if k.endswith("gate_up_proj"):
+                        if v.shape[1] == hid:
+                            gate, up = mx.split(v, 2, axis=-1)
+                            gate = gate.swapaxes(1, 2)
+                            up = up.swapaxes(1, 2)
+                        else:
+                            gate, up = mx.split(v, 2, axis=1)
+                        out[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
+                        out[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
+                    else:
+                        if v.shape[2] == hid:
+                            v = v.swapaxes(1, 2)
+                        out[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = v
+                    continue
+                if k.endswith("ple.conv1d.weight"):
+                    out[k.replace("ple.conv1d.weight", "ple.conv_weight")] = v.moveaxis(2, 1)
+                    continue
+                if k.endswith("linear_attn.conv1d.weight") and v.shape[-1] != 1:
+                    v = v.moveaxis(2, 1)
+                if v.ndim == 1 and any(k.endswith(s) for s in self._HF_NORM_SHIFT_SUFFIXES):
+                    v = v + 1.0
+            else:
+                if k.endswith("ple.conv1d.weight"):
+                    k = k.replace("ple.conv1d.weight", "ple.conv_weight")
+
+            out[k] = v
+
+        for dest, parts in stacked.items():
+            out[dest] = mx.stack([parts[i] for i in range(len(parts))])
+
+        out = _fuse_gate_up_sanitize(self, out)
+        out = _fuse_gdn_in_proj_sanitize(self, out)
+        out = _fuse_qsa_qkv_sanitize(self, out)
+
+        # The 51B table never loads as a parameter; sidecar rows are gathered
+        # lazily. Materialized shard concat is only accepted for tiny test
+        # configs (parity harnesses) where the table actually fits.
+        table_keys = [k for k in out if ".ngram_embedding.shard_" in k]
+        if table_keys:
+            shards = {}
+            for k in table_keys:
+                idx = int(k.rsplit("shard_", 1)[1].split(".")[0])
+                shards[idx] = out.pop(k)
+            table = mx.concatenate([shards[i] for i in range(len(shards))], axis=0)
+            key = next(
+                (
+                    k
+                    for k in _tree_keys(self)
+                    if k.endswith("ple.ple_embedding.ngram_embedding.weight")
+                ),
+                None,
+            )
+            if key is not None:
+                want = _tree_get(self, key).shape[0]
+                if table.shape[0] < want:
+                    pad = mx.zeros(
+                        (want - table.shape[0], table.shape[1]), dtype=table.dtype
+                    )
+                    table = mx.concatenate([table, pad], axis=0)
+                out[key] = table
+
+        return out
+
+    @property
+    def cast_predicate(self):
+        def predicate(path: str) -> bool:
+            if path.endswith("A_log"):
+                return False
+            if "ngram" in path or path.endswith("layer_multipliers"):
+                return False
+            return True
+
+        return predicate
+
+    @property
+    def quant_predicate(self):
+        """Convert-time recipe (Optimized Speed): 4-bit/g32 base; 8-bit/g64
+        embeddings, lm_head, GDN out_proj, router gates, shared expert and the
+        QSA indexer projection; the structural small stuff stays bf16."""
+
+        def predicate(path: str, module) -> Union[bool, dict]:
+            if not hasattr(module, "to_quantized"):
+                return False
+            eight = (
+                "embed_tokens",
+                "lm_head",
+                "linear_attn.out_proj",
+                "mlp.gate",
+                "shared_expert_gate",
+                "shared_expert.gate_proj",
+                "shared_expert.up_proj",
+                "shared_expert.down_proj",
+                "indexer.index_qk_proj",
+            )
+            keep = (
+                "input_mix_weight_down",
+                "input_mix_weight_up",
+                "block_inject_weight",
+                "ple.key_proj",
+                "ple.value_proj",
+                "ngram_embedding",
+            )
+            if any(path.endswith(s) or s in path for s in keep):
+                return False
+            if any(path.endswith(s) for s in eight):
+                return {"bits": 8, "group_size": 64}
+            return True
+
+        return predicate
+
+
+def _tree_keys(module: nn.Module):
+    from mlx.utils import tree_flatten
+
+    return [k for k, _ in tree_flatten(module.parameters())]
+
+
+def _tree_get(module: nn.Module, dotted: str):
+    from mlx.utils import tree_flatten
+
+    for k, v in tree_flatten(module.parameters()):
+        if k == dotted:
+            return v
+    raise KeyError(dotted)
+
+
+def is_qwen4_exp_mtp_config(config: dict) -> bool:
+    """Does this artifact belong to the Flash-Next family?
+
+    The family always exports its draft head as an ``mtp.safetensors``
+    sidecar and the shipped configs carry no usable declaration field
+    (``mtp``/``mtp_num_hidden_layers`` arrive null), so weight presence is
+    decided by :meth:`Model.attach_mtp` at inject time — mirroring the
+    DeepSeek-V4 "weight presence is decided later" convention.
+    """
+    cfg = config or {}
+    mt = str(cfg.get("model_type") or "").lower()
+    tc = cfg.get("text_config") or {}
+    tmt = str(tc.get("model_type") or "").lower()
+    return "qwen4_exp" in (mt, tmt) or "qwen4_exp_text" in (mt, tmt)
+
+
+def inject_qwen4_exp_mtp_support(
+    model,
+    path=None,
+    config: dict | None = None,
+    contract=None,
+) -> bool:
+    """Enable the speculative lane on an already-loaded Flash-Next model.
+
+    Nothing to graft: :meth:`Model.attach_mtp` builds the head from the
+    pack's self-describing ``mtp.safetensors`` (per-module quant inferred
+    from packed shapes) and publishes it on ``language_model`` where
+    ``mtplx.mtp_patch.validate_mtp_support`` looks. Returns False for a
+    pack that ships no head — the degrade-to-autoregressive signal.
+    """
+    if not is_qwen4_exp_mtp_config(config or {}):
+        return False
+    if path is None:
+        return False
+    attach = getattr(model, "attach_mtp", None)
+    if not callable(attach):
+        return False
+    return bool(attach(path))

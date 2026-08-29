@@ -21,6 +21,8 @@ from mtplx.cache_state import CacheSnapshot
 
 from .codec import (
     ColdEncodeInterrupted,
+    TreeCodec,
+    build_payload_spec,
     decode_gdn_boundaries,
     decode_payload,
     encode_payload,
@@ -356,8 +358,16 @@ class SessionBankColdTier:
         self._writer_pause_enabled = _env_flag(
             "MTPLX_SSD_WRITER_FOREGROUND_PAUSE", default=True
         )
+        # 600 s, not 60: coding-agent turns run 60-620 s, so a 60 s bound
+        # expired mid-decode and each blob write fired under the live turn —
+        # a ~1 GB/min unified-memory drumbeat that tripped macOS pressure
+        # (banner) and stole decode (gate254-c4s -30%; manifest receipts
+        # 2026-08-28 21:38-22:17, 9+ GB written across live OpenCode turns).
+        # The cold tier is a cache: waiting out even a 10-minute turn costs
+        # only delayed durability, never correctness. Inter-turn gaps drain
+        # the queue (the pause loop samples every 50 ms).
         self._writer_pause_max_s = _env_float(
-            "MTPLX_SSD_WRITER_FOREGROUND_PAUSE_MAX_S", 60.0
+            "MTPLX_SSD_WRITER_FOREGROUND_PAUSE_MAX_S", 600.0
         )
         self._encode_yield_enabled = _env_flag(
             "MTPLX_SSD_ENCODE_FOREGROUND_YIELD", default=True
@@ -411,6 +421,7 @@ class SessionBankColdTier:
             "encode_yields_foreground": 0,
             "writer_foreground_pauses": 0,
             "writer_foreground_pause_s": 0.0,
+            "writer_pause_expired_busy": 0,
         }
         self._ensure_store()
         self._writer = threading.Thread(
@@ -533,6 +544,275 @@ class SessionBankColdTier:
             )
             return False
         self._inc("writes_enqueued")
+        return True
+
+    @property
+    def spill_threshold_bytes(self) -> int:
+        """Entries at or above this cannot ride the staged writer queue
+        (put_entry holds the fully encoded payload in RAM behind a backlog
+        budget) and must use :meth:`spill_entry`'s streaming path."""
+        return int(self._backlog_budget_bytes)
+
+    def _admit_hourly(self, estimated_nbytes: int) -> bool:
+        """The hourly-write-budget half of _admit_write, for writes that
+        never stage bytes in the queue (spill_entry)."""
+        now = time.time()
+        with self._stats_lock:
+            while self._written_window and self._written_window[0][0] < now - 3600:
+                self._written_window.popleft()
+            written_last_hour = sum(nbytes for _, nbytes in self._written_window)
+            if (
+                written_last_hour + max(0, estimated_nbytes)
+                > self._write_budget_per_hour_bytes
+            ):
+                self._stats["skipped_write_budget"] = (
+                    int(self._stats.get("skipped_write_budget", 0) or 0) + 1
+                )
+                return False
+        return True
+
+    def _warn_spill_size_capped(
+        self, entry: Any, estimated: int, effective_cap: int
+    ) -> None:
+        """One console line per session when a spill is refused for size.
+
+        skipped_size_cap was a silent in-memory counter — a session bigger
+        than min(cap, free_disk/4) lost durability with no trace, and the
+        user's next restart paid a full re-prefill with nothing to explain
+        it (the 2026-08-27 48G-sim finding: a 4 TB disk at 28 GiB free
+        capped the lane at ~7 GiB and every 100k+ session skipped mutely,
+        the exact #278 silence class in a new lane). Same dedup shape as
+        warn_oversized_snapshot_skip: first refusal per session speaks,
+        repeats stay counters.
+        """
+        session_id = getattr(entry, "session_id", None)
+        with self._stats_lock:
+            warned = getattr(self, "_size_cap_warned_sessions", None)
+            if warned is None:
+                warned = set()
+                self._size_cap_warned_sessions = warned
+            if session_id in warned:
+                return
+            warned.add(session_id)
+        try:
+            free_gib = shutil.disk_usage(self.base_dir).free / GIB
+        except Exception:
+            free_gib = -1.0
+        logger.warning(
+            "SessionBank SSD spill skipped for session %s: entry ~%.1f GiB "
+            "exceeds the effective cap %.1f GiB (min of configured cap and "
+            "free_disk/4; free disk %.1f GiB). The session stays warm in RAM "
+            "but will re-prefill after a restart. Free disk space to restore "
+            "durability for sessions this large.",
+            session_id or "<anon>",
+            estimated / GIB,
+            effective_cap / GIB,
+            free_gib,
+        )
+
+    def spill_entry(
+        self,
+        entry: Any,
+        *,
+        capabilities: list[str] | tuple[str, ...] | None = None,
+        raise_on_yield: bool = False,
+    ) -> bool:
+        """Stream one entry to disk tensor-by-tensor, no RAM staging.
+
+        put_entry encodes the WHOLE payload into queue-staged bytes behind
+        a 4 GiB backlog budget — so a >4 GiB session could never persist,
+        and the RAM per-session cap (8 GiB on the 48 GB tier) excluded the
+        very coding-agent sessions whose re-prefill costs minutes (#305's
+        514 s TTFT loop; #323's live-ref sessions never reached SSD at
+        all). Here each tensor is encoded (one bounded eval — lazy COW
+        snapshot views materialize per tensor/block), hashed, written or
+        deduped, and dropped before the next starts: the high-water mark
+        is one tensor, not the payload. Runs on the caller's thread (the
+        idle lane) with the same per-tensor foreground yield as put_entry;
+        the writer thread is not involved.
+
+        The on-disk result is byte-compatible with put_entry — same
+        content-addressed blobs, same payload.json shape, same manifest
+        row — so lookups and restores cannot tell the paths apart.
+        """
+        if self.mode == "off":
+            return False
+        token_ids = tuple(int(token) for token in getattr(entry, "token_ids"))
+        if len(token_ids) < self.min_prefix_tokens:
+            self._inc("skipped_too_short")
+            return False
+        estimated = int(getattr(entry, "nbytes", 0) or 0)
+        if estimated <= 0:
+            estimated = int(getattr(entry, "oversized_nbytes", 0) or 0)
+        if not self._admit_hourly(estimated):
+            return False
+        metadata = self._metadata_for_entry(
+            entry, capabilities=capabilities or (), payload_nbytes=estimated
+        )
+        entry_id = str(metadata["entry_id"])
+        entry_hash_prefix = entry_id[:2]
+        final_dir = self.base_dir / "entries" / entry_hash_prefix / entry_id
+        self._ensure_disk_usage_snapshot()
+        with self._base_lock:
+            self._ensure_store()
+            if final_dir.exists():
+                if self._entry_in_manifest(entry_id):
+                    self._touch_entry(entry_id)
+                    return True
+                self._archive_orphan_entry_dir(final_dir, entry_id)
+            effective_cap, budget_block = self._effective_write_budget()
+            if budget_block is not None:
+                self._inc("skipped_low_disk")
+                with self._stats_lock:
+                    self._stats["low_disk_writes_disabled"] = True
+                logger.warning(
+                    "SessionBank SSD spill disabled (%s): free disk below %d GiB",
+                    budget_block,
+                    LOW_DISK_FLOOR_BYTES // GIB,
+                )
+                return False
+            with self._stats_lock:
+                self._stats["low_disk_writes_disabled"] = False
+                self._stats["effective_max_bytes"] = int(effective_cap)
+            if estimated > effective_cap:
+                self._inc("skipped_size_cap")
+                self._warn_spill_size_capped(entry, estimated, effective_cap)
+                return False
+            if not self._evict_until_room(estimated, cap_bytes=effective_cap):
+                self._inc("skipped_size_cap")
+                self._warn_spill_size_capped(entry, estimated, effective_cap)
+                return False
+        should_abort: Callable[[], bool] | None = None
+        if self._encode_yield_enabled and self.foreground_busy is not None:
+            should_abort = self.foreground_busy
+        tensor_blobs: dict[str, dict[str, Any]] = {}
+        written_state = {"logical": 0, "physical": 0, "deduped_hits": 0}
+        tier = self
+
+        class _WriteThroughTensors(dict):
+            """TreeCodec sink: each tensor's bytes go straight to a blob
+            file (or dedupe against one) and are dropped, never retained —
+            this dict stays empty on purpose."""
+
+            def __setitem__(self, name: str, raw: bytes) -> None:  # noqa: N804
+                # Abort, never wait (2026-08-29). This sink runs on the
+                # single model-owner thread (spill_entry runs on the idle
+                # lane), and foreground_busy counts QUEUED work — a request
+                # queued behind this very spill cannot start until the
+                # spill yields the thread, so a _pause_for_foreground here
+                # could never see busy clear: it ran out its full deadline
+                # (600 s of frozen TTFT) before writing anyway. Busy on
+                # the encode path therefore means raise, same contract as
+                # the codec's per-tensor check: nothing restorable is left
+                # behind (payload.json + manifest row land only at the
+                # end) and session_bank re-dispatches the coalesce-keyed
+                # job for the next idle window. The WRITER-thread pause in
+                # _writer_loop keeps waiting on purpose — nothing queues
+                # behind that thread (ac0386d0 decode-theft fix).
+                if should_abort is not None:
+                    try:
+                        busy = bool(should_abort())
+                    except Exception:
+                        busy = False
+                    if busy:
+                        raise ColdEncodeInterrupted()
+                if tier._stop.is_set():
+                    raise ColdEncodeInterrupted()
+                digest = hashlib.sha256(raw).hexdigest()
+                tensor_blobs[name] = {"sha256": digest, "nbytes": len(raw)}
+                written_state["logical"] += len(raw)
+                if tier._write_blob(digest, raw):
+                    written_state["physical"] += len(raw)
+                else:
+                    written_state["deduped_hits"] += 1
+
+        codec = TreeCodec(block_size=self.block_size, should_abort=should_abort)
+        codec.tensors = _WriteThroughTensors()
+        boundaries = tuple(
+            (int(r[0]), r[1], r[2] if len(r) > 2 else None)
+            for r in (getattr(entry, "gdn_boundaries", None) or [])
+        )
+        try:
+            payload_spec = build_payload_spec(
+                codec,
+                cache_snapshot=getattr(entry, "cache_snapshot"),
+                logits=getattr(entry, "logits"),
+                hidden=getattr(entry, "hidden"),
+                mtp_history_snapshot=getattr(entry, "mtp_history_snapshot", None),
+                gdn_boundaries=boundaries,
+                has_recurrent=bool(getattr(entry, "has_recurrent", False)),
+            )
+        except ColdEncodeInterrupted:
+            self._inc("encode_yields_foreground")
+            if raise_on_yield:
+                raise
+            return False
+        except Exception as exc:
+            self._inc("skipped_serialize_error")
+            logger.warning(
+                "SessionBank SSD spill skipped: %s: %s", type(exc).__name__, exc
+            )
+            return False
+        if should_abort is not None:
+            # Same fencing rationale as put_entry: the per-tensor evals
+            # above schedule GPU work whose command buffers must drain in
+            # this idle window, not into the next request's decode.
+            try:
+                import mlx.core as _mx
+
+                _mx.synchronize()
+            except Exception:
+                pass
+        metadata["logical_nbytes"] = int(written_state["logical"])
+        metadata["physical_nbytes"] = int(written_state["physical"])
+        metadata["deduped_nbytes"] = max(
+            0, int(written_state["logical"]) - int(written_state["physical"])
+        )
+        metadata["nbytes"] = max(
+            int(metadata.get("nbytes", 0) or 0), int(written_state["logical"])
+        )
+        payload = {
+            "format_version": COLD_TIER_FORMAT_VERSION,
+            "metadata": metadata,
+            "payload_spec": payload_spec,
+            "tensor_names": sorted(tensor_blobs),
+            "tensor_blobs": tensor_blobs,
+        }
+        with self._base_lock:
+            if final_dir.exists():
+                if self._entry_in_manifest(entry_id):
+                    self._touch_entry(entry_id)
+                    return True
+                self._archive_orphan_entry_dir(final_dir, entry_id)
+            temp_parent = self.base_dir / "entries" / entry_hash_prefix
+            temp_parent.mkdir(parents=True, exist_ok=True)
+            temp_dir = Path(
+                tempfile.mkdtemp(prefix=f".{entry_id}.tmp-", dir=temp_parent)
+            )
+            (temp_dir / "payload.json").write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temp_dir.rename(final_dir)
+            metadata["entry_dir"] = str(final_dir.relative_to(self.base_dir))
+            self._insert_manifest(metadata)
+            self._invalidate_disk_usage_cache()
+        self._inc("writes_completed")
+        self._inc("spill_writes_completed")
+        with self._stats_lock:
+            self._stats["last_write_s"] = time.time()
+            self._written_window.append(
+                (
+                    time.time(),
+                    int(written_state["physical"] or written_state["logical"]),
+                )
+            )
+        logger.info(
+            "SessionBank SSD spilled entry_id=%s prefix_len=%d nbytes=%d",
+            entry_id,
+            len(token_ids),
+            int(written_state["logical"]),
+        )
         return True
 
     def lookup(
@@ -1014,16 +1294,28 @@ class SessionBankColdTier:
         waited = 0.0
         deadline = time.monotonic() + max(0.0, self._writer_pause_max_s)
         paused = False
-        while time.monotonic() < deadline and not self._stop.is_set():
+        expired_busy = False
+        while not self._stop.is_set():
             try:
                 busy = bool(check())
             except Exception:
                 break
             if not busy:
                 break
+            if time.monotonic() >= deadline:
+                # Liveness bound hit with traffic still in flight: the write
+                # proceeds under the live turn. Counted so a saturated server
+                # shows exactly how often durability had to fight decode.
+                expired_busy = True
+                break
             paused = True
             time.sleep(0.05)
             waited += 0.05
+        if expired_busy:
+            with self._stats_lock:
+                self._stats["writer_pause_expired_busy"] = (
+                    int(self._stats.get("writer_pause_expired_busy", 0) or 0) + 1
+                )
         if paused:
             with self._stats_lock:
                 self._stats["writer_foreground_pauses"] = (
@@ -1072,14 +1364,35 @@ class SessionBankColdTier:
 
         now = time.time()
         with self._stats_lock:
-            if (
-                self._pending_bytes + max(0, estimated_nbytes)
-                > self._backlog_budget_bytes
-            ):
-                self._stats["skipped_backlog_bytes"] = (
-                    int(self._stats.get("skipped_backlog_bytes", 0) or 0) + 1
-                )
-                return False
+            needed = max(0, estimated_nbytes)
+            if self._pending_bytes + needed > self._backlog_budget_bytes:
+                if self._pending_bytes <= 0:
+                    # #384: the backlog budget bounds QUEUED bytes, but a
+                    # single entry larger than the whole budget was rejected
+                    # on every attempt even with an empty queue — at ~84
+                    # KB/token of 27B KV the 4 GiB default made the SSD tier
+                    # silently off past ~50k tokens, exactly the sessions it
+                    # exists to serve, with only a skipped_backlog_bytes
+                    # counter as the trace. An empty queue is not backlog
+                    # pressure: admit the lone entry and say so by name.
+                    self._stats["admitted_oversized_alone"] = (
+                        int(self._stats.get("admitted_oversized_alone", 0) or 0)
+                        + 1
+                    )
+                    logger.warning(
+                        "SessionBank SSD write of %.2f GiB exceeds the "
+                        "writer backlog budget of %.2f GiB "
+                        "(MTPLX_SSD_WRITER_BACKLOG_BYTES); admitting it "
+                        "alone because the queue is empty",
+                        needed / (1024**3),
+                        self._backlog_budget_bytes / (1024**3),
+                    )
+                else:
+                    self._stats["skipped_backlog_bytes"] = (
+                        int(self._stats.get("skipped_backlog_bytes", 0) or 0)
+                        + 1
+                    )
+                    return False
             while self._written_window and self._written_window[0][0] < now - 3600:
                 self._written_window.popleft()
             written_last_hour = sum(nbytes for _, nbytes in self._written_window)

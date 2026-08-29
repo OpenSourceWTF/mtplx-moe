@@ -27,6 +27,13 @@ struct LiveTab: View {
                         PortFallbackBanner(message: portNotice)
                     }
 
+                    MemoryGuardBanner(
+                        pressureLevel: backend.memoryPressureLevel,
+                        recentShed: backend.memoryGuardRecentShed,
+                        pressureSource: backend.memoryPressureSource,
+                        plan: backend.memoryPlan
+                    )
+
                     heroSection(availableWidth: contentWidth)
                     TileRow(availableWidth: contentWidth)
                     AcceptanceSection()

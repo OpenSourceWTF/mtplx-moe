@@ -30,6 +30,10 @@ from mtplx.backends.descriptors import (
 from mtplx.default_models import public_model_id_for_ref
 from mtplx.reasoning_effort import REASONING_EFFORT_CHOICES
 from mtplx.profiles import (
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     QWEN38_BARE_SPEED_HF_MODEL_ID,
     QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
     QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
@@ -243,6 +247,26 @@ def test_qwen38_resolved_descriptor_matches_model_controls() -> None:
             "~/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Bare-Speed",
             QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
         ),
+        # Flash-Next serve packs (2026-08-27 promotion): HF id, public id,
+        # and released folder name all resolve to the canonical id the
+        # turbo allowlist gates on.
+        (FLASH_NEXT_BARE_SPEED_HF_MODEL_ID, FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID),
+        (
+            FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+            FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+            FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            "~/.mtplx/models/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+            FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        ),
+        (
+            "~/.mtplx/models/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+            FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        ),
     ],
 )
 def test_qwen38_public_model_id_resolution(ref: str, public_id: str) -> None:
@@ -255,6 +279,16 @@ def test_qwen38_derivative_names_fall_through() -> None:
         public_model_id_for_ref("Youssofal/Qwen3.8-27B-MTPLX-Bare-Speed-RC1")
         != QWEN38_BARE_SPEED_PUBLIC_MODEL_ID
     )
+    # Flash-Next derivative packs (hc8 kernel donor, superseded v1a) keep
+    # falling through to sanitized names — no first-party id inheritance.
+    for derivative in (
+        "Qwen3.8-Flash-Next-MTPLX-Bare-Speed-hc8",
+        "Qwen3.8-Flash-Next-MTPLX-OS-v1a",
+    ):
+        assert public_model_id_for_ref(derivative) not in {
+            FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+            FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        }
 
 
 def test_qwen38_turbo_default_promotion() -> None:
@@ -267,11 +301,18 @@ def test_qwen38_turbo_default_promotion() -> None:
         QWEN38_BARE_SPEED_PUBLIC_MODEL_ID,
         QWEN38_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
         QWEN38_OPTIMIZED_QUALITY_PUBLIC_MODEL_ID,
+        # Flash-Next serve packs promoted 2026-08-27 (family fast lane
+        # under turbo; two-boot-triple GDN-step receipt).
+        FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     ):
         assert public_id in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
     args = SimpleNamespace(profile="sustained", _cli_flags=set())
     assert _apply_model_default_profile(args, QWEN38_BARE_SPEED_PUBLIC_MODEL_ID)
     assert args.profile == "turbo"
+    fn_args = SimpleNamespace(profile="sustained", _cli_flags=set())
+    assert _apply_model_default_profile(fn_args, FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID)
+    assert fn_args.profile == "turbo"
     # An explicit --profile flag still wins.
     pinned = SimpleNamespace(profile="sustained", _cli_flags={"profile"})
     assert not _apply_model_default_profile(pinned, QWEN38_BARE_SPEED_PUBLIC_MODEL_ID)
@@ -507,6 +548,112 @@ def test_reasoning_effort_still_none_for_qwen36_state() -> None:
     assert srv._reasoning_effort_for_state(state, thinking_enabled=True) is None
 
 
+def test_flash_next_family_reasoning_codec() -> None:
+    """qwen4_exp shipped effort-blind: reasoning_policy_for_model had no
+    family branch, so reasoning_effort=low was dropped before the request
+    field was read and the template's own xhigh fallback burned 8k+
+    thinking tokens (showdown receipt 2026-08-27). The template is
+    byte-identical to the 27B's, so the declared triple must match it —
+    it raise_exceptions on anything else."""
+
+    for ref in (
+        FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+        FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    ):
+        codec = reasoning_policy_for_model(model_ref=ref)
+        assert codec.supported and codec.parser == "qwen3", ref
+        assert codec.effort_levels == ("xhigh", "medium", "low"), ref
+        assert codec.default_effort == "xhigh", ref
+
+
+def test_reasoning_effort_resolves_for_flash_next_state() -> None:
+    from mtplx.server import openai as srv
+
+    state = _state(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID)
+    # Family default (founder call 2026-08-28): xhigh, unlike the 27B's
+    # receipted medium.
+    assert (
+        srv._reasoning_effort_for_state(state, thinking_enabled=True) == "xhigh"
+    )
+    assert (
+        srv._reasoning_effort_for_state(
+            state, thinking_enabled=True, request_effort="low"
+        )
+        == "low"
+    )
+    # "high" is shared vocabulary but outside the template triple: nearest
+    # declared tier UP, never a template crash.
+    assert (
+        srv._reasoning_effort_for_state(
+            state, thinking_enabled=True, request_effort="high"
+        )
+        == "xhigh"
+    )
+    assert (
+        srv._reasoning_effort_for_state(state, thinking_enabled=False) is None
+    )
+
+
+def test_server_defaults_stamp_flash_next_reasoning() -> None:
+    """The daemon twin of _apply_backend_serve_defaults stamped the lane
+    descriptor's codec (native_mtp -> parser "none", no effort), so a child
+    daemon served Flash-Next with reasoning disabled while the CLI parent
+    resolved the family correctly."""
+
+    from mtplx.server import openai as srv
+
+    args = srv.parse_args(["--model", FLASH_NEXT_BARE_SPEED_HF_MODEL_ID])
+    srv._apply_backend_server_defaults(args, explicit_flags={"model"})
+    assert args.reasoning_parser == "qwen3"
+    assert args.reasoning_effort == "xhigh"
+
+    args27 = srv.parse_args(["--model", BARE_SPEED])
+    srv._apply_backend_server_defaults(args27, explicit_flags={"model"})
+    assert args27.reasoning_parser == "qwen3"
+    assert args27.reasoning_effort == "medium"  # 27B keeps its own receipt
+
+    # A DEFAULT model ref must never override an explicitly chosen lane:
+    # the daemon's default --model is the 27B HF id, and a ref-only
+    # override stamped qwen3 onto the Laguna lane (2026-08-28).
+    laguna = srv.parse_args(["--backend-id", "laguna_ar", "--no-load-mtp"])
+    srv._apply_backend_server_defaults(
+        laguna, explicit_flags={"backend-id", "no-load-mtp"}
+    )
+    assert laguna.reasoning_parser == "poolside_v1"
+
+
+def test_one_shot_cli_reasoning_effort_matches_server_semantics() -> None:
+    from types import SimpleNamespace as NS
+
+    from mtplx.commands.public import _one_shot_reasoning_effort
+
+    flash = FLASH_NEXT_BARE_SPEED_HF_MODEL_ID
+    assert _one_shot_reasoning_effort(NS(), True, flash) == "xhigh"  # auto
+    assert (
+        _one_shot_reasoning_effort(NS(reasoning_effort="low"), True, flash)
+        == "low"
+    )
+    assert (
+        _one_shot_reasoning_effort(NS(reasoning_effort="high"), True, flash)
+        == "xhigh"  # nearest declared tier up
+    )
+    assert _one_shot_reasoning_effort(NS(), False, flash) is None
+    assert _one_shot_reasoning_effort(NS(reasoning_effort="xhigh"), True, V2_36) is None
+    assert _one_shot_reasoning_effort(NS(), True, BARE_SPEED) == "medium"
+
+
+def test_run_and_chat_parsers_accept_reasoning_effort() -> None:
+    from mtplx.cli import build_parser
+
+    parser = build_parser()
+    for command in ("run", "chat"):
+        args = parser.parse_args(
+            [command, "--prompt", "hi", "--reasoning-effort", "xhigh"]
+        )
+        assert args.reasoning_effort == "xhigh"
+        assert parser.parse_args([command, "--prompt", "hi"]).reasoning_effort == "auto"
+
+
 def test_normalize_reasoning_effort_accepts_xhigh() -> None:
     from mtplx.server import openai as srv
 
@@ -568,6 +715,36 @@ def test_every_effort_writing_surface_accepts_the_whole_vocabulary() -> None:
         srv._coerce_setting("reasoning_effort", "ultra")
     with pytest.raises(SystemExit, match="reasoning_effort must be"):
         config_set("ultra")
+
+
+def test_reasoning_history_auto_preserves_for_flash_next() -> None:
+    # Flash-Next ships the byte-identical Qwen3.8 template and the same
+    # preserve-by-default trained contract. The scoped fallback made every
+    # agent round's postcommit abort (reasoning_history_scoping_mismatch)
+    # and re-prefill the assistant turn (2026-08-28 wall-clock receipts).
+    from mtplx.server import openai as srv
+
+    assert (
+        srv._reasoning_history_mode(_state(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID))
+        == "preserve"
+    )
+    assert (
+        srv._reasoning_history_mode(_state(FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID))
+        == "preserve"
+    )
+    # An operator's explicit scoped/off still wins.
+    assert (
+        srv._reasoning_history_mode(
+            _state(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID, preserve_thinking="scoped")
+        )
+        == "scoped"
+    )
+    assert (
+        srv._reasoning_history_mode(
+            _state(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID, preserve_thinking="off")
+        )
+        == "strip"
+    )
 
 
 def test_reasoning_history_auto_preserves_for_qwen38() -> None:

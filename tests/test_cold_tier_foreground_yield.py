@@ -131,10 +131,48 @@ def test_writer_pauses_while_foreground_busy(tmp_path):
     assert stats_end["writes_completed"] >= 1
     assert stats_end["writer_foreground_pauses"] >= 1
     assert stats_end["writer_foreground_pause_s"] > 0.0
+    # The writer THREAD keeps its wait-out-the-turn pause (ac0386d0);
+    # only the owner-thread encode/spill paths yield. The pause here must
+    # not masquerade as an encode yield (2026-08-29 spill-sink fix).
+    assert stats_end["encode_yields_foreground"] == 0
     # The write must not have completed while we were holding it busy,
     # unless it slipped in before the flip (tolerated: pause counter proves
     # the writer honored the signal at least once).
     del stats_mid
+
+
+def test_writer_pause_outlasts_a_long_turn_by_default(tmp_path):
+    # 2026-08-28: the 60 s default expired mid-turn on 60-620 s coding-agent
+    # decodes, so every blob write fired under the live turn (~1 GB/min
+    # manifest drumbeat 21:38-22:17, macOS pressure banner + decode theft).
+    # The bound is a liveness backstop, not a cadence: it must exceed any
+    # realistic single turn.
+    tier = SessionBankColdTier(
+        base_dir=tmp_path / "bank", mode="on", min_prefix_tokens=1
+    )
+    assert tier._writer_pause_max_s == 600.0
+
+
+def test_writer_pause_expiry_into_busy_traffic_is_counted(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTPLX_SSD_WRITER_FOREGROUND_PAUSE_MAX_S", "0.2")
+    tier = SessionBankColdTier(
+        base_dir=tmp_path / "bank", mode="on", min_prefix_tokens=1
+    )
+    busy = {"value": False}
+    tier.foreground_busy = lambda: busy["value"]
+    entry = _make_entry()
+    assert tier.put_entry(entry, capabilities=["ar_insert"]) is True
+    busy["value"] = True
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if tier.stats()["writes_completed"] >= 1:
+            break
+        time.sleep(0.05)
+    stats = tier.stats()
+    # The write went through despite permanent busy (liveness bound), and
+    # the expiry was recorded so operators can see durability fought decode.
+    assert stats["writes_completed"] >= 1
+    assert stats["writer_pause_expired_busy"] >= 1
 
 
 def test_writer_pause_disabled_by_env(tmp_path, monkeypatch):

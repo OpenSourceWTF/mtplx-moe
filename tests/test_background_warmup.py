@@ -71,12 +71,17 @@ def make_state(scheduler: FakeScheduler | None = None, **args_overrides):
     )
     for key, value in args_overrides.items():
         setattr(args, key, value)
-    return SimpleNamespace(
+    state = SimpleNamespace(
         args=args,
         model_scheduler=scheduler or FakeScheduler(),
         runtime=SimpleNamespace(tokenizer=FakeTokenizer()),
         context_window=262144,
+        foreground_active=0,
     )
+    # Mirrors ServerState.has_foreground: non-zero while a request is being
+    # served, independent of the completion stamp in last_request_at.
+    state.has_foreground = lambda: state.foreground_active > 0
+    return state
 
 
 def test_background_warmup_enabled_env(monkeypatch):
@@ -144,17 +149,11 @@ def test_background_warmup_runs_all_steps_and_publishes_done(monkeypatch):
     assert snapshot["resubmits"] == 0
 
 
-def test_background_warmup_defers_while_foreground_recent(monkeypatch):
-    """2.8.3 idle grace: a daemon that served traffic recently must not
-    burn GPU on warm rungs between chat turns — steps defer on a timer
-    (no model work, no resubmit budget) until the grace elapses."""
-    import time as _time
-
-    scheduler = FakeScheduler()
-    state = make_state(scheduler)
-    state.last_request_at = _time.time()  # a response just finished
+def _deferral_probe(monkeypatch, state, scheduler, grace: str = "90"):
+    """Run one warmup plan with timers faked; report whether any rung
+    actually generated and what the first step's published state is."""
     monkeypatch.setenv("MTPLX_WARMUP_LADDER", "16")
-    monkeypatch.setenv("MTPLX_WARMUP_IDLE_GRACE_S", "90")
+    monkeypatch.setenv("MTPLX_WARMUP_IDLE_GRACE_S", grace)
     monkeypatch.setattr(server, "_prewarm_gqa_packed_pipelines", lambda: True)
     generations: list[int] = []
     monkeypatch.setattr(
@@ -178,6 +177,19 @@ def test_background_warmup_defers_while_foreground_recent(monkeypatch):
     warming = server._BackgroundWarmup(state, status_host, [1, 2, 3])
     warming.submit(0)
     scheduler.drain()
+    return generations, status_host, timers
+
+
+def test_background_warmup_defers_while_foreground_recent(monkeypatch):
+    """2.8.3 idle grace: a daemon that served traffic recently must not
+    burn GPU on warm rungs between chat turns — steps defer on a timer
+    (no model work, no resubmit budget) until the grace elapses."""
+    import time as _time
+
+    scheduler = FakeScheduler()
+    state = make_state(scheduler)
+    state.last_request_at = _time.time()  # a response just finished
+    generations, status_host, timers = _deferral_probe(monkeypatch, state, scheduler)
     # No model work ran; the plan is waiting for idle, budget untouched.
     assert generations == []
     assert status_host["background"]["steps"][0]["state"] == "waiting_idle"
@@ -356,3 +368,77 @@ def test_dashboard_record_completion_skips_warmup_rows():
         stats={},
     )
     assert "lifetime" in calls and "rolling" in calls
+
+
+def test_background_warmup_defers_while_a_request_is_in_flight(monkeypatch):
+    """A request that has ARRIVED but not finished must hold the ladder.
+
+    last_request_at is stamped at completion, so a daemon that has not
+    completed a request yet still reads 0.0 while one is generating. That
+    read as "infinitely quiet" and let a warm rung run against live
+    traffic — and because a UI that restarts the engine on a config change
+    is typed into immediately afterwards, the very first request of a serve
+    was the one most likely to be warmed over. (Adapting community PR #300
+    by @Blakeolson21.)"""
+    scheduler = FakeScheduler()
+    state = make_state(scheduler)
+    state.last_request_at = 0.0  # nothing has COMPLETED yet
+    state.foreground_active = 1  # ...but a real request is generating now
+    generations, status_host, timers = _deferral_probe(monkeypatch, state, scheduler)
+    assert generations == [], "warming generated while a request was in flight"
+    assert status_host["background"]["steps"][0]["state"] == "waiting_idle"
+    assert status_host["background"]["resubmits"] == 0
+    assert len(timers) == 1
+
+
+def test_background_warmup_holds_a_live_request_even_at_zero_grace(monkeypatch):
+    """MTPLX_WARMUP_IDLE_GRACE_S=0 drops the between-turns wait, not the
+    live-traffic guard.
+
+    Expressing "busy" as zero quiet made the hold collapse at grace 0
+    (``0.0 < 0.0`` is False), so the one knob an operator reaches for when
+    warm rungs are not running also handed them a request that was still
+    generating — the exact starvation the guard exists to prevent."""
+    scheduler = FakeScheduler()
+    state = make_state(scheduler)
+    state.last_request_at = 0.0
+    state.foreground_active = 1  # a real request is generating right now
+    generations, status_host, timers = _deferral_probe(
+        monkeypatch, state, scheduler, grace="0"
+    )
+    assert generations == [], "warming generated against a live request at grace 0"
+    assert status_host["background"]["steps"][0]["state"] == "waiting_idle"
+    assert status_host["background"]["resubmits"] == 0
+    assert len(timers) == 1
+    wait_s, fn, args = timers[0]
+    assert wait_s >= 1.0  # _defer_step floors the re-check, never a hot loop
+    # The request finishes and nothing else is queued: zero grace means the
+    # plan runs on the very next admission, with no wait to serve out.
+    state.foreground_active = 0
+    fn(*args)
+    scheduler.drain()
+    assert generations == [16]
+    assert status_host["background"]["state"] == "done"
+
+
+def test_background_warmup_defers_while_foreground_is_queued(monkeypatch):
+    """Foreground work queued on the scheduler counts as busy at admission
+    time, not only once it starts executing."""
+    scheduler = FakeScheduler()
+    scheduler.foreground_busy = True
+    state = make_state(scheduler)
+    state.last_request_at = 0.0
+    generations, status_host, _ = _deferral_probe(monkeypatch, state, scheduler)
+    assert generations == [], "warming generated while foreground work was queued"
+    assert status_host["background"]["steps"][0]["state"] == "waiting_idle"
+
+
+def test_background_warmup_still_warms_a_genuinely_idle_fresh_daemon(monkeypatch):
+    """The guard must not cost the case it exists for: nothing running and
+    nothing ever completed still warms immediately."""
+    scheduler = FakeScheduler()
+    state = make_state(scheduler)
+    state.last_request_at = 0.0
+    generations, status_host, _ = _deferral_probe(monkeypatch, state, scheduler)
+    assert generations == [16]
+    assert status_host["background"]["state"] == "done"

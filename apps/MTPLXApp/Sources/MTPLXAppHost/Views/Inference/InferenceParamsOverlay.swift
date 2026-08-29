@@ -564,7 +564,7 @@ struct InferenceParamsOverlay: View, Equatable {
         switch selectedModelFamily {
         case "gemma4": return "Gemma assistant MTP"
         case "step": return "Step experimental MTP"
-        case "qwen3_5", "qwen3_6", "qwen3_8": return "Qwen native MTP"
+        case "qwen3_5", "qwen3_6", "qwen3_8", "qwen4_exp": return "Qwen native MTP"
         case "glm": return "GLM MTP"
         case "deepseek": return "DeepSeek MTP"
         default: return "Custom model"
@@ -592,6 +592,17 @@ struct InferenceParamsOverlay: View, Equatable {
                 topP: 0.95,
                 topK: 20,
                 familyDefaultReason: "Qwen 3.8 native sampler"
+            )
+        case "qwen4_exp":
+            // Flash-Next ships the same official thinking-mode triple as the
+            // 27B (engine QWEN4_EXP_SAMPLER_DEFAULTS); without this arm the
+            // overlay fell to the 3.6-era 0.6 coding sampler whenever the
+            // daemon was down and could persist 0.6 over the engine's 1.0.
+            return SamplingDefaults(
+                temperature: 1.0,
+                topP: 0.95,
+                topK: 20,
+                familyDefaultReason: "Native MTP sampler"
             )
         default:
             return SamplingDefaults(
@@ -667,6 +678,17 @@ struct InferenceParamsOverlay: View, Equatable {
                 effortLevels: ["xhigh", "medium", "low"],
                 defaultEffort: "medium"
             )
+        case "qwen4_exp":
+            // Same think-tag codec as the 27B lane; the Flash-Next family
+            // default is xhigh (engine QWEN4_EXP_REASONING_CODEC), not medium.
+            return ReasoningPolicy(
+                supported: true,
+                parser: "qwen3",
+                defaultMode: "auto",
+                historyPolicy: "preserve_when_enabled",
+                effortLevels: ["xhigh", "medium", "low"],
+                defaultEffort: "xhigh"
+            )
         case "step", "unknown":
             if selectedModelFamily == "step" {
                 return ReasoningPolicy(
@@ -718,6 +740,17 @@ struct InferenceParamsOverlay: View, Equatable {
                 restartRequired: true,
                 proofLevel: "not_validated",
                 disabledReason: "KV quantization is not supported for Step."
+            )
+        case "qwen4_exp":
+            // Mirrors QWEN4_EXP_KV_QUANT_POLICY in backends/descriptors.py:
+            // the paged KV-quant lane never converts this family's QSA
+            // caches, and the hybrid design keeps KV small by construction.
+            return KVQuantPolicy(
+                supported: false,
+                modes: ["off"],
+                restartRequired: true,
+                proofLevel: "not_validated",
+                disabledReason: "Flash-Next keeps KV on 12 of 48 layers (~24 KB/token), and its QSA attention has no validated quantized-cache lane yet."
             )
         default:
             return KVQuantPolicy(

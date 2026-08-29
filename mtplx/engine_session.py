@@ -183,13 +183,25 @@ def model_weights_bytes(model_path: Any) -> int | None:
     MTP sidecar lives at ``mtp/weights.safetensors`` (artifacts.py) and
     wrapper dirs keep shards under a subdirectory. The old top-level-only
     scan undercounted those (or returned None outright), silently skewing
-    the RAM-aware session-bank budget this number feeds."""
+    the RAM-aware session-bank budget this number feeds.
+
+    The Flash-Next n-gram sidecar (~30 GiB) is excluded by name: in its
+    default streamed mode only touched pages become resident and they are
+    reclaimable file-backed pages, not wired weight. Counting it here was
+    the 2026-08-28 defect chain (false MODEL DOES NOT FIT, 30G-pessimistic
+    window and bank on 128G Macs). When the resident policy arms, the
+    caller adds ``ngram_table_bytes`` back explicitly — see
+    ``memory_plan.ngram_table_resident_policy``."""
+    from mtplx.memory_plan import NGRAM_TABLE_FILENAME
+
     try:
         root = Path(str(model_path))
         if not root.is_dir():
             return None
         total = 0
         for shard in root.rglob("*.safetensors"):
+            if shard.name == NGRAM_TABLE_FILENAME:
+                continue
             try:
                 total += shard.stat().st_size
             except OSError:
@@ -197,6 +209,19 @@ def model_weights_bytes(model_path: Any) -> int | None:
         return total if total > 0 else None
     except Exception:
         return None
+
+
+def ngram_table_bytes(model_path: Any) -> int:
+    """Size of the Flash-Next n-gram sidecar next to the weights (0 when
+    absent). Kept separate from ``model_weights_bytes`` so callers count it
+    as a commitment exactly when the resident policy says it will be one."""
+    from mtplx.memory_plan import NGRAM_TABLE_FILENAME
+
+    try:
+        table = Path(str(model_path)) / NGRAM_TABLE_FILENAME
+        return table.stat().st_size if table.is_file() else 0
+    except Exception:
+        return 0
 
 
 def _memory_budget_bytes_env() -> int | None:
@@ -279,13 +304,18 @@ def _explicit_max_bytes_env_set() -> bool:
 
 def resolve_session_bank_max_bytes(
     model_bytes: int | None = None,
+    *,
+    memory_plan: Any | None = None,
 ) -> tuple[int, bool]:
     """MTPLX_SESSION_BANK_MAX_BYTES resolution with model-aware auto sizing.
 
     Returns ``(max_bytes, auto_active)``. Explicit byte values keep today's
-    semantics (auto_active False). Unset or ``auto`` computes half the
-    post-model RAM surplus when the model size is known; when it cannot be
-    computed the legacy flat default applies (auto_active False) so every
+    semantics (auto_active False). In auto mode a machine memory plan
+    (mtplx.memory_plan) wins when available: the bank takes everything the
+    engine envelope leaves after weights and transients (its dynamic
+    ceiling yields to live KV at runtime, so idle-aggressive is safe).
+    Without a plan the legacy half-surplus formula applies; when nothing
+    can be computed the flat default applies (auto_active False) so every
     legacy behavior stays byte-identical.
     """
     raw = os.environ.get("MTPLX_SESSION_BANK_MAX_BYTES")
@@ -296,6 +326,8 @@ def resolve_session_bank_max_bytes(
             ),
             False,
         )
+    if memory_plan is not None and getattr(memory_plan, "available", False):
+        return int(memory_plan.bank_idle_max_bytes), True
     auto = _auto_session_bank_max_bytes(model_bytes)
     if auto is not None:
         return auto, True
@@ -1313,6 +1345,7 @@ class EngineSessionManager:
         idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
         cold_tier: Any | None = None,
         model_weights_bytes: int | None = None,
+        memory_plan: Any | None = None,
     ) -> None:
         # Byte caps resolve model-aware by default (v2): unset or "auto" env
         # gives the bank half of the RAM surplus left after the model weights
@@ -1325,7 +1358,8 @@ class EngineSessionManager:
         # MTPLX_SESSION_BANK_MAX_ENTRIES (plain integer).
         if bank is None:
             resolved_max_bytes, auto_active = resolve_session_bank_max_bytes(
-                model_weights_bytes
+                model_weights_bytes,
+                memory_plan=memory_plan,
             )
             bank = SessionBank(
                 max_entries=_session_bank_max_entries(),
@@ -1337,11 +1371,67 @@ class EngineSessionManager:
                 idle_ttl_s=idle_ttl_s,
                 cold_tier=cold_tier,
             )
+            if (
+                auto_active
+                and memory_plan is not None
+                and getattr(memory_plan, "available", False)
+            ):
+                # The "guard that turns on" (#305): while live requests hold
+                # little KV the bank keeps its full idle budget; as a
+                # long-context request materializes KV, the ceiling walks
+                # down and evictions demote entries ahead of any swap.
+                # Working set = allocator active minus weights minus the
+                # bank's own bytes — the same attribution the dashboard
+                # reports. mlx is imported lazily so plan-carrying tests
+                # without a GPU fall back to the static budget (the bank
+                # counts, not swallows, ceiling failures).
+                from mtplx.memory_plan import (
+                    bank_dynamic_ceiling,
+                    transient_reserve_bytes,
+                )
+
+                def _dynamic_ceiling(
+                    _bank: SessionBank = bank, _plan: Any = memory_plan
+                ) -> int:
+                    import mlx.core as mx
+
+                    active = int(mx.get_active_memory())
+                    working = (
+                        active
+                        - int(_plan.model_weights_bytes)
+                        - int(_bank.total_nbytes)
+                    )
+                    # Observed spike (peak high-water over current active)
+                    # replaces the static 3 GiB reserve: a deep chunked
+                    # prefill measured 12.4 GiB over active, and with only
+                    # the static term the bank held entries while the
+                    # allocator peak kissed 0.99+ of the Metal limit —
+                    # tripping the warning banner on every long coding turn
+                    # (2026-08-29 receipts).
+                    reserve = transient_reserve_bytes(
+                        int(mx.get_peak_memory()),
+                        active,
+                        play_bytes=int(_plan.usable_bytes)
+                        - int(_plan.model_weights_bytes),
+                    )
+                    return bank_dynamic_ceiling(
+                        _plan, max(0, working), transient_bytes=reserve
+                    )
+
+                bank.dynamic_ceiling_fn = _dynamic_ceiling
             # Visible on the daemon console on purpose (#229/#230): the
             # 2.4.2 notes promised this line but it shipped as logger.info,
             # which default logging swallows — users debugging "the cache
             # stopped working" had no way to see the resolved budgets.
-            if auto_active:
+            if (
+                auto_active
+                and memory_plan is not None
+                and getattr(memory_plan, "available", False)
+            ):
+                budget_mode = (
+                    "auto: machine memory plan, yields to live KV"
+                )
+            elif auto_active:
                 budget_mode = "auto: half of post-model RAM surplus"
             elif _explicit_max_bytes_env_set():
                 budget_mode = "explicit"

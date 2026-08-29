@@ -17,7 +17,11 @@ import numpy as np
 import pytest
 from mlx_lm.models.cache import KVCache
 
-from mtplx.cache_state import TensorOffsetVllmMetalPagedKVCache, VllmMetalPagedKVCache
+from mtplx.cache_state import (
+    TensorOffsetQuantizedPagedKVCache,
+    TensorOffsetVllmMetalPagedKVCache,
+    VllmMetalPagedKVCache,
+)
 from mtplx.gdn_capture import commit_captured_prefix
 from mtplx.graphbank import (
     CompiledVerifyBank,
@@ -149,7 +153,7 @@ def _leaf_arrays(cache) -> list[mx.array]:
         if entry is None:
             continue
         if isinstance(entry, (TensorOffsetKVCache, TensorOffsetVllmMetalPagedKVCache)):
-            leaves.extend(entry.cache[:3])
+            leaves.extend(entry.cache)
         elif isinstance(entry, _arrays_cache_cls()):
             leaves.extend(item for item in entry.cache if item is not None)
         elif isinstance(entry, KVCache):
@@ -822,28 +826,354 @@ def test_fallback_reasons_for_unsupported_cache_containers():
     assert null_rt.calls == 3
 
 
-def test_quantized_paged_entries_fall_back(monkeypatch):
-    if not mx.metal.is_available():
-        pytest.skip("Metal is unavailable")
+class ToyQuantPagedRuntime(ToyHybridRuntime):
+    """ToyHybridRuntime whose full-attention layer lives in QUANTIZED pages.
+
+    The model dim stays at the parent's compile-bit-stable D=4 (the D=64
+    variant of the toy diverges under ``mx.compile`` by ~0.4 with a PLAIN
+    paged adapter too — a toy-graph fusion property, not an adapter one);
+    fixed projections lift K/V/Q to head dim 64, which puts the head inside
+    the packed-quant kernel's supported set so promotion takes the
+    quantized-adapter lane (5 leaves) end-to-end. The toy's attention math
+    reads the densified ``update_and_fetch`` state, so no Metal kernel is
+    dispatched — this exercises the promotion, spec, reseed, in-graph
+    quantized writes, state movement, mirror-commit, trim, and demote
+    plumbing.
+    """
+
+    HEAD_DIM = 64
+
+    def __init__(self, seed: int = 7, mode: str = "q4") -> None:
+        super().__init__(seed=seed)
+        self.mode = mode
+        mx.random.seed(seed + 1)
+        self.w_kp = 0.4 * mx.random.normal((self.D, self.HEAD_DIM)).astype(mx.float32)
+        self.w_vp = 0.4 * mx.random.normal((self.D, self.HEAD_DIM)).astype(mx.float32)
+        self.w_qp = 0.4 * mx.random.normal((self.D, self.HEAD_DIM)).astype(mx.float32)
+        self.w_ao = 0.4 * mx.random.normal((self.HEAD_DIM, self.D)).astype(mx.float32)
+
+    def make_cache(self) -> list:
+        from mtplx.kv_quant import PagedKVQuantConfig
+
+        gdn = _arrays_cache_cls()(2)
+        gdn[0] = mx.zeros((1, self.K, self.D), dtype=mx.float32)
+        gdn[1] = mx.zeros((1, 1, self.D, self.D), dtype=mx.float32)
+        paged = VllmMetalPagedKVCache(
+            block_size=8,
+            num_blocks=8,
+            kv_quant_config=PagedKVQuantConfig(self.mode),
+        )
+        return [gdn, paged]
+
+    def forward_ar_capture(
+        self,
+        input_ids,
+        cache=None,
+        return_hidden: bool = False,
+        hidden_variant: str | None = None,
+        capture_backend: str | None = None,
+    ):
+        del hidden_variant, capture_backend
+        self.calls.append("forward")
+        B, S = int(input_ids.shape[0]), int(input_ids.shape[1])
+        gdn_entry, attn_entry = cache
+        h = self.embed[input_ids]  # (B, S, D)
+
+        conv = gdn_entry.cache[0]
+        state = gdn_entry.cache[1]
+        conv_steps = []
+        state_steps = []
+        outs = []
+        for t in range(S):
+            x_t = h[:, t : t + 1, :]
+            conv = mx.concatenate([conv[:, 1:, :], x_t], axis=1)
+            mixed = mx.tanh(conv.reshape(B, -1) @ self.w_conv)  # (B, D)
+            state = mx.tanh(
+                state + mixed[:, None, :, None] * mixed[:, None, None, :]
+            )
+            conv_steps.append(conv)
+            state_steps.append(state)
+            outs.append(mx.sum(state, axis=-1))
+        gdn_entry[0] = conv
+        gdn_entry[1] = state
+        gdn_entry.advance(S)
+        h = h + mx.concatenate(outs, axis=1)
+
+        # Attention with head dim 64: KV written to the quantized paged
+        # cache via update_and_fetch, offset-masked readout as the parent.
+        keys = (h @ self.w_kp)[:, None, :, :]  # (B, 1, S, HEAD_DIM)
+        values = (h @ self.w_vp)[:, None, :, :]
+        k_buf, v_buf = attn_entry.update_and_fetch(keys, values)
+        offset = attn_entry.offset  # int (stock) or mx.array (adapter)
+        capacity = int(k_buf.shape[2])
+        q = h @ self.w_qp  # (B, S, HEAD_DIM)
+        scores = q @ mx.swapaxes(k_buf[:, 0, :, :], 1, 2)  # (B, S, T)
+        pos = mx.arange(capacity)
+        limit = offset - S + 1 + mx.arange(S)
+        mask = (pos[None, :] < limit[:, None]).astype(mx.float32)  # (S, T)
+        attn = (scores * mask[None, :, :]) @ v_buf[:, 0, :, :]  # (B, S, HEAD_DIM)
+        h = h + attn @ self.w_ao
+
+        hidden = h
+        logits = h @ self.w_out
+        captures = {
+            0: {
+                "conv_states": mx.stack(conv_steps, axis=1),
+                "states": mx.stack(state_steps, axis=1),
+            }
+        }
+        if return_hidden:
+            return logits, hidden, captures
+        return logits, captures
+
+
+def _build_quantized_paged(mode: str = "q8", *, dim: int = 64) -> VllmMetalPagedKVCache:
     from mtplx.kv_quant import PagedKVQuantConfig
 
-    monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
-    null_rt = NullRuntime()
-    bank = CompiledVerifyBank(null_rt)
     quantized = VllmMetalPagedKVCache(
         block_size=4,
         num_blocks=4,
-        kv_quant_config=PagedKVQuantConfig("q8"),
+        kv_quant_config=PagedKVQuantConfig(mode),
     )
     quantized.update_without_fetch(
-        mx.random.normal((1, 2, 5, 16), dtype=mx.float16),
-        mx.random.normal((1, 2, 5, 16), dtype=mx.float16),
+        mx.random.normal((1, 2, 5, dim), dtype=mx.float16),
+        mx.random.normal((1, 2, 5, dim), dtype=mx.float16),
     )
-    cache = [quantized]
+    return quantized
 
+
+@pytest.mark.parametrize("mode", ["q8", "q4"])
+def test_kv_quant_paged_entries_promote_and_run_compiled(monkeypatch, mode):
+    import mtplx.graphbank as graphbank_module
+
+    monkeypatch.setattr(graphbank_module, "_PREWARM_DONE", True)
+    monkeypatch.delenv("MTPLX_GRAPHBANK_QUANTIZED_PAGED", raising=False)
+    rt = ToyQuantPagedRuntime(mode=mode)
+    bank = CompiledVerifyBank(rt)
+    cache = _prefill(rt, [0, 1, 2])
+
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[0]]), cache=cache)
+
+    assert bank.stats["fallback_calls"] == 0, bank.stats["fallback_reasons"]
+    assert bank.stats["compiled_calls"] == 1
+    assert bank.stats["promoted"] == 1
+    entry = cache[1]
+    assert isinstance(entry, TensorOffsetQuantizedPagedKVCache)
+    assert len(entry.cache) == 5
+    spec, reason = build_verify_state_spec(cache)
+    assert reason is None
+    assert spec == [(0, "gdn", 2), (1, "fa", 5)]
+    assert int(entry.size()) == 6
+    # Mirror-commit cleared the full 5-slot rollback window.
+    assert entry.rollback_state == [None] * 5
+
+    # Second call replays the cached trace on stable leaf shapes/dtypes.
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[1]]), cache=cache)
+    assert bank.stats["compiled_calls"] == 2
+    assert bank.stats["traces"] == 1
+    assert int(entry.size()) == 9
+
+
+@pytest.mark.parametrize("mode", ["q8", "q4"])
+def test_kv_quant_compiled_state_evolution_matches_eager_reference(mode, monkeypatch):
+    """Accept-path session over quantized adapters: compiled vs pure eager.
+
+    The strong claim is STATE EVOLUTION: quantized payloads, fp32 scale
+    planes, offsets, and GDN slots must stay bit-identical between the
+    compiled-bank session and the pure-eager session at every step — that
+    is exactly the surface the quantized adapter owns (in-graph quantized
+    writes, mirror-commit, commit/trim interplay). Logits/hidden get a
+    small tolerance instead: ``mx.compile`` fuses this toy's readout with
+    different fp ordering than eager (measured 3e-5 on q8 with the state
+    bit-identical, and 0.385 on a PLAIN unquantized paged D=64 toy — no
+    quantization involved), so per-call output bit-exactness is the parity
+    harness's job (see test_kv_quant_parity_mode_passes_on_quantized_toy
+    and the production Gate A receipts), not a toy-graph property.
+    """
+    import mtplx.graphbank as graphbank_module
+
+    monkeypatch.setattr(graphbank_module, "_PREWARM_DONE", True)
+    keep_plan = [3, 2, 1, 3]
+
+    def run_session(compiled: bool):
+        rt = ToyQuantPagedRuntime(seed=7, mode=mode)
+        cache = _prefill(rt, [0, 1, 2])
+        bank = CompiledVerifyBank(rt) if compiled else None
+        if not compiled:
+            promoted, failures = promote_kv_cache_offsets(
+                cache, reserve_tokens=3, preserve_paged=True
+            )
+            assert promoted == 1 and failures == {}
+        outputs = []
+        for window, keep in zip(VERIFY_WINDOWS, keep_plan):
+            ids = mx.array([window])
+            if compiled:
+                logits, hidden, captures = bank.forward_ar_capture(ids, cache=cache)
+            else:
+                logits, hidden, captures = rt.forward_ar_capture(
+                    ids, cache=cache, return_hidden=True
+                )
+            committed = commit_captured_prefix(
+                cache,
+                captures,
+                keep_tokens=keep,
+                verified_tokens=len(window),
+            )
+            assert committed is True
+            offset = int(cache[1].size())
+            outputs.append(
+                {
+                    "logits": np.array(logits),
+                    "hidden": np.array(hidden),
+                    "gdn_conv": np.array(cache[0].cache[0]),
+                    "gdn_state": np.array(cache[0].cache[1]),
+                    "offset": offset,
+                    "k_bank": np.array(cache[1].cache[0][:, :, :offset, :]),
+                    "v_bank": np.array(cache[1].cache[1][:, :, :offset, :]),
+                    "k_scales": np.array(cache[1].cache[3][:, :, :offset, :]),
+                    "v_scales": np.array(cache[1].cache[4][:, :, :offset, :]),
+                }
+            )
+        if compiled:
+            assert bank.stats["compiled_calls"] == len(VERIFY_WINDOWS)
+            assert bank.stats["fallback_calls"] == 0
+        return outputs
+
+    compiled_outputs = run_session(compiled=True)
+    eager_outputs = run_session(compiled=False)
+
+    for step, (got, want) in enumerate(zip(compiled_outputs, eager_outputs)):
+        assert got["offset"] == want["offset"], f"step {step}"
+        for name in (
+            "gdn_conv",
+            "gdn_state",
+            "k_bank",
+            "v_bank",
+            "k_scales",
+            "v_scales",
+        ):
+            assert got[name].shape == want[name].shape, f"step {step}: {name}"
+            assert np.array_equal(got[name], want[name]), f"step {step}: {name}"
+        for name in ("logits", "hidden"):
+            assert got[name].shape == want[name].shape, f"step {step}: {name}"
+            assert np.allclose(
+                got[name], want[name], rtol=0.0, atol=1e-1
+            ), f"step {step}: {name}"
+
+
+def test_kv_quant_parity_mode_passes_on_quantized_toy(monkeypatch):
+    import mtplx.graphbank as graphbank_module
+
+    monkeypatch.setattr(graphbank_module, "_PREWARM_DONE", True)
+    rt = ToyQuantPagedRuntime(mode="q4")
+    bank = CompiledVerifyBank(rt, parity=True)
+    cache = _prefill(rt, [0, 1, 2])
+    for window in VERIFY_WINDOWS[:3]:
+        bank.forward_ar_capture(mx.array([window]), cache=cache)
+    assert bank.stats["parity_checks"] == 3
+    assert bank.stats["parity_failures"] == 0
+
+
+def test_kv_quant_reject_path_trim_takes_offset_only_branch(monkeypatch):
+    import mtplx.graphbank as graphbank_module
+
+    monkeypatch.setattr(graphbank_module, "_PREWARM_DONE", True)
+    rt = ToyQuantPagedRuntime(mode="q4")
+    bank = CompiledVerifyBank(rt)
+    cache = _prefill(rt, [0, 1, 2])
+
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[0]]), cache=cache)
+    entry = cache[1]
+    assert isinstance(entry, TensorOffsetQuantizedPagedKVCache)
+    assert entry.rollback_state == [None] * 5
+    assert entry.size() == 6
+
+    entry.trim(2)  # full-window reject of two tokens
+    assert entry.size() == 4
+    bank.forward_ar_capture(mx.array([[1, 3]]), cache=cache)
+    assert entry.size() == 6
+
+
+def test_kv_quant_bank_demote_restores_quantized_pages(monkeypatch):
+    import mtplx.graphbank as graphbank_module
+
+    monkeypatch.setattr(graphbank_module, "_PREWARM_DONE", True)
+    rt = ToyQuantPagedRuntime(mode="q4")
+    bank = CompiledVerifyBank(rt)
+    cache = _prefill(rt, [0, 1, 2])
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[0]]), cache=cache)
+    adapter = cache[1]
+    assert isinstance(adapter, TensorOffsetQuantizedPagedKVCache)
+    bank_prefix = np.array(adapter.cache[0][:, :, :6, :])
+
+    count = bank.demote(cache)
+
+    assert count == 1
+    restored = cache[1]
+    assert isinstance(restored, VllmMetalPagedKVCache)
+    assert restored.kv_quant and int(restored.kv_quant_config.bits) == 4
+    assert int(restored.offset) == 6
+    assert restored.key_scale_cache is not None
+    heads = int(restored.key_cache.shape[2])
+    pages_prefix = np.array(
+        restored.key_cache.reshape(-1, heads, restored.key_cache.shape[3])[:6]
+        .transpose(1, 0, 2)[None, ...]
+    )
+    assert np.array_equal(bank_prefix, pages_prefix)
+    # The restored eager cache keeps working: append + attention arrays.
+    restored.update_without_fetch(
+        mx.random.normal((1, 1, 2, 64), dtype=mx.float32),
+        mx.random.normal((1, 1, 2, 64), dtype=mx.float32),
+    )
+    assert int(restored.offset) == 8
+
+
+def test_turboquant_paged_entries_still_fall_back(monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
+    null_rt = NullRuntime()
+    bank = CompiledVerifyBank(null_rt)
+    quantized = _build_quantized_paged("q8")
+    quantized.turboquant = True  # TurboQuant pages: no adapter understands them
+
+    cache = [quantized]
     bank.forward_ar_capture(mx.array([[0, 1]]), cache=cache)
 
     assert bank.stats["fallback_reasons"]["quantized_paged_kv"] == 1
+    assert cache[0] is quantized  # never promoted, never densified
+
+
+def test_kv_quant_promotion_env_kill_switch_restores_refusal(monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
+    monkeypatch.setenv("MTPLX_GRAPHBANK_QUANTIZED_PAGED", "0")
+    null_rt = NullRuntime()
+    bank = CompiledVerifyBank(null_rt)
+    quantized = _build_quantized_paged("q8")
+
+    cache = [quantized]
+    bank.forward_ar_capture(mx.array([[0, 1]]), cache=cache)
+
+    assert bank.stats["fallback_reasons"]["quantized_paged_kv"] == 1
+    assert cache[0] is quantized
+
+
+def test_kv_quant_unsupported_geometry_fails_closed(monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal is unavailable")
+    monkeypatch.delenv("MTPLX_GRAPHBANK_PRESERVE_PAGED_KV", raising=False)
+    monkeypatch.delenv("MTPLX_GRAPHBANK_QUANTIZED_PAGED", raising=False)
+    null_rt = NullRuntime()
+    bank = CompiledVerifyBank(null_rt)
+    # Head dim 16 is outside the packed-quant kernel's {64, 128, 256} set.
+    quantized = _build_quantized_paged("q8", dim=16)
+
+    cache = [quantized]
+    bank.forward_ar_capture(mx.array([[0, 1]]), cache=cache)
+
+    assert bank.stats["fallback_reasons"]["quantized_paged_kv_geometry"] == 1
     assert cache[0] is quantized  # never promoted, never densified
 
 

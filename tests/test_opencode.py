@@ -82,12 +82,18 @@ def test_build_opencode_config_carries_family_effort_dial():
     # transport); an effort variant picked inside OpenCode merges after model
     # options and wins for that request.
     assert model["options"] == {"reasoningEffort": "medium"}
-    # OpenCode's built-in effort picker is trimmed to the family dial:
-    # tiers outside xhigh/medium/low are disabled, valid tiers stay.
+    # OpenCode's effort picker is trimmed to the family dial: tiers outside
+    # xhigh/medium/low are disabled, and every family tier is declared as an
+    # explicit variant — Desktop 1.18.21 does not surface its built-in list
+    # for custom openai-compatible providers (xhigh was missing live), and an
+    # explicit variant renders on every version.
     assert model["variants"] == {
         "none": {"disabled": True},
         "minimal": {"disabled": True},
         "high": {"disabled": True},
+        "xhigh": {"reasoningEffort": "xhigh"},
+        "medium": {"reasoningEffort": "medium"},
+        "low": {"reasoningEffort": "low"},
     }
 
 

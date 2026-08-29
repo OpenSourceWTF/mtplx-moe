@@ -67,7 +67,7 @@ public struct HuggingFaceProbe: Sendable {
             return OtherModelProbe(
                 verdict: .noMTP,
                 hfRepo: repo,
-                message: "No MTP heads. You'll lose speculative decoding (~2-3× slower)."
+                message: "MTP unavailable — runs autoregressive (no speculative speed boost, ~2-3× slower than an MTP build)."
             )
         }
 

@@ -1,10 +1,11 @@
 """KV-quant memory honesty and per-request numerics routing (F29).
 
 The kv_quant dequant mirror must never invert the feature's memory promise:
-it is offset-sized (not capacity-sized), q8-only (q4 can never reach the q8
-kernel, so a persistent bf16 mirror would sit on top of the quantized store
-for the whole request), released when a request latches the q8-kernel route,
-and it survives quantized-store growth without a full rebuild. Numerics are
+it is offset-sized (not capacity-sized), q8-only (q4 never builds a bf16
+mirror — its kernel route reads the head-major QUANTIZED bank instead, and
+its dequant fallbacks materialize transiently), released when a request
+latches the q8-kernel route, and it survives quantized-store growth without
+a full rebuild. Numerics are
 routed once per request: a request must not hop between kernel math and
 dequant math because its offset crossed the two-pass threshold
 mid-generation (temp-0 exactness). trim() deliberately keeps the latched
@@ -97,8 +98,9 @@ def test_q8_mirror_is_offset_sized_not_capacity_sized(monkeypatch):
 
 
 def test_q4_allocates_no_mirror(monkeypatch):
-    """q4 can never reach the q8 kernel, so a persistent mirror would just
-    stack bf16 on top of the quantized store forever: it must not exist."""
+    """q4 never builds the bf16 mirror (its kernel route reads the quantized
+    bank instead): a persistent bf16 mirror would just stack bf16 on top of
+    the quantized store forever, so it must not exist."""
 
     _skip_without_metal()
     monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "1")
@@ -307,13 +309,16 @@ def test_kv_quant_route_survives_verify_reject_trim(monkeypatch):
 
 
 def test_kv_quant_route_is_structurally_dequant_when_kernel_cannot_engage(monkeypatch):
-    """q4 and sliding-window layers can never use the q8 kernel: their
-    route latches dequant regardless of offset."""
+    """Kill-switched q4, geometry the packed-quant kernel refuses, and
+    sliding-window layers cannot use a kv_quant kernel: their route latches
+    dequant regardless of offset."""
 
     _skip_without_metal()
     monkeypatch.setenv("MTPLX_KV_QUANT_2PASS_KERNEL", "1")
     monkeypatch.setenv("MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD", "64")
 
+    # q4 with the dedicated kill-switch off: structurally dequant.
+    monkeypatch.setenv("MTPLX_KV_QUANT_Q4_KERNEL", "0")
     q4_cache = _build_cache("q4", block_size=16, num_blocks=16)
     keys, values = _rows(200, seed=808)
     with attention_phase("prefill"):
@@ -323,6 +328,23 @@ def test_kv_quant_route_is_structurally_dequant_when_kernel_cannot_engage(monkey
     assert out is not None
     assert q4_cache.paged_stats()["kv_quant_route"] == "dequant"
     assert q4_cache.kv_quant_kernel_calls == 0
+    monkeypatch.delenv("MTPLX_KV_QUANT_Q4_KERNEL")
+
+    # q4 head_dim outside the packed-quant kernel's {64, 128, 256} set:
+    # structurally dequant even with every switch on.
+    narrow = _build_cache("q4", block_size=16, num_blocks=16)
+    mx.random.seed(818)
+    narrow_keys = 0.5 * mx.random.normal((1, KV_HEADS, 200, 96), dtype=mx.float16)
+    narrow_values = 0.5 * mx.random.normal((1, KV_HEADS, 200, 96), dtype=mx.float16)
+    with attention_phase("prefill"):
+        narrow.update_without_fetch(narrow_keys, narrow_values)
+    mx.random.seed(819)
+    narrow_q = 0.3 * mx.random.normal((1, Q_HEADS, 1, 96), dtype=mx.float16)
+    with attention_phase("ar_decode"):
+        out = narrow.paged_attention(narrow_q, scale=96**-0.5, mask="causal")
+    assert out is not None
+    assert narrow.paged_stats()["kv_quant_route"] == "dequant"
+    assert narrow.kv_quant_kernel_calls == 0
 
     windowed = _build_cache("q8", block_size=16, num_blocks=16)
     with attention_phase("prefill"):

@@ -613,6 +613,11 @@ def install_qwen4_capture_route(runtime: Any, *, config: dict[str, Any]) -> dict
     runtime.prepare_compiled_verify_aux = MethodType(
         _prepare_compiled_verify_aux, runtime
     )
+    # The exact 16K/1K production shape proves the full stock cap before the
+    # generic probation policy can pay for extra short verify rounds. Bind the
+    # measured schedule at installation so the enabled Qwen4 lane has no
+    # per-cycle eligibility or family check.
+    runtime.context_copy_probation_k = 24
     return {"installed": True, "linear_layers": 36, "rows": 2}
 
 

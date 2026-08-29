@@ -43,6 +43,11 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         # able to force it off/on per launch for A/B work.
         "MTPLX_GQA_PACKED_SDPA",
         "MTPLX_GQA_PACKED_SDPA_THRESHOLD",
+        # Dense-decode context ceiling (2026-08-26): past it the auto layout
+        # repages decode and the packed lane is structurally excluded — the
+        # 147.4k decode cliff. Operators must be able to sweep it per launch.
+        "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT",
+        "MTPLX_SUSTAINED_PREFILL_LAYOUT",
         # Compiled-verify commit-first donation (speed-war Lane A2): same
         # A/B requirement — an explicit env must beat the profile default.
         "MTPLX_COMPILED_VERIFY_DONATION",
@@ -68,6 +73,18 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         # rung list per machine/benchmark; an explicit env must beat the
         # turbo default below, same precedent as the chunk-size knobs.
         "MTPLX_WARMUP_LADDER",
+        # Long-generation decay levers (2026-08-28): the uncapped-chat decay
+        # investigation sweeps these against the shipping turbo profile, and
+        # per-round event capture is how the growth term is attributed.
+        # Same operator-A/B precedent as DONATION/LAZY above.
+        "MTPLX_CLEAR_CACHE_EVERY",
+        "MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD",
+        "MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT",
+        "MTPLX_MTP_HISTORY_LAST_WINDOW",
+        "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD",
+        "MTPLX_DROP_EVENTS",
+        "MTPLX_SKIP_VERIFY_SNAPSHOT",
+        "MTPLX_FAMILY_CAPTURE_COMMIT",
     }
 )
 
@@ -146,6 +163,17 @@ QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID = "mtplx-qwen38-27b-optimized-speed-
 QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID = (
     "mtplx-qwen38-27b-optimized-quality-fp16"
 )
+# Qwen 3.8 Flash-Next serve identities (2026-08-27 turbo-first-class
+# promotion). The public ids equal the model_catalog aliases so catalog
+# installs, `mtplx pull mtplx-flash-next-*`, and served-dir name inference
+# all converge on one identity. Derivative packs (-hc8, -v1a, RC dirs) fall
+# through to sanitized names by the exact-equality fence in default_models.
+FLASH_NEXT_BARE_SPEED_HF_MODEL_ID = "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed"
+FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID = (
+    "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed"
+)
+FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID = "mtplx-flash-next-bare-speed"
+FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID = "mtplx-flash-next-optimized-speed"
 # Public default (2026-08-15, founder ruling on the Qwen3.8 release): the
 # Qwen 3.8 Optimized Speed dynamic 4-bit build is the recommended pick and the
 # fresh-install default on modern Apple Silicon. Its weights are published on
@@ -266,6 +294,44 @@ def announce_runtime_gated_env(
 MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
     {
         *NATIVE_MTP_60_FAST_PATH_ENV,
+        "MTPLX_AR_PIPELINE",
+        "MTPLX_COMPILED_GDN",
+        "MTPLX_DEFER_REPAIR_EVAL",
+        "MTPLX_FAMILY_CAPTURE_COMMIT",
+        "MTPLX_NGRAM_RESIDENT",
+        "MTPLX_FUSED_GATE_UP",
+        "MTPLX_FUSED_GDN_INPROJ",
+        "MTPLX_FUSED_GDN_OUT",
+        "MTPLX_FUSED_QSA_QKV",
+        "MTPLX_FUSED_GDN_CONVNORM",
+        # One-dispatch GDN decode step (2026-08-27 family default; two
+        # boot-triple receipt in the server's family octet comment).
+        "MTPLX_FUSED_GDN_STEP",
+        # Verify-width conv+silu+l2norm rows kernel (2026-08-27 candidate,
+        # A/B pending — registered ahead of any default flip per the
+        # boot-time-validator lesson in mistakes/).
+        "MTPLX_FUSED_CONVNORM_VERIFY",
+        # QSA decode gather lane (2026-08-27 candidate): selected-token
+        # gather + maskless SDPA instead of dense-bool-mask over full KV.
+        # Long-context A/B pending; registered ahead per the same lesson.
+        "MTPLX_QSA_GATHER",
+        # Rows-gather routing knobs (2026-08-28, adapting PR #380): S>1
+        # engage floor by KV length and the served row-width ceiling.
+        # Registered ahead of any default flip per the boot-trap law.
+        "MTPLX_QSA_GATHER_MIN_CONTEXT",
+        "MTPLX_QSA_GATHER_MAX_ROWS",
+        # QSA block-sparse flash-skip attention (2026-08-27 candidate):
+        # selected blocks iterated inside the kernel, no staging/copies.
+        "MTPLX_QSA_FLASH",
+        # n-gram hot-row LRU size in MB for the streamed sidecar
+        # (2026-08-28, default 1024; 0 disables) — registered ahead per the
+        # boot-trap law so packs/profiles may stamp it.
+        "MTPLX_NGRAM_HOT_MB",
+        # Family-scoped NAX neutralize (2026-08-27): qwen4_exp holds the 27B
+        # NAX verify patch OFF under turbo until it earns a family receipt.
+        "MTPLX_NAX_VERIFY",
+        "MTPLX_FUSED_HC_V3",
+        "MTPLX_FUSED_MOE_DECODE",
         "MTPLX_MTP_HISTORY_POLICY",
         "MTPLX_MTP_HISTORY_LAST_WINDOW",
         "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD",
@@ -350,10 +416,16 @@ SUSTAINED_PREFILL_ENV = {
     **NATIVE_MTP_60_FAST_PATH_ENV,
     "MTPLX_SUSTAINED_PREFILL": "1",
     "MTPLX_SUSTAINED_PREFILL_LAYOUT": "auto",
-    # Keep the v0.2 sustained default through the 128k class: current release
-    # QA shows this is the better OpenCode/Pi user path for TTFT, prefill TPS,
-    # decode TPS, and memory than the short-lived dense/repage chunk split.
-    "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT": "131072",
+    # "auto" (2.9.3): memory-aware dense-decode ceiling, floored at the old
+    # 131072 literal so no machine regresses. The fixed 131072 was a memory
+    # guess, not a kernel envelope — past 2^17 tokens the auto layout repaged
+    # decode and structurally excluded the packed fast-SDPA lane (the 147.4k
+    # decode cliff: 12.0 -> 18.44 tok/s once dense decode holds; walk ladders
+    # show both kernels linear through 2^17, MEASUREMENTS 2026-08-26). The
+    # resolver budgets 15% of device RAM against the model's KV bytes/token
+    # (MTPLX_DENSE_KV_BYTES_PER_TOKEN) and announces its resolution in the
+    # serve log.
+    "MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT": "auto",
     # MTPLX_PREFILL_CHUNK_SIZE is retained as a legacy single-knob fallback:
     # if set to a numeric value it overrides BOTH paths. "auto" resolves to
     # the per-layout defaults below, which intentionally match in product mode.

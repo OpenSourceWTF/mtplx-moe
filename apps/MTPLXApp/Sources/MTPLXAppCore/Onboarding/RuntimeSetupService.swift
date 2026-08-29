@@ -232,7 +232,16 @@ public struct RuntimeSetupService: Sendable {
         rows.update(.globalCLI, .running, "Checking for an existing mtplx command")
         publish()
 
-        guard let globalCLI = MTPLXCommandBuilder.detectGlobalCLIExecutable(
+        // The user's login shell is the only honest oracle for which
+        // executable `mtplx` actually runs in their terminal — the app's
+        // Finder-launched PATH lacks the shell rc's /opt/homebrew/bin
+        // ordering and certified a false green (2026-08-28 receipt: setup
+        // said "Up to date (2.10.0)" while `command -v MTPLX` served the
+        // Homebrew 2.9.2). Fall back to the in-process scan when the probe
+        // fails.
+        guard let globalCLI = MTPLXCommandBuilder.detectShellWinningCLIExecutable(
+            environment: processEnvironment
+        ) ?? MTPLXCommandBuilder.detectGlobalCLIExecutable(
             environment: processEnvironment
         ) else {
             // No user-managed CLI anywhere — install the terminal

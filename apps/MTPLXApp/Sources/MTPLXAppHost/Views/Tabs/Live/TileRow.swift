@@ -188,7 +188,12 @@ struct TileRow: View {
                 value: memoryValue(mem: mem),
                 unit: memoryUnit(machine: machine),
                 systemImage: "memorychip",
-                caption: memoryCaption(mem: mem, machine: machine),
+                caption: memoryCaption(
+                    mem: mem,
+                    machine: machine,
+                    pressureLevel: backend.memoryPressureLevel,
+                    recentShed: backend.memoryGuardRecentShed
+                ),
                 liftIndex: 2
             ),
             TileSpec(
@@ -358,13 +363,27 @@ struct TileRow: View {
         return "/ \(Format.gigabytes(total))"
     }
 
-    private func memoryCaption(mem: MemSnapshot?, machine: HealthPayload?) -> String? {
+    private func memoryCaption(
+        mem: MemSnapshot?, machine: HealthPayload?, pressureLevel: Int = 0,
+        recentShed: Bool = false
+    ) -> String? {
         guard let used = mem.flatMap({ ($0.activeMemoryBytes ?? 0) + ($0.cacheMemoryBytes ?? 0) }),
               let total = machine?.unifiedMemoryBytes,
               total > 0
         else { return nil }
         let pct = Double(used) / Double(total)
-        return "\(Format.percent(pct, fractionDigits: 0)) used"
+        // The raw (unclamped) percentage stays — 129% is a receipt, not a
+        // rendering bug — but past 100% or under pressure the caption says
+        // what it means instead of leaving the user to guess (#305).
+        let base = "\(Format.percent(pct, fractionDigits: 0)) used"
+        if pressureLevel >= 4 { return base + " · critical pressure" }
+        // Same contract as the banner (605a1006): a shed claim requires an
+        // actual shed in the guard ring, never pressure level alone.
+        if pressureLevel >= 2 {
+            return base + (recentShed ? " · pressure, shedding cache" : " · memory pressure")
+        }
+        if pct > 1.0 { return base + " · over budget" }
+        return base
     }
 
     // MARK: Average prefill tile

@@ -32,6 +32,10 @@ from .models.laguna_config import (
 from .profiles import (
     DEFAULT_FP16_HF_MODEL_ID,
     DEFAULT_FP16_PUBLIC_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     LEGACY_OPTIMIZED_HF_MODEL_ID,
     LEGACY_OPTIMIZED_PUBLIC_MODEL_ID,
     OPTIMIZED_SPEED_V1_HF_MODEL_ID,
@@ -92,6 +96,8 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     QWEN38_BARE_SPEED_FP16_PUBLIC_MODEL_ID: QWEN38_BARE_SPEED_FP16_HF_MODEL_ID,
     QWEN38_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID: QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     QWEN38_OPTIMIZED_QUALITY_FP16_PUBLIC_MODEL_ID: QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
+    FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID: FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    FLASH_NEXT_OPTIMIZED_SPEED_PUBLIC_MODEL_ID: FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
     # Artifact-basename aliases (folder-name style).
     "qwen3.5-9b-mtplx-optimized-speed": QWEN35_9B_OPTIMIZED_SPEED_HF_MODEL_ID,
     "qwen3.5-9b-mtplx-optimized-speed-fp16": QWEN35_9B_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
@@ -111,6 +117,14 @@ _KNOWN_PUBLIC_MODEL_ALIASES = {
     "qwen3.8-27b-mtplx-optimized-speed-fp16": QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
     "qwen3.8-27b-mtplx-optimized-quality-fp16": QWEN38_OPTIMIZED_QUALITY_FP16_HF_MODEL_ID,
     "qwen3.8-27b-mtplx-optimized-quality": QWEN38_OPTIMIZED_QUALITY_HF_MODEL_ID,
+    # Flash-Next basenames are derived, not hand-copied: this table drifted
+    # from model_catalog and commands/public once already, which broke the
+    # release-notes command `mtplx pull mtplx-flash-next-bare-speed`.
+    # test_public_model_id_alias_tables_agree keeps all three in agreement.
+    Path(FLASH_NEXT_BARE_SPEED_HF_MODEL_ID).name.lower(): FLASH_NEXT_BARE_SPEED_HF_MODEL_ID,
+    Path(
+        FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID
+    ).name.lower(): FLASH_NEXT_OPTIMIZED_SPEED_HF_MODEL_ID,
 }
 
 
@@ -900,6 +914,11 @@ def _mtp_pattern_from_config(config: dict[str, Any]) -> str | None:
     raw = (
         tcfg.get("mtp_hybrid_override_pattern")
         or config.get("mtp_hybrid_override_pattern")
+        # Official NVIDIA Nemotron-H configs describe the MTP stack as a
+        # block-type name list; it must outrank the backbone-wide fallback
+        # keys or the backbone pattern shadows the MTP stack (issue #341).
+        or tcfg.get("mtp_layers_block_type")
+        or config.get("mtp_layers_block_type")
         or tcfg.get("hybrid_override_pattern")
         or config.get("hybrid_override_pattern")
         or tcfg.get("layers_block_type")

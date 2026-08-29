@@ -337,6 +337,7 @@ struct TuneStep: View {
         case "qwen3_5": return "Qwen 3.5"
         case "qwen3_6": return "Qwen 3.6"
         case "qwen3_8": return "Qwen 3.8"
+        case "qwen4_exp": return "Flash-Next"
         default: return "This model"
         }
     }

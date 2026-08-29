@@ -539,6 +539,65 @@ public struct MTPLXCommandBuilder: Sendable {
         return nil
     }
 
+    /// The executable a real terminal resolves for `mtplx`/`MTPLX`, probed
+    /// through the user's login shell. The app's own process PATH is the
+    /// wrong oracle: a Finder-launched app never inherits the shell rc's
+    /// /opt/homebrew/bin ordering, so setup certified "up to date (2.10)"
+    /// off a launcher the user's terminal never wins with while
+    /// `command -v MTPLX` served Homebrew 2.9.x (issue receipt 2026-08-28).
+    /// Returns nil when the probe fails or only resolves the app-owned
+    /// runtime; callers then fall back to the in-process PATH scan.
+    public static func detectShellWinningCLIExecutable(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        // Hermetic-test escape hatch, same contract as searchPaths: a caller
+        // that disabled standard paths is describing a fabricated seat, and
+        // probing the real login shell would leak this machine's PATH into
+        // it (19 suite failures when this probe first landed unguarded).
+        if environment["MTPLX_APP_DISABLE_STANDARD_PATHS"]?.isEmpty == false {
+            return nil
+        }
+        let shell = (environment["SHELL"]?.isEmpty == false ? environment["SHELL"]! : "/bin/zsh")
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: shell)
+        // -l loads the user's login rc (where PATH order actually comes
+        // from); command -v prints one resolution per name.
+        probe.arguments = ["-l", "-c", "command -v mtplx; command -v MTPLX"]
+        let out = Pipe()
+        probe.standardOutput = out
+        probe.standardError = Pipe()
+        do {
+            try probe.run()
+        } catch {
+            return nil
+        }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        probe.waitUntilExit()
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let appRuntimeBin = appRuntimeBinDirectory(environment: environment)
+        let appRuntimeBinResolved = URL(fileURLWithPath: appRuntimeBin)
+            .resolvingSymlinksInPath()
+            .path
+        for line in text.split(separator: "\n") {
+            let path = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard path.hasPrefix("/"),
+                  FileManager.default.isExecutableFile(atPath: path)
+            else { continue }
+            if isDevelopmentWrapper(path) { continue }
+            let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+            if resolved.hasPrefix(appRuntimeBin + "/")
+                || resolved.hasPrefix(appRuntimeBinResolved + "/")
+                || path.hasPrefix(appRuntimeBin + "/")
+            {
+                // The app-owned launcher winning the user's PATH is the
+                // healthy state, not a foreign CLI to grade.
+                continue
+            }
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
     public static func isDevelopmentWrapperPath(_ candidatePath: String) -> Bool {
         let candidate = URL(fileURLWithPath: candidatePath).resolvingSymlinksInPath()
         guard candidate.lastPathComponent.lowercased() == "mtplx" else { return false }
@@ -719,11 +778,18 @@ struct ResolvedDaemonArgs {
             processEnvironment: processEnvironment
         )
 
-        let targetOwnsScheduling =
-            target == .chat
-            || target == .openWebUI
-            || target == .hermes
-            || target == .benchmark
+        // Issue #325: Settings' Performance mode promises "use it
+        // everywhere", so every serving target honors an EXPLICIT
+        // scheduling choice (schedulingPreset != "target-default", or an
+        // overridden numeric knob). The per-target preset only fills the
+        // Auto case — Auto launches are byte-identical to before.
+        // Benchmark is the one deliberate exception: the AIME overlay
+        // spawns a measurement daemon whose serial single-stream lane
+        // keeps scores comparable across users, and a leftover
+        // throughput experiment in Settings must not contaminate
+        // benchmark numbers. The Settings caption names that exception
+        // so nothing is silently discarded.
+        let targetOwnsScheduling = target == .benchmark
         let scheduling = targetOwnsScheduling
             ? .targetDefault
             : SchedulingOverridePreset(configuration.schedulingPreset)
@@ -1066,6 +1132,7 @@ private enum ModelLaunchFamily {
     case qwen36_27BOptimizedQuality
     case qwen35_9BOptimizedSpeed
     case qwen38_27B
+    case flashNext
     case gemma4
     case step
     case hy3
@@ -1091,6 +1158,16 @@ private enum ModelLaunchFamily {
             || normalized.contains("qwen35-9b-optimized-speed")
         {
             return .qwen35_9BOptimizedSpeed
+        }
+        // Flash-Next (qwen4_exp) BEFORE the 3.8 family test: the pack
+        // names carry "Qwen3.8-Flash-Next" and must not be claimed by the
+        // dense-27B launch contract (engine twin:
+        // descriptors._QWEN4_PREVIEW_MARKER routes flash-next away first).
+        if normalized.contains("flash-next")
+            || normalized.contains("flashnext")
+            || MTPLXModelOption.modelFamily(for: model) == "qwen4_exp"
+        {
+            return .flashNext
         }
         // Qwen3.8 27B MTPLX family (Bare Speed / Optimized Speed /
         // Optimized Quality). Trunk geometry is identical to the Qwen3.6
@@ -1268,6 +1345,8 @@ private struct TargetPreset {
             return applyingQwen35_9BOptimizedSpeedDefaults()
         case .qwen38_27B:
             return applyingQwen38_27BDefaults()
+        case .flashNext:
+            return applyingFlashNextDefaults()
         case .qwenDefault:
             return self
         case .gemma4:
@@ -1349,6 +1428,38 @@ private struct TargetPreset {
         // same draft sampler for the same artifact (incl. the FP16 siblings)
         // and a stamp change never needs an app release. A user-set sampler
         // in Settings still carries to the draft, as for every family.
+        return preset
+    }
+
+    private func applyingFlashNextDefaults() -> TargetPreset {
+        var preset = self
+        // Flash-Next (qwen4_exp) shares the 27B's Qwen think-tag codec but
+        // its family default effort is xhigh (engine
+        // QWEN4_EXP_REASONING_CODEC, founder call 2026-08-28); pinning it
+        // here keeps the app launch on the family default the way the Step
+        // preset does. A user-set effort in Settings still overrides.
+        // Profile, sampler, and draft sampler are deliberately NOT pinned:
+        // the engine's qwen4_exp contract (QWEN4_EXP_SAMPLER_DEFAULTS, the
+        // turbo allowlist, the artifact draft-sampler stamp) owns them, so
+        // the app and the CLI launch identically.
+        preset.reasoningParser = "qwen3"
+        preset.reasoningEffort = "xhigh"
+        // "NOT pinned" must also hold on targets whose preset pre-fills the
+        // 3.6-era coding sampler (openCode/hermes 0.6, pi's top-p/top-k):
+        // an inherited value reaches `mtplx serve` as an explicit flag, which
+        // suppresses the boot-time pack-stamp injection and served OpenCode
+        // Flash-Next at target 0.6 against the family's 1.0 — with the draft
+        // still at the stamp's 1.0, a mismatched verify pair (request-log
+        // receipt 2026-08-28, port 8000). Clearing the slots restores the
+        // zero-flag boot path on those targets (they never carry the
+        // Settings sampler — targetCarriesSettingsSampler); chat-lane
+        // targets still carry a user-set Settings sampler unchanged.
+        preset.temperature = nil
+        preset.topP = nil
+        preset.topK = nil
+        preset.draftTemperature = nil
+        preset.draftTopP = nil
+        preset.draftTopK = nil
         return preset
     }
 
@@ -1541,7 +1652,8 @@ private struct TargetPreset {
             // In-app chat is one foreground stream. Keep its daemon launch
             // aligned with the old browser WebUI path; coding-agent runtime
             // extras belong to Pi/OpenCode/custom-client targets, not plain
-            // chat.
+            // chat. Auto-mode default only: an explicit Settings
+            // Performance mode overrides this preset (#325).
             return TargetPreset(
                 schedulerMode: "serial",
                 batchingPreset: "solo",
@@ -1635,9 +1747,10 @@ private struct TargetPreset {
             )
         case .hermes:
             // Hermes is a foreground coding agent, not a generic batch client.
-            // Keep it on the measured OpenCode latency lane so Settings'
-            // throughput/agent batching experiments cannot silently slow the
-            // agent chat path. Draft sampler stays model/stamp-owned — never
+            // Auto keeps it on the measured OpenCode latency lane so target
+            // drift cannot silently slow the agent chat path; an explicit
+            // Settings Performance mode overrides it like every serving
+            // target (#325). Draft sampler stays model/stamp-owned — never
             // target-pinned (see the openCode case).
             var env = codingAgentRuntimeEnvironment(
                 processEnvironment: processEnvironment

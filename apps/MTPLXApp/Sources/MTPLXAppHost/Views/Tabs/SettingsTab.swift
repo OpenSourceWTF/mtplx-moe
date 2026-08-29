@@ -126,7 +126,7 @@ struct SettingsTab: View {
             VStack(alignment: .leading, spacing: 6) {
                 FormRow(
                     label: "Mode",
-                    caption: "Auto picks the best mode for what you're using. Pick a mode below to use it everywhere."
+                    caption: "Auto picks the best mode for what you're using. Pick a mode below to use it everywhere. Benchmark runs keep their own single-stream setup."
                 ) {
                     Picker("Mode", selection: schedulerPresetBinding) {
                         Text("Auto").tag("target-default")
@@ -1000,7 +1000,7 @@ struct SettingsTab: View {
                 FormRow(
                     label: "Profile",
                     caption: "Auto picks the recommended profile for the "
-                        + "selected model — Turbo for the 27B models."
+                        + "selected model — Turbo for the 27B and Flash-Next models."
                 ) {
                     // Only persistable profiles may appear here; a stray
                     // tag value persists into config and kills serve at
@@ -1320,6 +1320,17 @@ struct SettingsTab: View {
                 restartRequired: true,
                 proofLevel: "not_supported",
                 disabledReason: "KV quantization is not supported for Step."
+            )
+        case "qwen4_exp":
+            // Mirrors QWEN4_EXP_KV_QUANT_POLICY in backends/descriptors.py:
+            // the paged KV-quant lane never converts this family's QSA
+            // caches, and the hybrid design keeps KV small by construction.
+            return KVQuantPolicy(
+                supported: false,
+                modes: ["off"],
+                restartRequired: true,
+                proofLevel: "not_supported",
+                disabledReason: "Flash-Next keeps KV on 12 of 48 layers (~24 KB/token), and its QSA attention has no validated quantized-cache lane yet."
             )
         default:
             return KVQuantPolicy(

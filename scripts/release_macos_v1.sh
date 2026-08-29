@@ -30,6 +30,32 @@ if [[ ! "$VERSION" =~ ^[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
+# Sparkle ranks releases purely by CFBundleVersion, and the semantic
+# derivation in build_and_run.sh (major*1000000 + minor*1000 + patch) has
+# drifted below shipped reality: 2.9.1 shipped as 2009009 and 2.9.2 as
+# 2009010, so a derived 2.9.3 (2009003) would rank BELOW the shipped 2.9.2
+# and never be offered to updaters — while 2.9.2 could be offered "back" to
+# 2.9.3 users. Refuse, before any expensive gate runs, any build number
+# that does not strictly advance the local shipping record.
+CANDIDATE_BUILD="$APP_BUILD"
+if [[ -z "$CANDIDATE_BUILD" ]]; then
+  IFS='.' read -r _bn_major _bn_minor _bn_patch <<<"$VERSION"
+  CANDIDATE_BUILD="$((10#$_bn_major * 1000000 + 10#$_bn_minor * 1000 + 10#$_bn_patch))"
+fi
+LAST_SHIPPED_BUILD=0
+for _bn_manifest in "$HOME"/.mtplx/releases/*/site/releases/latest.json; do
+  [[ -f "$_bn_manifest" ]] || continue
+  _bn_val="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("app_build",""))' "$_bn_manifest" 2>/dev/null || true)"
+  [[ "$_bn_val" =~ ^[0-9]+$ ]] || continue
+  if (( _bn_val > LAST_SHIPPED_BUILD )); then LAST_SHIPPED_BUILD="$_bn_val"; fi
+done
+if (( LAST_SHIPPED_BUILD > 0 && CANDIDATE_BUILD <= LAST_SHIPPED_BUILD )); then
+  echo "error: build number $CANDIDATE_BUILD does not advance the last shipped CFBundleVersion $LAST_SHIPPED_BUILD" >&2
+  echo "       Sparkle ranks by CFBundleVersion alone, so this release would never reach existing users." >&2
+  echo "       Export MTPLX_RELEASE_BUILD=$((LAST_SHIPPED_BUILD + 1)) and rerun." >&2
+  exit 1
+fi
+
 export MTPLX_SPARKLE_PUBLIC_ED_KEY="${MTPLX_SPARKLE_PUBLIC_ED_KEY:-GQ0sTm6nb5kv+Btri7wc4LqnXGZ48vIs6PGMwsI/mBM=}"
 SPARKLE_PRIVATE_KEY="${MTPLX_SPARKLE_PRIVATE_KEY:-${SPARKLE_PRIVATE_KEY:-}}"
 SPARKLE_PRIVATE_KEY_FILE="${MTPLX_SPARKLE_PRIVATE_KEY_FILE:-${SPARKLE_PRIVATE_KEY_FILE:-}}"
@@ -261,29 +287,11 @@ DMG_URL="$GITHUB_ASSET_BASE/$(basename "$DMG")"
 
 # Sparkle's "what's new" dialog and the hosted notes page render the real
 # release notes authored in docs/releases/v$VERSION.md (gated above).
-"$PYTOOLS_VENV/bin/python" - "$RELEASE_NOTES_MD" "$NOTES_OUT/v$VERSION.html" "$VERSION" <<'PY'
-import pathlib
-import sys
-
-import markdown
-
-source, destination, version = sys.argv[1], sys.argv[2], sys.argv[3]
-body = markdown.markdown(
-    pathlib.Path(source).read_text(encoding="utf-8"),
-    extensions=["extra"],
-)
-html = (
-    "<!doctype html>\n"
-    '<meta charset="utf-8">\n'
-    f"<title>MTPLX {version}</title>\n"
-    '<style>body{font-family:-apple-system,system-ui,sans-serif;'
-    "max-width:42em;margin:2em auto;padding:0 1em;line-height:1.55}"
-    "h1,h2{line-height:1.2}code{background:#f2f2f4;padding:0 .25em;"
-    "border-radius:4px}</style>\n"
-    f"{body}\n"
-)
-pathlib.Path(destination).write_text(html, encoding="utf-8")
-PY
+# scripts/render_release_notes.py owns the page template — light AND dark
+# mode readable (#367) — and the rehearsal kit renders through the same
+# file, so do not inline a template copy here again.
+"$PYTOOLS_VENV/bin/python" "$ROOT/scripts/render_release_notes.py" \
+  "$RELEASE_NOTES_MD" "$NOTES_OUT/v$VERSION.html" "$VERSION"
 
 python3 - "$RELEASES_OUT/latest.json" "$VERSION" "$APP_BUILD" "$DMG_URL" "$DMG_SHA256" "$DMG_SIZE" "$RELEASE_NOTES_URL" <<'PY'
 import datetime

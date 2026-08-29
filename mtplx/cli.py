@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import platform
@@ -10,6 +11,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from .batching.state import SchedulerMode
 from .constants import DEFAULT_RUNTIME_MODEL_DIR
 from .fan_mode import FAN_MODE_CHOICES
 from .mtp_batch_numerics import MTP_BATCH_NUMERICS_CHOICES
@@ -86,8 +88,11 @@ PUBLIC_COMMANDS = (
     ("help", "Detailed help; `help commands` / `help flags` / `help <name>`"),
     ("setup", "Prepare config and the model cache"),
     ("quickstart", "Run the local OpenAI/Anthropic server"),
+    ("serve", "Start the local server with an explicit model and mode"),
     ("connect", "Copy settings for Open WebUI, Claude Code, OpenCode, or Swival"),
     ("ask", "Ask the verified local model once"),
+    ("run", "Run one verified completion from an argument, a flag, or a pipe"),
+    ("chat", "Run one native-MTP chat generation as a smoke check"),
     ("status", "Check install, model, and integration health"),
     ("stop", "Stop the MTPLX daemon answering on a port"),
     ("settings", "Get or set live daemon settings"),
@@ -118,6 +123,14 @@ ADVANCED_COMMANDS = {
         ("models", "List local cached models"),
         ("model architectures", "Architecture support matrix"),
         ("model publish-check", "HF staging readiness"),
+    ),
+    "Server and scripting": (
+        ("list", "List locally cached models"),
+        ("remove", "Remove a cached model (confirms first; --yes to skip)"),
+        ("config *", "Show or edit the MTPLX user config"),
+        ("env", "Reproducible environment snapshot"),
+        ("dashboard", "Open the live dashboard against a running server"),
+        ("integrate *", "Print client integration settings"),
     ),
     "Kernel Lab": (
         ("debug hotpath", "Next verify-cycle boundary map"),
@@ -188,6 +201,20 @@ def _help_banner_prefix() -> str:
     if _shell_banner_already_shown():
         return ""
     return f"{_ascii_banner()}\n\n"
+
+
+def _version_string() -> str:
+    """Text printed by ``mtplx --version``.
+
+    The parenthetical exists to disambiguate a marketing/display version from
+    the packaged one. When they are the same string it disambiguates nothing
+    and "mtplx 2.10.0 (2.10.0)" just reads like a bug, so only print it when
+    the two actually differ.
+    """
+
+    if DISPLAY_VERSION == __version__:
+        return f"mtplx {DISPLAY_VERSION}"
+    return f"mtplx {DISPLAY_VERSION} ({__version__})"
 
 
 def _format_public_help() -> str:
@@ -521,8 +548,14 @@ def _parser_command_names(parser: argparse.ArgumentParser) -> set[str]:
     return set()
 
 
-def _print_unknown_command(command: str) -> int:
+def _print_unknown_command(command: str, known: set[str] | None = None) -> int:
     print(f"Unknown command: {_command(command)}\n")
+    # Match against every registered subcommand, not just the curated help
+    # lists: a typo of a lab command deserves the same nudge as a typo of
+    # `status`. One suggestion only — a wall of near-misses is noise.
+    suggestions = difflib.get_close_matches(command, sorted(known or ()), n=1)
+    if suggestions:
+        print(f"Did you mean {_command(suggestions[0])}?\n")
     print("Try:")
     for name, summary in PUBLIC_COMMANDS:
         print(f"  mtplx {_command_cell(name, 10)} {summary}")
@@ -660,13 +693,9 @@ def _add_mtp_toggle_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-SCHEDULER_MODE_CHOICES = (
-    "serial",
-    "cooperative",
-    "ar_batch",
-    "mtp_batch",
-    "mtp_cohort_experimental",
-)
+# Single source of truth is the SchedulerMode enum (mtplx.batching.state is
+# MLX/FastAPI-free, so the CLI can import it without dragging in the server).
+SCHEDULER_MODE_CHOICES = tuple(mode.value for mode in SchedulerMode)
 BATCHING_PRESET_CHOICES = ("solo", "latency", "agent", "throughput")
 ADAPTIVE_POLICY_CHOICES = ("none", "streak", "expected_value", "cost")
 
@@ -682,7 +711,10 @@ def _add_batching_args(parser: argparse.ArgumentParser) -> None:
             "the batched-AR lane end to end on prefill-heavy concurrent "
             "loads because MTP decode is ~4x faster per stream); ar_batch "
             "opts concurrent requests into the batched AR decode lane, "
-            "which wins on decode-heavy many-client loads."
+            "which wins on decode-heavy many-client loads. hyper serves ONE "
+            "request at a time (extra requests queue FIFO like serial) and "
+            "reserves batch width for self-speculative rows of that request; "
+            "at width 1 it rides the exact serial path."
         ),
     )
     parser.add_argument(
@@ -852,7 +884,11 @@ def cmd_hardware_public(args: argparse.Namespace) -> int:
         "M5 TensorOps eligible: "
         f"{str(bool(payload.get('m5_neural_accelerator_eligible'))).lower()}"
     )
-    print("hardware acceleration confirmed: false")
+    # `hardware_acceleration_confirmed` is False here because nothing profiles
+    # it (the JSON carries the reason: "not_profiled"). Printing a bare "false"
+    # to a human reads as "your Mac failed a check", which is not what the
+    # field means. The JSON document keeps both fields unchanged.
+    print("acceleration profile: not measured by this command")
     for warning in payload.get("warnings") or []:
         print(f"warning: {warning}")
     return 0
@@ -1147,7 +1183,7 @@ def _cmd_profiles(args: argparse.Namespace) -> int:
     print(f"library default: {DEFAULT_PROFILE_NAME}")
     print(
         "start/serve default: resolves per model — turbo for the quantized "
-        "27B/9B flagships, sustained otherwise"
+        "27B/9B flagships and the Flash-Next packs, sustained otherwise"
     )
     for profile in payload["profiles"]:
         print(f"{profile['name']}: {profile['summary']}")
@@ -2069,7 +2105,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"mtplx {DISPLAY_VERSION} ({__version__})",
+        version=_version_string(),
     )
     sub = parser.add_subparsers(dest="command", required=True)
     default_model = DEFAULT_HF_MODEL_ID
@@ -2139,7 +2175,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_profile_arg,
         metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
-        help="Runtime profile. Default resolves per model: Turbo for the quantized 27B and 9B flagships (the app's launch rule), Sustained otherwise. An explicit value always wins. Use --profile performance-cold --max for Burst.",
+        help="Runtime profile. Default resolves per model: Turbo for the quantized 27B/9B flagships and the Qwen 3.8 Flash-Next packs (the app's launch rule), Sustained otherwise. An explicit value always wins. Use --profile performance-cold --max for Burst.",
     )
     start_flow_p.add_argument(
         "--download",
@@ -2421,6 +2457,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mtp_toggle_args(ask_p)
     ask_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(ask_p)
+    _add_reasoning_effort_arg(ask_p)
     ask_p.add_argument(
         "--stats",
         action="store_false",
@@ -2463,7 +2500,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_profile_arg,
         metavar=_PROFILE_METAVAR,
         default=DEFAULT_PROFILE_NAME,
-        help="Runtime profile. Default resolves per model (Turbo for the quantized 27B and 9B flagships, Sustained otherwise); use --profile performance-cold --max for Burst.",
+        help="Runtime profile. Default resolves per model (Turbo for the quantized 27B/9B flagships and the Flash-Next packs, Sustained otherwise); use --profile performance-cold --max for Burst.",
     )
     quickstart_server_p.add_argument("--unsafe-force-unverified", action="store_true")
     quickstart_server_p.add_argument(
@@ -3153,6 +3190,19 @@ def build_parser() -> argparse.ArgumentParser:
     forge_verify_p.add_argument("--max", action="store_true")
     forge_verify_p.add_argument("--max-tokens", type=int, default=2048)
     forge_verify_p.add_argument("--suite", help="Verification prompt suite")
+    forge_verify_p.add_argument(
+        "--stamp",
+        action="store_true",
+        help=(
+            "After the rows pass, write/update the pack's mtplx_runtime.json "
+            "in place (the first-load smoke baseline that clears the "
+            "'unverified' marker) — no rebuild or copy"
+        ),
+    )
+    forge_verify_p.add_argument(
+        "--source-repo",
+        help="Provenance for --stamp: the upstream repo this pack was converted from",
+    )
     forge_verify_p.set_defaults(func=cmd_forge_public)
 
     forge_cancel_p = forge_sub.add_parser(
@@ -3241,6 +3291,9 @@ def build_parser() -> argparse.ArgumentParser:
     remove_p.add_argument("--cache-dir")
     remove_p.add_argument("--missing-ok", action="store_true")
     remove_p.add_argument(
+        "--yes", action="store_true", help="Skip the delete confirmation prompt"
+    )
+    remove_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     remove_p.set_defaults(func=cmd_remove_public)
@@ -3276,6 +3329,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mtp_toggle_args(run_p)
     run_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(run_p)
+    _add_reasoning_effort_arg(run_p)
     run_p.add_argument("--quiet", action="store_true", help="Hide the stats footer")
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     run_p.add_argument("--expect-python", action="store_true")
@@ -3312,6 +3366,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mtp_toggle_args(chat_p)
     chat_p.add_argument("--seed", type=int, default=0)
     _add_reasoning_arg(chat_p)
+    _add_reasoning_effort_arg(chat_p)
     chat_p.add_argument(
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
@@ -3667,7 +3722,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(*PROFILE_CHOICES, "native-mtp-60"),
         help=(
             "Runtime profile for product benchmark actions. Default follows the launch rule: "
-            "Turbo for the quantized 27B/9B flagships across every suite; Sustained otherwise "
+            "Turbo for the quantized 27B/9B flagships and the Flash-Next packs across every suite; Sustained otherwise "
             "(context and long-generation suites stay Sustained for non-flagship models); "
             "native-mtp-60 is a legacy alias for performance-cold."
         ),
@@ -5004,7 +5059,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     command_names = _parser_command_names(parser)
     if raw_args[0] not in command_names and not raw_args[0].startswith("-"):
-        return _print_unknown_command(raw_args[0])
+        return _print_unknown_command(raw_args[0], command_names)
     args = parser.parse_args(raw_args)
     args._cli_flags = canonicalize_flag_tokens(
         _explicit_cli_flags(raw_args), parser, args

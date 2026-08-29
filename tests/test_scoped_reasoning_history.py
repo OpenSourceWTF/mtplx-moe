@@ -439,11 +439,18 @@ def test_template_probe_rejects_gemma4_tokenizer():
     assert not _template_supports_scoped_reasoning(gemma)
 
 
-def _state(policy: str, *, capable: bool, strip_flag: bool = False):
+def _state(
+    policy: str,
+    *,
+    capable: bool,
+    strip_flag: bool = False,
+    model: str | None = None,
+):
     return SimpleNamespace(
         args=SimpleNamespace(
             preserve_thinking=policy,
             strip_assistant_reasoning_history=strip_flag,
+            model=model,
         ),
         reasoning_history_scoped_capable=capable,
     )
@@ -490,6 +497,31 @@ def test_legacy_strip_flag_still_wins():
     assert not _reasoning_history_scoped_active(
         _state("auto", capable=True, strip_flag=True)
     )
+
+
+def test_auto_preserves_for_qwen38_and_flash_next_even_on_capable_templates():
+    """The 3.8-generation trained contract: preserve_thinking on by default.
+
+    Both families ship templates that CARRY the rolling checkpoint, so the
+    capability probe alone would resolve auto -> scoped — which made every
+    Flash-Next agent round abort postcommit with
+    reasoning_history_scoping_mismatch and re-prefill the whole assistant
+    turn (OpenCode wall-clock rig, 2026-08-28). Auto must resolve to
+    preserve for qwen3_8 and qwen4_exp on every harness; only an explicit
+    off/scoped policy changes it.
+    """
+    for model in (
+        "/models/Qwen3.8-27B-MTPLX-Optimized-Speed",
+        "/models/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+    ):
+        assert (
+            _reasoning_history_mode(_state("auto", capable=True, model=model))
+            == _REASONING_HISTORY_PRESERVE
+        ), model
+        assert (
+            _reasoning_history_mode(_state("off", capable=True, model=model))
+            == _REASONING_HISTORY_STRIP
+        ), model
 
 
 def test_normalize_policy_accepts_scoped_and_rejects_junk():

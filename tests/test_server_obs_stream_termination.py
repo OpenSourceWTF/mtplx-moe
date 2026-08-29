@@ -226,7 +226,9 @@ def test_explicit_cancel_ends_chat_stream_with_terminal_frame(monkeypatch):
         if record.get("request_cancelled")
     ]
     assert cancel_records
-    assert cancel_records[-1]["cancellation_reason"] == "stream_cancelled"
+    # #381 attribution: the registry flip IS the POST endpoint's path, so
+    # the metric now names it instead of the generic stream_cancelled.
+    assert cancel_records[-1]["cancellation_reason"] == "post_endpoint"
     assert cancel_records[-1]["stream_cancelled_by_client"] is False
 
 

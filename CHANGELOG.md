@@ -4,6 +4,552 @@ All notable user-facing changes to MTPLX. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.10.0] - 2026-08-28
+
+### Added
+
+- **Long generations hold their decode speed.** A 34k-token uncapped chat
+  answer decayed from 86 to 25 tok/s inside one request because every
+  long-generation guard keyed off prompt length: the draft head's committed
+  history cache grew unbounded during decode, and the allocator clear-cache
+  cadence never armed for short prompts (8.6 GB of MLX allocator cache in a
+  single request). The history cache now resets and regrows after 16,384
+  live-appended tokens (`MTPLX_MTP_HISTORY_LIVE_RESET_THRESHOLD`, keyed on
+  appends so restored session seeds are never dropped; output stream
+  unchanged by the verify contract), and the clear-cache cadence arms
+  mid-generation when live context crosses the threshold (0.6 GB on the
+  same workload with it armed).
+- **Context-copy block rounds on the batched verify lane.** Flash-Next's
+  lane never had the copy mechanic, so file rewrites decoded at plain MTP
+  depth even with every output token already in the prompt. A prompt n-gram
+  match now proposes up to a 24-token block through the lane's normal
+  verify forward with the identical probability-ratio acceptance, so
+  sampling behavior is unchanged. Two-turn rewrite receipt: rewrite turn
+  87.6 tok/s vs 73.8 for the fresh build, 2,400 of 3,963 tokens from 177
+  copy rounds, zero copy rounds on novel text.
+  `MTPLX_CONTEXT_COPY_BATCHED=0` disables.
+- **Decay observability.** Receipts carry the context-copy counters and the
+  live-reset fields; `MTPLX_DROP_EVENTS=0` launches also get a per-round
+  `round_timing_ms` series. The growth-lever envs (clear-cache cadence,
+  history window and live reset, verify snapshot, family capture-commit,
+  drop-events) join the operator-beats-profile list.
+- **Reasoning effort works on Flash-Next, everywhere.** The `qwen4_exp`
+  family now declares the same reasoning codec as the dense 27B (Qwen
+  think-tag parser; effort levels `xhigh` / `medium` / `low`; modes
+  auto/on/off), so `reasoning_effort` on a request is honored instead of
+  silently dropped — previously the family resolved "no levels", the
+  field was discarded before it was read, and the chat template's own
+  `xhigh` fallback burned thousands of thinking tokens with no way to
+  turn it down. The family default is `xhigh`; the 27B keeps its
+  measured `medium` coding default. Full surface parity in the same
+  pass: the app's effort picker renders and persists for the family,
+  `mtplx run` and `mtplx chat` gain `--reasoning-effort`, and
+  `/v1/messages` (Anthropic-bridge) requests now forward the flat
+  `reasoning_effort` field for every family instead of dropping it.
+- **The n-gram sidecar stops costing 30 GB of RAM on paper.** The 32 GB
+  Flash-Next n-gram table streams from SSD by default, but the memory
+  plan, session-bank budget, Metal floor, and the app's memory card all
+  still counted it as wired weights — a 128 GB Mac printed a false
+  "MODEL DOES NOT FIT", resolved a 30 GB-pessimistic context window, and
+  auto-budgeted the session bank 30 GB too small. One policy now drives
+  gather behavior and every accounting surface; the serve banner and the
+  app's Memory Detail card say `n-gram table 29.8G streamed from SSD
+  (not wired)`. A new hot-row LRU (`MTPLX_NGRAM_HOT_MB`, default 1024)
+  keeps decode-sized gathers in RAM, byte-identical by construction and
+  by test — measured against the previously shipping streamed default:
+  +5-10% AR and +7.5-16% MTP decode, at identical memory. In the
+  product default config the MTP register now meets or beats the 30
+  GB-wired resident pin (+2.4%), so the wired mode remains only a
+  bench pin for 160 GB+ machines (`MTPLX_NGRAM_RESIDENT=1`).
+- **Both Flash-Next packs are public on Hugging Face** —
+  `Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed` and
+  `Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed` — and first-run
+  onboarding now offers them on Macs that fit them, right behind the
+  27B trio, resolving straight to the published repos.
+
+- **Flash-Next turbo, first-class.** The two Qwen 3.8 Flash-Next serve
+  packs now resolve the **turbo** launch profile by default across
+  `mtplx start` / `serve` / `quickstart` / the app — the same measured
+  launch rule the quantized 27B/9B flagships follow. On this family turbo
+  rides the qwen4_exp fast lane (pipelined AR decode, compiled GDN,
+  layer-owned capture-commit, and the fused hyper-read/GDN kernels below)
+  rather than the 27B NAX verify patch, which stays off for the family
+  until it earns its own measured win. Both packs' canonical ids
+  (`mtplx-flash-next-bare-speed`, `mtplx-flash-next-optimized-speed`)
+  now resolve from HF ids, folder names, and `mtplx pull` aliases;
+  derivative or renamed packs deliberately do not inherit the ids.
+- **Verify-width GDN conv kernel.** The conv + SiLU + L2-norm chain that
+  speculative verify blocks previously ran as an eager op sequence now runs
+  as one Metal dispatch for blocks of up to six rows, with a sliding
+  in-block conv window, and stays fully compatible with the family's
+  capture-commit rollback (it emits the exact rows the stash retains).
+  Default-on for the family after two boot-triple A/B batteries in both
+  orders (+3.1% and +2.3% MTP decode; the fused arm posted the campaign's
+  best arm mean).
+- **One-dispatch GDN decode step.** The whole GatedDeltaNet decode
+  step — causal conv + SiLU + L2 norm, decay/beta gates, the fp32 delta
+  recurrence, and the gated-RMS output epilogue — now runs as a single
+  Metal dispatch between the in/out projections, cutting a GDN layer
+  from ~6 GPU sends to 3. Default-on for the family after two
+  boot-triple A/B batteries in both arm orders (+1.7% and +2.2% decode,
+  the confirm triple's fused arm holding the six fastest rows).
+- **Qwen 3.8 Flash-Next, day-0 native.** A new first-class model family
+  (`qwen4_exp`): the 125B-A6B Qwen4-generation preview with GDN hybrid
+  MoE, Qwen Sparse Attention, and the 32 GB n-gram memory sidecar —
+  served by an in-tree MLX backend that is parity-exact against the
+  reference implementation, with the native MTP draft head running
+  through MTPLX's standard speculative lane (measured 1.6-1.7× over AR
+  through the real server). Two packs: **Bare Speed** (flat 4-bit,
+  fastest) and **Optimized Speed** (dynamic quant with 8-bit attention,
+  higher quality). The n-gram table streams from SSD by default, so the
+  packs fit 96 GB+ Macs with headroom; both appear in the app and CLI
+  model pickers on machines that fit them, with the family's own serving
+  contract (temperature 1.0, adaptive draft depth) applied end to end.
+- `mtplx forge verify --stamp`: records a first-load smoke baseline and
+  writes the pack's `mtplx_runtime.json` in place — the step that turns a
+  "family-compatible-unverified" model into a verified one — without
+  rebuilding or copying the artifact. Families the tune instrument cannot
+  measure (Flash-Next today) take their rows through a locally booted
+  `mtplx serve`, the lane that actually applies their family contract.
+- **The CLI's first 90 seconds behave like 2026.** The terminal chat
+  gets readline line editing with a persistent history
+  (`~/.mtplx/history`, 1000 entries; arrow keys used to print raw
+  escape sequences into the prompt); prompts pipe in
+  (`echo "..." | mtplx run`, and a piped prompt into the chat entry
+  answers through the same path `--prompt` uses, while an empty pipe
+  keeps the non-tty refusal); `serve`/`run`/`chat` join the main help
+  and `list`/`remove`/`config`/`env`/`dashboard`/`integrate` get a
+  "Server and scripting" help group, with a one-line difflib
+  "Did you mean" on any typo across all registered subcommands (exit
+  code still 2); `mtplx ask` joins `run`/`chat` on
+  `--reasoning-effort` and the chat REPL gains `/effort
+  <level|status>`, live per turn like `/reasoning`; `mtplx --version`
+  drops the redundant parenthetical when display and package versions
+  match; and `mtplx hardware` stops printing "hardware acceleration
+  confirmed: false" at humans for a field that means "not profiled"
+  (JSON output unchanged everywhere).
+- Streaming endpoints (`/v1/chat/completions`, `/v1/completions`,
+  `/v1/messages`) emit a `: keep-alive` SSE comment every 5 seconds
+  while a stream is still silent before its first token (#358). Long
+  prefills — minutes at 32k+ prompts — previously put zero liveness
+  bytes on the wire, so strict client/proxy read-timeouts (Claude
+  Code, Cursor, Open WebUI, nginx, cloudflared) dropped the
+  connection mid-compute. SSE comments are ignored by every compliant
+  parser; once tokens flow the comments stop. Disable with
+  `MTPLX_SSE_HEARTBEAT=0`; tune the cadence with
+  `MTPLX_SSE_HEARTBEAT_INTERVAL_S` (minimum 1s).
+- **Machine memory governor** (issue #305). MTPLX now plans its memory
+  against the Mac it is actually on instead of assuming a 128 GB studio
+  machine. At startup the serve banner prints the machine plan (engine
+  budget, weights, resolved context window, session-bank budget); the
+  default context window is the largest one whose full-window KV really
+  fits (a 48 GB Mac serving the Speed model defaults to 196,608 tokens
+  instead of a physically impossible 262,144 — 128 GB machines are
+  unchanged), and an explicit `--context-window` above the fit still wins
+  but is flagged loudly. The session bank stays idle-aggressive and
+  yields dynamically as a long-context request's KV materializes, ahead
+  of any swap; macOS pressure and an earlier allocator-relative signal
+  drive the existing shedding guard. `/health`, the dashboard snapshot
+  and the app carry `memory_plan`, guard events, and a pressure banner.
+  `MTPLX_MEMORY_BUDGET=48G` reproduces a real 48 GB seat exactly (test-pinned).
+- **Streaming SSD spill for large sessions** (issues #305, #323). Sessions
+  above the per-session RAM cap — exactly the 100k+-token coding-agent
+  sessions whose re-prefill costs minutes — now persist to the SSD tier
+  through a tensor-by-tensor streaming writer (bounded memory, same
+  on-disk format), instead of silently losing durability. Live-ref-only
+  sessions reach the SSD tier for the first time; every remaining skip is
+  recorded, never silent — including the disk-headroom size cap
+  (`min(configured cap, free_disk/4)`), which now prints one console line
+  per session naming the entry size, the effective cap, and free disk
+  when it refuses a spill (found live on a 4 TB disk at 28 GiB free,
+  which caps the lane at ~7 GiB and mutely excluded every 100k+-token
+  session — the same silence class as #278, in a brand-new lane). A
+  request arriving mid-write makes the streaming encode abort cleanly
+  and re-dispatch for the next idle window (counted in
+  `encode_yields_foreground`), so a spill in progress can never make a
+  request wait; the dedicated writer thread keeps its own 600 s
+  foreground pause, where waiting is free because nothing queues behind
+  that thread.
+
+- **RAMP: opt-in long-block and fuzzy re-anchor policy for context copy**
+  (adapting community PR #375 by @johninthewinter). A fixed 48-token copy
+  block replaces the confidence ladder and an exact n-gram miss falls
+  through to a mismatch-tolerant short-anchor re-match, for edit-shaped
+  temperature-0 agent workloads where the author measured +45.9 to +53.9
+  percent decode with byte-identical output. Our own paired temperature-1
+  chat-rewrite arms measured it a net loss (copy supply fell 504 to 123
+  tokens on seed-identical streams), so it ships off by default
+  (`MTPLX_RAMP_ENABLED`); off is byte-for-byte the prior proposer.
+- **One-sync greedy draft read on confidence lanes** (adapting community
+  PR #288 by @ArthurOstapenko). Margin-gate and adaptive-depth lanes now
+  read the greedy draft token and its confidence metrics in one GPU
+  synchronization instead of two; the author's paired receipt is +0.559
+  percent geomean on the ExpectedValue depth-3 lane. The default greedy
+  chain and every sampled-draft lane are untouched, proven by an
+  engagement counter that reads zero there.
+- **QSA rows-gather lane for verify widths** (adapting the per-query
+  gather and GQA head-group broadcast from community PR #380 by @maceip).
+  Multi-row QSA forwards previously staged a dense [rows, context] mask
+  and read the full KV in all 12 QSA layers every verify round, a cost
+  that grows with the generation. The opt-in lane gathers each row's
+  selected blocks plus its visible tail at a constant width instead, with
+  context-length and row-count routing fences so short contexts keep the
+  fused dense path. Family default ON for Flash-Next (self-fenced to
+  2..8 rows at 16384+ tokens of context, so shorter contexts are
+  bit-identical dense; `MTPLX_QSA_GATHER=0` is the kill switch). Paired
+  16,384-token receipt: the dense path's verify cost grew 37.0 to 46.9 ms
+  per round across the run while the gather arm held flat 45.3 to 45.9,
+  finishing its last window at 64.5 tok/s against 36.0 dense.
+  Parity-tested against the dense path on the real layer.
+
+### Fixed
+
+- **The context-copy lane earns its block size before spending it.** Copy
+  rounds verify 16-24-token candidate blocks — a ~4x-cost forward versus a
+  normal round — and the acceptance gate needed four sampled rounds per
+  generation before it could suspend, so short coding-agent turns re-paid
+  the full misfire cost every turn (measured: whole-turn verify 60-88
+  ms/round at 8k context with 21/96 copy tokens accepted, decode down to
+  ~27 tok/s). Blocks now stay at 8 tokens
+  (`MTPLX_CONTEXT_COPY_PROBATION_K`) until the turn's acceptance EMA
+  proves the content pays, and the suspension arms one round earlier.
+  Long-context re-emission — where the lane is a measured +16.7% — opens
+  to full blocks by its third round and keeps its win. The batched verify
+  lane (Flash-Next's copy mechanic, above) carries the identical
+  probation contract.
+- **Greedy draft coupling engages on launch-default-greedy servers.** The
+  draft-sampler resolver received the raw request `temperature` — `None`
+  when a client omits the field — so a server launched with
+  `--temperature 0` serving such a client decoded greedily while drafts
+  stayed at the family default (1.0): the silent sampled-draft acceptance
+  collapse ([79/65/42]% by depth vs [96/87/76]% coupled), with no
+  `draft_sampler_greedy_coupled` stamp to show for it. Both serve lanes
+  now hand the resolver the effective sampler temperature, matching the
+  resolver's documented contract; explicit-temperature requests were
+  never affected.
+- **SSD spills no longer fire mid-turn: the writer's foreground pause now
+  outlasts a long coding turn.** The writer already stood down while a
+  request was in flight, but its liveness bound was 60 s — shorter than a
+  typical agent turn (60–620 s) — so every multi-GB session spill fired
+  under the live decode: a ~1 GB/min unified-memory drumbeat that tripped
+  macOS memory pressure (the Live-tab banner) and stole decode (measured
+  −30% when a write overlapped a turn). The bound is now 600 s
+  (`MTPLX_SSD_WRITER_FOREGROUND_PAUSE_MAX_S`); writes drain in the gaps
+  between turns, and a bound that still expires into live traffic is
+  counted in `/admin/cache/ssd` as `writer_pause_expired_busy`. The cold
+  tier is a cache — waiting out a turn costs delayed durability, never
+  correctness.
+- **The session bank yields ahead of the prefill spike, so deep turns stop
+  tripping the memory banner.** The dynamic ceiling reserved a static 3 GiB
+  for generation transients, but a deep chunked prefill measures up to
+  12.4 GiB of peak-over-active — so on long coding sessions the bank kept
+  entries while the allocator peak kissed 99%+ of the Metal limit, firing
+  the warning banner on every deep turn. The ceiling now reserves the
+  spike this process has actually observed (clamped between 3 GiB and
+  half the post-weights memory, at most 16 GiB), demoting idle entries
+  to SSD before the next spike can slam the ceiling.
+- **The memory banner now names the culprit.** The daemon reports which
+  signal produced the pressure level (`memory_pressure_source`: system-wide
+  macOS pressure vs this engine's allocator near its Metal limit, plus the
+  live `allocator_fraction`), and the app's warning banner distinguishes
+  "System memory pressure" (another process allocating; decode can dip
+  until it passes — nothing was evicted) from the engine's own
+  "Memory running high". Receipt for the split: an external 26 GB
+  allocation storm dropped decode 65→22 tok/s with the engine's guard
+  correctly doing nothing at all — the old copy blamed the engine for
+  weather it didn't make. Attribution only claims what it can prove:
+  when macOS and the allocator report pressure in the same tick the
+  banner names the allocator (the "another process" copy asserts the
+  engine's footprint is steady, which is false at a tie), and when the
+  allocator probe cannot read at all the source reports `unknown` and
+  the banner stays neutral.
+- **Long sessions persist to SSD: the writer's backlog budget no longer
+  rejects a snapshot bigger than itself** (#384, thanks @sapiens77 for a
+  forensic-grade report). The SSD writer bounds queued bytes at 4 GiB by
+  default, but a single snapshot larger than the whole budget failed
+  admission on every attempt even with an empty queue — at roughly 84
+  KB/token of 27B KV that turned the SSD tier silently off past ~50k
+  tokens, with only a counter as the trace. An empty queue is not backlog
+  pressure: a lone oversized entry is now admitted, logged by name, and
+  counted in `/admin/cache/ssd` as `admitted_oversized_alone`; a genuinely
+  backlogged writer still rejects. The reporter measured 41.7x TTFT across
+  a restart (282 s to 6.8 s) once writes could land. Also from the same
+  thread: `request_session_source` now reports the header source instead
+  of null for header-identified sessions.
+- **The memory governor's ceiling never evicts the live session's cache.**
+  The dynamic bank ceiling subtracts an instantaneous working-set reading,
+  so a deep prefill's transient allocator spike read as a standing
+  commitment: on a 93k-token coding session the ceiling walked the session
+  bank to zero bytes mid-request, evicting the in-flight session's own
+  prefix entries, and every following agent turn re-prefilled from scratch
+  (TTFT 54 to 57 s, prefill 909 down to 175 tok/s). The ceiling now
+  squeezes idle sessions only; the active session's prefix chain survives
+  even when the bank stays above target. Real macOS or allocator pressure
+  keeps its take-anything eviction semantics, so the 48 GB swap-death
+  protection is unchanged.
+- **Flash-Next serves coding agents at its official sampler.** The app's
+  OpenCode and Hermes launch presets pre-fill the Qwen3.6-era coding
+  sampler (temperature 0.6), and the Flash-Next model defaults left those
+  slots untouched, so the daemon booted with an explicit `--temperature
+  0.6` that suppressed the pack-stamp injection — OpenCode requests were
+  normalized to a 0.6 target against the family's official 1.0, with the
+  draft still at the stamp's 1.0 (a mismatched verify pair). Flash-Next
+  now clears the target-preset sampler slots on every launch target, so
+  the zero-flag boot path injects the artifact's stamped 1.0/0.95/20 for
+  target and draft alike, identical to a bare `mtplx serve`. The dense
+  27B was already correct (its preset pins the official triple); 3.6-era
+  models keep their measured 0.6 lane.
+- **OpenCode's effort picker shows the whole Flash-Next dial.** The
+  generated config only declared effort variants for tiers outside
+  OpenCode's built-in list, trusting the client to surface the rest — but
+  OpenCode Desktop 1.18.21 does not offer its full built-in list for
+  custom openai-compatible providers, so xhigh (the Flash-Next chat
+  default) was missing from the picker entirely. Every family tier is now
+  written as an explicit variant, which renders on every OpenCode version
+  and still merges over same-named built-ins; out-of-family tiers stay
+  disabled.
+- **The KV-quantization control explains itself on Flash-Next.** The
+  setting showed the anonymous "not supported for this model" line because
+  the family had no entry in the KV-quant policy table. The policy is
+  unchanged — the validated q8/q4 paged lane is wired to the dense-27B
+  attention call sites, not to Flash-Next's QSA layers — but the app now
+  states the architecture truth: the hybrid design keeps KV on 12 of 48
+  layers (~24 KB/token), and a quantized QSA lane has no validation
+  receipts yet. Qwen 3.5/3.6/3.8 keep the full q8/q4 control.
+- **The warm ladder yields to live traffic and no longer stamps the
+  traffic clock** (adapting community PR #300 by @Blakeolson21). A request
+  that had arrived but not yet completed read as an idle daemon, so the
+  first request of a serve could share the GPU with a warm rung; and warm
+  rungs stamped `last_request_at`, making /health report user traffic on
+  an untouched daemon while the ladder deferred against its own output.
+  Rung admission now checks live and queued foreground work as its own
+  branch (safe at zero idle grace), and warm generations no longer move
+  the request clock or counters anywhere.
+- **The Live tab's acceptance panel no longer goes blank after a finished
+  request.** Two stacked causes: the daemon's idle warmup ladder published
+  its rungs into the dashboard's `latest` slot, replacing the finished
+  request's receipt (a warmup row with a null request id sat where the
+  user's acceptance counters belonged), and the app's Live-tab gates only
+  ever ticked on `.completed` stream frames, which have no replay, so one
+  frame missed during a reconnect kept the panel on its placeholder
+  forever. Warmup rows now stay out of the dashboard ring server side, the
+  app refuses to merge a warmup row over a real receipt, and a finished
+  request observed through the snapshot poller counts as completion
+  evidence (deduplicated per request), so the panel lights up within one
+  poll of a request finishing regardless of stream health.
+- **The compact tool contract no longer drops trailing tools** (#376,
+  adapting community PR #379 by @ArctifoxNL). When the "Declared tools
+  and schemas" line exceeded its 1200-character budget it was raw
+  byte-cut, deleting whole tool names at the tail (`task` first, in
+  Claude Code-shaped toolsets) — and the contract's own "never invent an
+  undeclared tool" clause then made the model treat every dropped tool
+  as nonexistent, killing subagents. Over budget, every declared tool
+  name is now kept and only per-tool signature detail is shed.
+- **Cancellation errors name their real cause** (#381). One shared
+  per-request cancel flag is tripped by several unrelated paths — the
+  `POST /v1/mtplx/cancel` endpoint, client disconnect, stop-sequence
+  completion, tool-call finalization, the stall watchdog, stream
+  teardown — and the terminal frame blamed every non-disconnect trip on
+  the POST endpoint, framing an endpoint nobody called. The first
+  origin is now recorded when the flag trips, terminal frames and the
+  cancellation metric report it, and an unattributed trip says so
+  instead of inventing a caller.
+- `mtplx connect opencode` now actually writes `~/.config/opencode/opencode.json`
+  (merge-preserving: other providers and plugins survive). It previously built
+  the config, printed the config path, and wrote nothing — so a `--model-id`
+  for a newly served model never reached OpenCode's provider models map and
+  runs failed with `ProviderModelNotFoundError` surfaced as "Unexpected
+  server error". Found wiring Flash-Next day-0.
+- The serve daemon and tune/bench children now start Python with `-P`,
+  so the directory you launch from can never shadow the installed
+  runtime. Previously, running `mtplx serve` from any folder containing
+  an `mtplx/` package (a source checkout, a vendored copy) silently
+  served that folder's code instead of the installed release.
+- **Unexecuted tool calls are no longer silently swallowed** (#349). A
+  fresh-install user asking the built-in chat about their files saw the
+  model "invoke" tools (`ls`, `find`, `search_files`, `read_file`) and
+  get nothing back — no output, no error — because the server deleted
+  dead tool-call markup from no-tools responses (#160) and from
+  undeclared-tool fallbacks without telling anyone. Suppressed calls
+  now leave a short, visible notice naming the tool and stating that
+  nothing ran, this chat has no file/terminal access, and a coding
+  agent (Claude Code, OpenCode, Hermes) connected to MTPLX provides
+  it. The model reads the same notice in its history and stops
+  claiming it ran tools; the reply is never blank. Code-fenced tool
+  syntax examples are untouched, and `mtplx_stats` gains
+  `unexecuted_tool_call_notice` for triage. The macOS app also
+  persists a truthful `tool_not_executed` result for any tool call
+  that finishes past the chat's tool-round budget, so replayed
+  transcripts never show the model an unanswered tool call.
+- **SSD session-cache writes no longer starve on an idle server, and
+  shutdown flushes them** (issue #290). The scheduler's durability lane
+  was only reachable while the idle band was completely empty, so any
+  self-chaining background occupant (the background warm ladder) could
+  hold SSD writes off forever — entries sat in RAM with every cold-tier
+  counter at zero and vanished on restart, costing a full re-prefill.
+  The server now pumps the durability lane within seconds of going
+  request-idle (foreground work still always wins, and the pump disarms
+  the moment a request arrives), and a plain SIGTERM/Ctrl-C gives
+  pending writes a bounded best-effort flush (default 10 s,
+  `MTPLX_SHUTDOWN_SSD_FLUSH_S` overrides, `0` disables) with one honest
+  console line — including the write the SSD writer thread already has
+  in flight, which the old shutdown killed mid-file.
+- Metal allocation failures are answered as structured
+  `insufficient_memory` (HTTP 507) errors with actionable advice, after
+  the engine sheds its caches — instead of anonymous `internal_error`
+  500s that left the next request to hit the same wall (issue #348 class).
+- `--memory-budget 48G` (the bare-suffix spelling MTPLX's own messages
+  advertise) crashed serve startup with a raw ValueError; single-letter
+  and terabyte size suffixes parse now.
+- The dashboard "RAM session cache" settings no longer invent `8G/4G`
+  when nothing is configured — they report the budgets the engine
+  actually resolved.
+- The update dialog's release notes are readable in dark mode (#367).
+  The generated notes page now declares `color-scheme: light dark` and
+  pairs each appearance with readable text colors instead of shipping a
+  light-only stylesheet that Sparkle's dark update window rendered as
+  near-black-on-dark. The release script and the Sparkle rehearsal kit
+  render through one shared template
+  (`scripts/render_release_notes.py`), so the rehearsal now shows the
+  exact page users get and the two can no longer drift apart.
+  Notes pages already published under mtplx.com/releases/notes/ need a
+  one-time re-render and re-upload to pick this up.
+- **Reasoning history preserves by default on Flash-Next.** The
+  `qwen4_exp` family ships the byte-identical Qwen 3.8 chat template and
+  the same preserve-by-default trained contract, but the auto policy
+  only recognized `qwen3_8` and dropped the family onto the scoped
+  fallback. Every agent round's session-cache postcommit then aborted
+  with `reasoning_history_scoping_mismatch` and re-prefilled the whole
+  assistant turn. With preserve on, mid-session agent turns cost about
+  20 new prefill tokens at 0.11 s first token (scoped paid 300 to 1500
+  tokens at 1.8 to 2.2 s, measured on the release wall-clock rig).
+- **Coding-agent lanes default to medium reasoning effort on
+  Flash-Next.** OpenCode and Pi config writers resolve the family's new
+  agent-lane default (codec `default_agent_effort`) instead of the chat
+  default. On the identical multi-file coding task, xhigh measured
+  150.2 s wall clock against 44.2 s at medium with the same correct
+  output. Chat surfaces keep xhigh; both clients' effort pickers still
+  offer every level per request.
+- **The Pi provider merge owns the transport contract.** The
+  user-preserving config merge kept an older MTPLX's
+  `supportsReasoningEffort: false` alive across every re-sync, which
+  silently killed Pi's effort dial after an upgrade. MTPLX's own
+  compatibility keys now update on sync; user-added keys still survive.
+- **The app's offline settings fallback shows family truth.** With the
+  engine stopped, the inference settings panel fell back to a generic
+  temperature 0.6 and the label "Custom model" for Flash-Next (and could
+  persist that 0.6 over the engine's 1.0). The fallback table now
+  carries the family's native 1.0 / 0.95 / 20 and the proper family
+  name; live-daemon state was always correct.
+- **Onboarding verifies the terminal command through the login shell.**
+  The setup step graded whatever executable the app's own process PATH
+  found, and a Finder-launched app never inherits the shell rc's
+  `/opt/homebrew/bin` ordering, so setup could certify "up to date"
+  while the user's actual terminal still ran an older Homebrew install.
+  The check now asks the user's login shell which executable wins and
+  grades that one.
+- **Each conversation streams on its own turn stream** (#324). Switching
+  conversations mid-generation no longer cross-wires or blanks either
+  turn.
+- **Explicit performance settings are honored over client-target
+  defaults** (#325), and the native Chat launch target stops silently
+  ignoring "Handle multiple at once".
+- **The app accepts custom Hugging Face models the engine reports as
+  runnable** (#359). Install completeness is judged by the source repo's
+  own manifest instead of requiring an `mtplx_runtime.json`.
+- **Forge routes official NVIDIA Nemotron-H configs** by deriving the
+  MTP pattern from `mtp_layers_block_type` (#341); load no longer
+  crashes with an AttributeError.
+- **`mtplx remove` is fenced to the models cache and asks first.** The
+  removal path ran `rmtree` on whatever the ref resolved to: a bare
+  `.` or `/` resolved to the models cache directory itself and `..` to
+  the whole `~/.mtplx` home (bin, config, session bank, every model),
+  deleted without a word and exit 0. A ref must now resolve to a direct
+  child of the models cache or the command refuses, a tty gets a
+  confirmation naming the resolved path and size, `--yes` skips it for
+  scripts, and a non-tty run without `--yes` refuses with the hint.
+- **A malformed `config.toml` no longer bricks every command.** A
+  truncated or hand-edited config raised a raw TOMLDecodeError through
+  `status`, `doctor`, even `stop`, so the one file meant to hold
+  preferences could lock the user out of the CLI entirely. The loader
+  now degrades to defaults with one stderr line naming the file, the
+  parse error, and `mtplx config show`; a bad value for a single key
+  degrades that key only.
+- **The daemonless CLI generate lanes couple the draft greedy under a
+  greedy target.** One-shot `run`, the terminal chat, and `tune` call
+  the engine directly and never pass the server's draft-sampler
+  resolver, so `--temperature 0` kept the pack's stamped sampled draft
+  (temperature 1.0) and paid the sampled-draft acceptance collapse
+  ([79/65/42]% by depth vs [96/87/76]% coupled) on exactly the lane
+  outside benchmarks run. The lanes now share one coupling helper; a
+  user-typed `--draft-temperature` still wins, and a spec-less lane
+  already mirrored the target and is unchanged.
+
+## [2.9.3] - 2026-08-26 (internal build — never published; ships as part of 2.10.0)
+
+### Fixed
+
+- **Agent turns died with a fabricated
+  `request cancelled via POST /v1/mtplx/cancel`** (issues #332, #343). After
+  a complete streamed tool call the server cancels its own generation to end
+  the turn; when the worker's acknowledgement outlived the stream loop's
+  250 ms poll, the loop misread its own cancel as a foreign
+  `POST /v1/mtplx/cancel` and killed the healthy turn with that error — no
+  one ever called the endpoint. Tool-calling streams now drain until the
+  worker acknowledges and end with the `tool_calls` terminal frame; a real
+  cancel and a real disconnect behave as before. Deterministic regression
+  test included. Only tool-calling turns were affected, which is why plain
+  streaming never reproduced it.
+- **Long-context decode past 128k, improved.** Past 131,072 prompt tokens dense decode
+  silently repaged into a cache layout that structurally excluded the packed
+  verify kernel, collapsing speculative decode to plain-AR speed (12.0 tok/s
+  at 147k on an M5 Max 128 GB). The dense-decode ceiling is now memory-aware
+  (`MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT=auto`, floored at the old
+  131,072 literal so smaller machines cannot regress), keeping the packed
+  lane engaged (16.3 tok/s at 147k; 18.4 with copy speculation off). The
+  resolver announces itself in the serve log, and an exported ceiling env
+  beats the profile instead of being silently stomped back.
+- **KV-cache quantization was effectively broken and is now usable.**
+  Enabling q8/q4 crashed serving at warmup; q4 additionally re-dequantized
+  the entire prefix every round, and quantized caches were refused by the
+  compiled verify bank. All three fixed: the crash is gone, q4 routes
+  through the exact packed-quant kernel via a persistent quantized bank,
+  and the verify bank promotes quantized paged caches. Measured cost at 16k
+  on an M5 Max vs off: q8 ≈ −4% decode, q4 ≈ −19% (down from crash / −50%).
+  Still opt-in — the remaining gap to zero-loss, and the slow quantized
+  lane past the dense ceiling, are known and being worked. A pre-existing
+  q4 numerics defect at head_dim 128 is fenced fail-closed (the shipped
+  head_dim 256 family is exact).
+- The dynamic-offset paged verify kernel had never compiled since its
+  introduction (a pointer-cast Metal bug hidden behind its own mask gate)
+  and crashed at q_len > 5 once compiled; both fixed. Still opt-in
+  (`MTPLX_PAGED_TAILMASK_ELIDE`) pending its serve verdict, but the crash
+  class is removed.
+- Warmup failures log their full traceback instead of a one-line skip.
+
+### Changed
+
+- **mlx floor raised to 0.32.2.** A clean same-wheel A/B on an M5 Max
+  measured 0.32.0 → 0.32.2 at +29% decode / +41% prefill at 88k context
+  (+31% at 16k); the floor converges existing installs onto that stack.
+- Every request row now records packed-route bail counters and
+  paged-adapter engagement, and `MTPLX_ROUTE_DEBUG=1` prints one line per
+  layer naming the attention branch taken and every gate input — the
+  decode cliff hid for months because fast lanes declined silently.
+
+### Added
+
+- Release-pin regression tests: the shipped profiles' fast-lane values
+  (compiled-verify ceiling, packed verify kernel, dense-decode ceiling),
+  operator-env-beats-profile precedence, and the mlx floor are now pinned
+  by tests so a silent lane loss fails CI instead of surfacing in a
+  benchmark weeks later.
+- Experimental, off by default: `--scheduler-mode hyper` (single-user
+  manufactured-concurrency chassis, trajectory-sha-exact vs serial),
+  `MTPLX_NAX_TILE_ROUTE` (first M5 tensor-unit attention kernel at decode
+  shapes), `MTPLX_ADAPTIVE_DTEMP`, `MTPLX_CCOPY_BANK_ROUTE`,
+  `MTPLX_FORKEV_TELEMETRY`.
+
 ## [2.9.2] - 2026-08-25
 
 ### Changed

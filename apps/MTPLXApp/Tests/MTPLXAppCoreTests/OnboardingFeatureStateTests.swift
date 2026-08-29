@@ -91,6 +91,10 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Curated Quality always resolves to a catalog entry")
         s.pick = .curatedGemmaSpeed
         XCTAssertTrue(s.canAdvance, "Curated Gemma Speed always resolves to a catalog entry")
+        s.pick = .curatedFlashNextBareSpeed
+        XCTAssertTrue(s.canAdvance, "Curated Flash-Next Bare Speed always resolves to a catalog entry")
+        s.pick = .curatedFlashNextOptimizedSpeed
+        XCTAssertTrue(s.canAdvance, "Curated Flash-Next Optimized Speed always resolves to a catalog entry")
         s.pick = .curatedStepFlash
         XCTAssertFalse(s.canAdvance, "StepFun is held out of the release catalog")
     }
@@ -107,15 +111,16 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Ready probe allows advance")
     }
 
-    func testModelPickNoMTPRequiresExplicitAcknowledgement() {
-        var s = OnboardingFeatureState(
+    func testModelPickNoMTPAdvancesWithoutAcknowledgement() {
+        // Founder directive 2026-08-26: MTP unavailable is informational,
+        // never a gate. The engine serves MTP-less checkpoints AR, so the
+        // wizard advances the same way the CLI runs them.
+        let s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
-            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "No MTP")
+            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "MTP unavailable")
         )
-        XCTAssertFalse(s.canAdvance, "noMTP blocks until acknowledged")
-        s.hasAcknowledgedOtherWarning = true
-        XCTAssertTrue(s.canAdvance, "Acknowledged noMTP allows advance")
+        XCTAssertTrue(s.canAdvance, "noMTP is informational and advances")
     }
 
     func testModelPickLocalRequiresReadyProbe() {
@@ -138,36 +143,29 @@ final class OnboardingFeatureStateTests: XCTestCase {
         XCTAssertTrue(s.canAdvance, "Complete MTPLX local folders allow advance")
     }
 
-    // MARK: select(_:) wipes stale probe + acknowledgement
+    // MARK: select(_:) wipes stale probes
 
-    func testSelectChoiceClearsProbeAndAcknowledgement() {
+    func testSelectChoiceClearsProbes() {
         var s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
             otherProbe: OtherModelProbe(verdict: .ready, hfRepo: "Foo/Bar", message: "OK"),
-            localProbe: LocalModelProbe(verdict: .ready, path: "/models/qwen", message: "Ready"),
-            hasAcknowledgedOtherWarning: true
+            localProbe: LocalModelProbe(verdict: .ready, path: "/models/qwen", message: "Ready")
         )
         s.select(.curatedSpeed)
         XCTAssertEqual(s.pick, .curatedSpeed)
         XCTAssertNil(s.otherProbe)
         XCTAssertNil(s.localProbe)
-        XCTAssertFalse(s.hasAcknowledgedOtherWarning)
     }
 
-    func testRecordProbeWipesAcknowledgement() {
+    func testRecordProbeReplacesPrevious() {
         var s = OnboardingFeatureState(
             step: .modelPick,
             pick: .other(hfRepo: "Foo/Bar"),
-            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "No MTP"),
-            hasAcknowledgedOtherWarning: true
+            otherProbe: OtherModelProbe(verdict: .noMTP, hfRepo: "Foo/Bar", message: "MTP unavailable")
         )
         s.record(OtherModelProbe(verdict: .ready, hfRepo: "Foo/Bar", message: "OK"))
         XCTAssertEqual(s.otherProbe?.verdict, .ready)
-        XCTAssertFalse(
-            s.hasAcknowledgedOtherWarning,
-            "A new probe must force a fresh acknowledgement"
-        )
     }
 
     // MARK: resolvedModel applies M1/M2 FP16 routing
@@ -340,6 +338,46 @@ final class OnboardingFeatureStateTests: XCTestCase {
             .block7,
             .block8,
         ])
+    }
+
+    func testResolvedModelForFlashNextBareSpeedPassesThroughOnModernApple() {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 128 * 1_073_741_824
+        )
+        let s = OnboardingFeatureState(hardware: m5, pick: .curatedFlashNextBareSpeed)
+        XCTAssertEqual(s.resolvedModel?.id, "flash-next-bare-speed")
+        XCTAssertEqual(s.resolvedRepoID, "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed")
+        XCTAssertEqual(s.resolvedModelFamily, "qwen4_exp")
+        XCTAssertFalse(s.supportsTune)
+    }
+
+    func testResolvedModelForFlashNextOptimizedSpeedPassesThroughOnModernApple() {
+        let m5 = DetectedHardware(
+            chipName: "Apple M5 Max",
+            appleSiliconGeneration: "m5",
+            unifiedMemoryBytes: 128 * 1_073_741_824
+        )
+        let s = OnboardingFeatureState(hardware: m5, pick: .curatedFlashNextOptimizedSpeed)
+        XCTAssertEqual(s.resolvedModel?.id, "flash-next-optimized-speed")
+        XCTAssertEqual(s.resolvedRepoID, "Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed")
+        XCTAssertEqual(s.resolvedModelFamily, "qwen4_exp")
+        XCTAssertFalse(s.supportsTune)
+    }
+
+    func testResolvedModelForFlashNextHasNoFP16SwapOnLegacyApple() {
+        // Flash-Next has no FP16 sibling (modern-tier-only packs), so the
+        // legacy swap the 3.8 trio gets must NOT fire here.
+        let m1 = DetectedHardware(
+            chipName: "Apple M1 Max",
+            appleSiliconGeneration: "m1",
+            unifiedMemoryBytes: 64 * 1_073_741_824
+        )
+        let bare = OnboardingFeatureState(hardware: m1, pick: .curatedFlashNextBareSpeed)
+        let optimized = OnboardingFeatureState(hardware: m1, pick: .curatedFlashNextOptimizedSpeed)
+        XCTAssertEqual(bare.resolvedModel?.id, "flash-next-bare-speed")
+        XCTAssertEqual(optimized.resolvedModel?.id, "flash-next-optimized-speed")
     }
 
     func testResolvedModelForStepIsHeldOutOfReleaseCatalog() {

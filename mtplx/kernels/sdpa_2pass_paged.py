@@ -214,7 +214,11 @@ def _paged_partials_dynamic_offset_kernel():
         thread U q[qk_per_thread];
         thread U o[v_per_thread] = {0};
 
-        const int N = static_cast<int>(offset);
+        // ``offset`` is an int32 mx.array input (device pointer), not a
+        // host scalar: static_cast<int>(offset) never compiled — this
+        // kernel was dead on arrival behind its python mask gate
+        // (found 2026-08-26 by the tailmask-elide equivalence test).
+        const int N = offset[0];
         const int kv_head_idx = threadgroup_position_in_grid.x;
         const int batch_idx = threadgroup_position_in_grid.y;
         const int block_idx = threadgroup_position_in_grid.z;
@@ -444,6 +448,11 @@ def sdpa_2pass_paged_tail_dynamic_offset(
 
     queries = mx.contiguous(queries)
     gqa_factor = int(hq) // hk
+    if 32 * gqa_factor * int(q_len) > 1024:
+        # Metal threadgroup ceiling: BD(32) x gqa x q_len rows must fit in
+        # 1024 threads — at GQA 6 that is q_len <= 5. Launching past it
+        # raises; decline instead (2026-08-26, found by the elide test).
+        return None
     capacity = int(key_cache.shape[0]) * int(block_size)
     static_offset = int(max_offset) if max_offset is not None else capacity
     static_offset = max(1, min(static_offset, capacity))
@@ -456,6 +465,12 @@ def sdpa_2pass_paged_tail_dynamic_offset(
     if partials_kernel is None or reduce_kernel is None:
         return None
 
+    # A 0-d size-1 array passes the gate above but binds BY VALUE in
+    # mx.fast.metal_kernel, so the source's ``offset[0]`` fails to compile
+    # (the TensorOffset adapter hands a 0-d offset; serve hands shape [1]).
+    # Reshape to [1] so the offset always binds as a device pointer.
+    offset_input = offset.astype(mx.int32).reshape(1)
+
     partial_shape = (int(bsz), int(hq), int(q_len), int(blocks), int(vdim))
     stats_shape = (int(bsz), int(hq), int(q_len), int(blocks))
     partials, sums, maxs = partials_kernel(
@@ -463,7 +478,7 @@ def sdpa_2pass_paged_tail_dynamic_offset(
             queries,
             key_cache,
             value_cache,
-            offset.astype(mx.int32),
+            offset_input,
             float(scale),
             int(blocks),
         ],

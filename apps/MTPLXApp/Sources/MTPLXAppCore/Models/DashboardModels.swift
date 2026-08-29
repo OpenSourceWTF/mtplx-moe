@@ -1003,6 +1003,48 @@ public struct MemSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// The daemon's machine memory plan (issue #305): what fits this Mac, what
+/// the serving defaults resolved to, and whether the user overcommitted.
+/// Absent on daemons built before the memory governor shipped.
+public struct MemoryPlanStatus: Codable, Equatable, Sendable {
+    public var available: Bool
+    public var unavailableReason: String?
+    public var totalRamBytes: Int?
+    public var usableBytes: Int?
+    public var modelWeightsBytes: Int?
+    /// Flash-Next n-gram table bytes when it streams from SSD (file-backed,
+    /// reclaimable — deliberately NOT in weights or Active). Nil/0 for
+    /// every other model and when the table is RAM-resident.
+    public var ngramTableStreamedBytes: Int?
+    public var contextWindowFit: Int?
+    public var contextWindowResolved: Int?
+    public var contextMachineBound: Bool?
+    public var contextOvercommitted: Bool?
+    public var modelFits: Bool?
+    public var bankIdleMaxBytes: Int?
+    public var bankSteadyBytes: Int?
+    public var headroomBytes: Int?
+    public var notes: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case available
+        case unavailableReason = "unavailable_reason"
+        case totalRamBytes = "total_ram_bytes"
+        case usableBytes = "usable_bytes"
+        case modelWeightsBytes = "model_weights_bytes"
+        case ngramTableStreamedBytes = "ngram_table_streamed_bytes"
+        case contextWindowFit = "context_window_fit"
+        case contextWindowResolved = "context_window_resolved"
+        case contextMachineBound = "context_machine_bound"
+        case contextOvercommitted = "context_overcommitted"
+        case modelFits = "model_fits"
+        case bankIdleMaxBytes = "bank_idle_max_bytes"
+        case bankSteadyBytes = "bank_steady_bytes"
+        case headroomBytes = "headroom_bytes"
+        case notes
+    }
+}
+
 public struct ThermalFan: Codable, Equatable, Sendable {
     public var rpm: Int?
     public var targetRpm: Int?
@@ -1326,6 +1368,24 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
     /// Absent on daemons built before retrieval shipped, so it decodes to a
     /// disabled status rather than failing the whole snapshot.
     public var retrieval: RetrievalStatus?
+    /// macOS/allocator memory pressure (1 normal, 2 warning, 4 critical;
+    /// 0/absent unknown) and the machine memory plan. Both absent on
+    /// pre-governor daemons.
+    public var memoryPressureLevel: Int?
+    /// Which signal produced the level: "macos" (system-wide pressure,
+    /// often another process allocating) or "allocator" (this engine's
+    /// Metal footprint near its limit). Absent on older daemons.
+    public var memoryPressureSource: String?
+    /// (active+cache)/metal-limit at the same guard tick.
+    public var allocatorFraction: Double?
+    public var memoryPlan: MemoryPlanStatus?
+    /// The guard's action ring (pressure trims, ceiling evictions). The
+    /// level alone says "the allocator ran close to its limit for a tick";
+    /// only these events say caches were actually shed — the banner must
+    /// not claim shedding without one (2026-08-28: warning-level ticks
+    /// during multi-session prefill showed the shedding banner while the
+    /// ring was empty).
+    public var memoryGuardEvents: [MemoryGuardEvent]?
 
     enum CodingKeys: String, CodingKey {
         case ts
@@ -1348,6 +1408,30 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
         case machine
         case uptimeS = "uptime_s"
         case retrieval
+        case memoryPressureLevel = "memory_pressure_level"
+        case memoryPressureSource = "memory_pressure_source"
+        case allocatorFraction = "allocator_fraction"
+        case memoryPlan = "memory_plan"
+        case memoryGuardEvents = "memory_guard_events"
+    }
+}
+
+public struct MemoryGuardEvent: Codable, Equatable, Sendable {
+    public var ts: Double?
+    public var action: String?
+    public var bankEntriesEvicted: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case ts
+        case action
+        case bankEntriesEvicted = "bank_entries_evicted"
+    }
+
+    /// True when this event represents caches actually being given back —
+    /// entries evicted, or the allocation-failure shed (which always
+    /// clears the allocator cache even at zero evictions).
+    public var didShed: Bool {
+        (bankEntriesEvicted ?? 0) > 0 || action == "allocation_failure_shed"
     }
 }
 

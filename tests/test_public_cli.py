@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ from mtplx.profiles import (
     QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
     QWEN38_OPTIMIZED_SPEED_FP16_HF_MODEL_ID,
 )
+from mtplx.reasoning_effort import REASONING_EFFORT_CHOICES
 from mtplx.version import DISPLAY_VERSION, __version__
 
 
@@ -73,13 +75,20 @@ def test_version_metadata_matches_package_metadata():
 
 
 def test_version_command_without_subcommand(capsys):
+    """`--version` names the display version, and the package one only when it differs.
+
+    This used to pin `mtplx <display> (<package>)` unconditionally, which on a
+    release where the two match prints `mtplx 2.10.0 (2.10.0)`.
+    """
     try:
         main(["--version"])
     except SystemExit as exc:
         assert exc.code == 0
 
     captured = capsys.readouterr().out
-    assert f"mtplx {DISPLAY_VERSION} ({__version__})" in captured
+    assert f"mtplx {DISPLAY_VERSION}" in captured
+    if DISPLAY_VERSION != __version__:
+        assert f"mtplx {DISPLAY_VERSION} ({__version__})" in captured
 
 
 def test_runtime_mode_display_respects_ar_mode():
@@ -654,6 +663,459 @@ def test_unknown_command_is_targeted_not_argparse_dump(capsys):
     assert "usage: mtplx" not in captured
 
 
+def _did_you_mean_line(captured: str) -> str | None:
+    for line in captured.splitlines():
+        if "Did you mean" in line:
+            return line
+    return None
+
+
+def test_unknown_command_suggests_the_closest_real_command(capsys):
+    """A typo should point at the command, not just re-print the whole menu."""
+    code = main(["stauts"])
+
+    captured = capsys.readouterr().out
+    suggestion = _did_you_mean_line(captured)
+    assert code == 2
+    assert suggestion is not None, captured
+    assert "status" in suggestion
+
+
+def test_unknown_command_suggests_commands_outside_the_curated_lists(capsys):
+    """The match runs over every registered subcommand, not the help menus."""
+    code = main(["doctro"])
+
+    captured = capsys.readouterr().out
+    suggestion = _did_you_mean_line(captured)
+    assert code == 2
+    assert suggestion is not None, captured
+    assert "doctor" in suggestion
+
+
+def test_unknown_command_invents_no_suggestion_without_a_close_match(capsys):
+    code = main(["zzzzzzzzzz"])
+
+    captured = capsys.readouterr().out
+    assert code == 2
+    assert _did_you_mean_line(captured) is None
+    # Still falls back to the curated menu it always printed.
+    assert "mtplx setup" in captured
+
+
+def test_version_prints_the_version_once_when_display_matches_package(capsys):
+    """`mtplx 2.10.0 (2.10.0)` reads as a bug; the parenthetical must earn itself."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+
+    printed = capsys.readouterr().out.strip()
+    assert excinfo.value.code == 0
+    if DISPLAY_VERSION == __version__:
+        assert printed == f"mtplx {DISPLAY_VERSION}"
+        assert printed.count(DISPLAY_VERSION) == 1
+    else:
+        assert printed == f"mtplx {DISPLAY_VERSION} ({__version__})"
+
+
+def test_curated_help_names_only_real_commands():
+    """Every curated help row must name a command the parser actually registers."""
+    from mtplx.cli import ADVANCED_COMMANDS, PUBLIC_COMMANDS, _parser_command_names
+
+    registered = _parser_command_names(build_parser())
+    public_names = {name for name, _ in PUBLIC_COMMANDS}
+    # Rows name a family ("bench *") or a subcommand ("model publish-check");
+    # the head token is the registered command in both shapes.
+    advanced_names = {
+        command.split()[0] for rows in ADVANCED_COMMANDS.values() for command, _ in rows
+    }
+
+    assert public_names <= registered, sorted(public_names - registered)
+    assert advanced_names <= registered, sorted(advanced_names - registered)
+
+
+def test_curated_help_stops_hiding_shipped_commands():
+    """run/chat/serve and the scripting surface shipped undocumented by help."""
+    from mtplx.cli import ADVANCED_COMMANDS, PUBLIC_COMMANDS
+
+    public_names = {name for name, _ in PUBLIC_COMMANDS}
+    advanced_names = {
+        command.split()[0] for rows in ADVANCED_COMMANDS.values() for command, _ in rows
+    }
+
+    assert {"run", "chat", "serve"} <= public_names
+    assert {
+        "list",
+        "remove",
+        "config",
+        "env",
+        "dashboard",
+        "integrate",
+    } <= advanced_names
+
+
+def test_help_renders_the_newly_listed_commands(capsys):
+    code = main(["help", "commands"])
+
+    captured = capsys.readouterr().out
+    assert code == 0
+    for name in ("run", "chat", "serve", "list", "remove", "env", "dashboard"):
+        assert f"\n  {name} " in captured, name
+    assert "Server and scripting" in captured
+
+
+def _reasoning_options(parser, command: str) -> dict[str, tuple[str, ...] | None]:
+    """Every ``--reasoning*`` flag on one subcommand, with its choices."""
+    import argparse
+
+    sub = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    return {
+        option: (tuple(action.choices) if action.choices else None)
+        for action in sub.choices[command]._actions
+        for option in action.option_strings
+        if option.startswith("--reasoning")
+    }
+
+
+def test_public_oneshot_commands_share_the_reasoning_surface():
+    """ask/run/chat run the same handler, so their reasoning dials must match.
+
+    `ask` is `cmd_run_public` under another name. It shipped without
+    `--reasoning-effort` while its two siblings had it, which is a silent
+    behaviour split inside one code path.
+    """
+    parser = build_parser()
+
+    ask = _reasoning_options(parser, "ask")
+    run = _reasoning_options(parser, "run")
+    chat = _reasoning_options(parser, "chat")
+
+    assert ask == run == chat
+    assert ask["--reasoning-effort"] == tuple(REASONING_EFFORT_CHOICES)
+    assert ask["--reasoning"] == ("auto", "on", "off")
+
+
+def test_hardware_human_output_does_not_read_as_a_failed_check(monkeypatch, capsys):
+    """`confirmed: false` on a flagship Mac looked like the hardware failed."""
+    import mtplx.hardware as hardware
+
+    monkeypatch.setattr(
+        hardware,
+        "inspect_hardware",
+        lambda: {
+            "chip": "Apple M5 Max",
+            "macos_version": "26.2",
+            "mlx_version": "0.31.0",
+            "m5_neural_accelerator_eligible": True,
+            "hardware_acceleration_eligible": True,
+            "hardware_acceleration_confirmed": False,
+            "hardware_acceleration_confirmation": "not_profiled",
+            "warnings": [],
+        },
+    )
+
+    code = main(["hardware", "inspect"])
+
+    captured = capsys.readouterr().out
+    assert code == 0
+    assert "hardware acceleration confirmed: false" not in captured
+    assert "acceleration profile: not measured by this command" in captured
+    assert "M5 TensorOps eligible: true" in captured
+
+
+def test_hardware_json_still_carries_the_confirmation_fields(monkeypatch, capsys):
+    import mtplx.hardware as hardware
+
+    monkeypatch.setattr(
+        hardware,
+        "inspect_hardware",
+        lambda: {
+            "chip": "Apple M5 Max",
+            "hardware_acceleration_eligible": True,
+            "hardware_acceleration_confirmed": False,
+            "hardware_acceleration_confirmation": "not_profiled",
+            "warnings": [],
+        },
+    )
+
+    code = main(["hardware", "inspect", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["hardware_acceleration_confirmed"] is False
+    assert payload["hardware_acceleration_confirmation"] == "not_profiled"
+
+
+class _PipedStdin(io.StringIO):
+    """Stdin as a shell pipe hands it over: readable, and never a terminal."""
+
+    def isatty(self) -> bool:
+        return False
+
+
+class _TerminalStdin(io.StringIO):
+    """An interactive stdin. Reading it would block a real session, so it raises."""
+
+    def isatty(self) -> bool:
+        return True
+
+    def read(self, *args, **kwargs):  # pragma: no cover - must never be called
+        raise AssertionError("the CLI must not drain an interactive stdin")
+
+
+def _one_shot_args(**overrides):
+    args = dict(
+        prompt=None,
+        prompt_arg=None,
+        model="/tmp/model",
+        cache_dir=None,
+        unsafe_force_unverified=False,
+        yes=True,
+        profile="sustained",
+        max=False,
+        system=None,
+        max_tokens=8,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        depth=3,
+        seed=0,
+        expect_python=False,
+        no_mtp=False,
+        load_mtp=True,
+        reasoning=None,
+        reasoning_effort="auto",
+        reasoning_parser="qwen3",
+        _cli_flags=set(),
+    )
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+def _stub_one_shot_generation(monkeypatch) -> dict[str, object]:
+    """Stub everything past the prompt so no model loads and no tokens generate.
+
+    Returns a dict capturing what actually reached the generation entry.
+    """
+    # The one-shot path applies a profile, which writes MTPLX_* keys into the
+    # process env for the rest of the CLI lifetime. Without this copy they leak
+    # into every later in-process test.
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    seen: dict[str, object] = {}
+
+    fake_runtime = ModuleType("mtplx.runtime")
+    fake_runtime.load = lambda *a, **kw: SimpleNamespace(tokenizer=object())
+
+    fake_schema = ModuleType("mtplx.benchmarks.schema")
+    fake_schema.PromptCase = lambda **kw: SimpleNamespace(**kw)
+
+    def _encode(_tokenizer, case, **kwargs):
+        seen["prompt"] = case.prompt
+        seen["messages"] = case.messages
+        seen["reasoning_effort"] = kwargs.get("reasoning_effort")
+        return [1, 2, 3]
+
+    fake_schema.encode_prompt_case = _encode
+
+    fake_generation = ModuleType("mtplx.generation")
+    fake_generation.generate_mtpk = lambda *a, **kw: SimpleNamespace(
+        text="ok",
+        tokens=[1],
+        stats=SimpleNamespace(
+            generated_tokens=1, tok_s=1.0, verify_time_s=0.0, verify_calls=0
+        ),
+    )
+    fake_generation.generate_ar = fake_generation.generate_mtpk
+
+    # `mtplx.sampling` stays real on purpose: stubbing it breaks the lazy
+    # `from mtplx.sampling import Distribution` inside `mtplx.batched_decode`,
+    # which the memory preflight pulls in, and makes the test pass or fail on
+    # nothing but file ordering. `SamplerConfig` is a cheap CPU-only dataclass.
+    monkeypatch.setitem(sys.modules, "mtplx.runtime", fake_runtime)
+    monkeypatch.setitem(sys.modules, "mtplx.benchmarks.schema", fake_schema)
+    monkeypatch.setitem(sys.modules, "mtplx.generation", fake_generation)
+    monkeypatch.setattr(
+        public,
+        "_resolve_runtime_model_path",
+        lambda model, cache_dir=None: ("/tmp/model", None),
+    )
+    monkeypatch.setattr(public, "_model_gate", lambda *a, **kw: ({}, None))
+    return seen
+
+
+@pytest.mark.parametrize("command", ["run", "ask", "chat"])
+def test_one_shot_takes_its_prompt_from_a_pipe(monkeypatch, command):
+    """`echo "..." | mtplx run` used to die with "requires a prompt"."""
+    seen = _stub_one_shot_generation(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", _PipedStdin("summarize this diff\n"))
+
+    code, _payload, _validations = public._generate_one_shot_public(
+        _one_shot_args(), command=command
+    )
+
+    assert code == 0
+    assert seen["prompt"] == "summarize this diff"
+
+
+def test_one_shot_prefers_an_explicit_prompt_over_the_pipe(monkeypatch):
+    seen = _stub_one_shot_generation(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", _PipedStdin("piped text"))
+
+    code, _payload, _validations = public._generate_one_shot_public(
+        _one_shot_args(prompt="flag text"), command="run"
+    )
+
+    assert code == 0
+    assert seen["prompt"] == "flag text"
+
+
+def test_one_shot_still_requires_a_prompt_when_the_pipe_is_empty(monkeypatch):
+    _stub_one_shot_generation(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", _PipedStdin("   \n  "))
+
+    with pytest.raises(SystemExit, match="requires a prompt"):
+        public._generate_one_shot_public(_one_shot_args(), command="run")
+
+
+def test_one_shot_never_drains_an_interactive_stdin(monkeypatch):
+    """Reading a terminal stdin would hang the CLI instead of erroring."""
+    _stub_one_shot_generation(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", _TerminalStdin("should never be read"))
+
+    with pytest.raises(SystemExit, match="requires a prompt"):
+        public._generate_one_shot_public(_one_shot_args(), command="run")
+
+
+def test_piped_prompt_text_survives_an_unreadable_stdin(monkeypatch):
+    """A captured or detached stdin means "no piped prompt", not a crash."""
+
+    class _Unreadable(io.StringIO):
+        def isatty(self) -> bool:
+            return False
+
+        def read(self, *args, **kwargs):
+            raise OSError("reading from stdin while output is captured")
+
+    monkeypatch.setattr(sys, "stdin", _Unreadable())
+    assert public._piped_prompt_text() == ""
+
+    monkeypatch.setattr(sys, "stdin", None)
+    assert public._piped_prompt_text() == ""
+
+
+def _stub_effort_codec(monkeypatch, levels=("low", "medium", "high", "xhigh")):
+    """Pin a family that declares effort levels, independent of model lookup."""
+    codec = SimpleNamespace(
+        supported=True,
+        effort_levels=tuple(levels),
+        default_effort="medium",
+        default_mode="auto",
+        parser="qwen3",
+    )
+    monkeypatch.setattr(public, "reasoning_policy_for_model", lambda **_kw: codec)
+    return codec
+
+
+def test_ask_reasoning_effort_reaches_the_prompt_encoder(monkeypatch):
+    """The new `ask` flag must change the encode, not just parse."""
+    seen = _stub_one_shot_generation(monkeypatch)
+    _stub_effort_codec(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", _TerminalStdin(""))
+
+    code, _payload, _validations = public._generate_one_shot_public(
+        _one_shot_args(prompt="hi", reasoning_effort="xhigh"), command="ask"
+    )
+
+    assert code == 0
+    assert seen["reasoning_effort"] == "xhigh"
+
+
+def test_effort_slash_command_sets_the_value_the_turn_path_reads(monkeypatch):
+    """`/effort <level>` and the generate path must agree on one attribute."""
+    _stub_effort_codec(monkeypatch)
+    args = SimpleNamespace(reasoning_effort="auto")
+
+    assert public._handle_quickstart_effort_command(args, "/effort high") is True
+    assert args.reasoning_effort == "high"
+    # This is the exact resolver `_quickstart_generate` calls each turn.
+    assert public._one_shot_reasoning_effort(args, True, "/tmp/model") == "high"
+
+
+def test_effort_slash_command_reports_status_without_changing_state(capsys):
+    args = SimpleNamespace(reasoning_effort="low")
+
+    assert public._handle_quickstart_effort_command(args, "/effort status") is True
+
+    captured = capsys.readouterr().out
+    assert args.reasoning_effort == "low"
+    assert "low" in captured
+
+
+def test_effort_slash_command_rejects_a_bad_level_and_ignores_other_input():
+    args = SimpleNamespace(reasoning_effort="auto")
+
+    assert public._handle_quickstart_effort_command(args, "/effort nonsense") is True
+    assert args.reasoning_effort == "auto", "a bad level must not be stored"
+    assert public._handle_quickstart_effort_command(args, "/stats") is False
+    assert public._handle_quickstart_effort_command(args, "hello there") is False
+
+
+def test_chat_line_editing_installs_readline_history(monkeypatch, tmp_path):
+    """Arrow keys printed `^[[A` because nothing ever imported readline."""
+    history = tmp_path / "nested" / "history"
+    registered: list[object] = []
+    monkeypatch.setattr(public, "CHAT_HISTORY_PATH", history)
+    monkeypatch.setattr(public, "_CHAT_LINE_EDITING", False)
+    monkeypatch.setattr(public.atexit, "register", registered.append)
+
+    public._enable_chat_line_editing()
+
+    readline = pytest.importorskip("readline")
+    assert public._CHAT_LINE_EDITING is True
+    assert readline.get_history_length() == public.CHAT_HISTORY_LENGTH
+    assert registered, "the history file must be written at end of session"
+
+    registered[0]()
+    assert history.exists(), "the parent directory has to be created on save"
+
+
+def test_chat_history_save_survives_an_unwritable_home(monkeypatch, tmp_path):
+    """A read-only home must cost the user history, never the chat session."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file where the history directory would go")
+    registered: list[object] = []
+    monkeypatch.setattr(public, "CHAT_HISTORY_PATH", blocker / "history")
+    monkeypatch.setattr(public, "_CHAT_LINE_EDITING", False)
+    monkeypatch.setattr(public.atexit, "register", registered.append)
+
+    public._enable_chat_line_editing()
+    pytest.importorskip("readline")
+    assert registered
+
+    registered[0]()  # must not raise
+
+
+def test_chat_prompt_brackets_ansi_only_under_readline(monkeypatch):
+    """Unbracketed escapes make readline miscount the prompt and redraw over it."""
+
+    class _TtyOut(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stdout", _TtyOut())
+
+    monkeypatch.setattr(public, "_CHAT_LINE_EDITING", False)
+    plain = public._chat_input_prompt()
+    monkeypatch.setattr(public, "_CHAT_LINE_EDITING", True)
+    bracketed = public._chat_input_prompt()
+
+    assert plain == "\n\033[1;36myou\033[0m\033[1m>\033[0m "
+    assert "\001" not in plain
+    assert bracketed.replace("\001", "").replace("\002", "") == plain
+
+
 def test_start_dry_run_is_consumer_friendly(monkeypatch, tmp_path, capsys):
     """The default start opens the browser chat; the terminal flow lives behind `cli`."""
     monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
@@ -1155,6 +1617,11 @@ def test_serve_defaults_quantized_27b_flagships_to_turbo(monkeypatch, tmp_path, 
         # kernels: live ABBA MTP D3 110/102 vs sustained 90/69 tok/s.
         "Qwen3.5-9B-MTPLX-Optimized-Speed",
         "Qwen3.5-9B-MTPLX-Optimized-Speed-FP16",
+        # Flash-Next serve packs promoted 2026-08-27: turbo rides the
+        # qwen4_exp family fast lane (env octet + family NAX neutralize in
+        # the server), receipts in _TURBO_DEFAULT_PUBLIC_MODEL_IDS.
+        "Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+        "Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
     ):
         model_dir = tmp_path / dir_name
         model_dir.mkdir()
@@ -2348,6 +2815,10 @@ def test_quickstart_public_quality_alias_missing_cache_is_not_no_mtp(tmp_path, c
             "--yes",
             "--warmup-tokens",
             "0",
+            # A real daemon on the default port must not fail this test at
+            # the preflight (exit 2) before the missing-cache path runs.
+            "--port",
+            "18091",
         ]
     )
 
@@ -2355,7 +2826,7 @@ def test_quickstart_public_quality_alias_missing_cache_is_not_no_mtp(tmp_path, c
     assert code == 1
     assert "error: model is not available locally" in captured
     assert "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality" in captured
-    assert "try: mtplx quickstart --download" in captured
+    assert "try: mtplx pull Qwen3.6-27B-MTPLX-Optimized-Quality" in captured
     assert "error: model cannot run with MTPLX" not in captured
     assert "tier: no-MTP" not in captured
 
@@ -2372,6 +2843,8 @@ def test_quickstart_model_id_quality_without_model_loads_quality(tmp_path, capsy
             "--yes",
             "--warmup-tokens",
             "0",
+            "--port",
+            "18092",
         ]
     )
 
@@ -2394,6 +2867,8 @@ def test_serve_model_id_quality_without_model_loads_quality(tmp_path, capsys):
             "--yes",
             "--warmup-tokens",
             "0",
+            "--port",
+            "18093",
         ]
     )
 
@@ -2418,6 +2893,8 @@ def test_quickstart_default_missing_cache_is_not_legacy_models_path(
             "--yes",
             "--warmup-tokens",
             "0",
+            "--port",
+            "18094",
         ]
     )
 
@@ -2908,6 +3385,34 @@ def test_quickstart_pi_dry_run_json(monkeypatch, tmp_path, capsys):
     # Pi rides the general auto resolution (2026-08-21): the family contract
     # owns reasoning history, replacing the 1.0.0-era Pi-only hard "off".
     assert "--preserve-thinking auto" in payload["pi"]["server_command"]
+
+
+def test_pi_provider_merge_owns_compat_but_keeps_user_extras():
+    # ``compat`` is MTPLX's transport contract, not a user preference: a
+    # 2.9.x-era ``supportsReasoningEffort: false`` survived every re-sync via
+    # the user-preserving merge and silently killed Pi's effort dial after
+    # upgrade (found live 2026-08-28). Fresh values win on our keys; a
+    # user-added extra compat key still survives.
+    from mtplx.pi import build_pi_provider_config, merge_pi_provider_config
+
+    existing = {
+        "baseUrl": "http://127.0.0.1:8002/v1",
+        "compat": {
+            "supportsReasoningEffort": False,
+            "maxTokensField": "max_tokens",
+            "userExtraKey": True,
+        },
+        "models": [{"id": "mtplx-old"}],
+    }
+    fresh = build_pi_provider_config(
+        base_url="http://127.0.0.1:8000/v1",
+        model_id="mtplx-flash-next-bare-speed",
+    )
+    merged = merge_pi_provider_config(existing, fresh)
+    assert merged["compat"]["supportsReasoningEffort"] is True
+    assert merged["compat"]["thinkingFormat"] == "qwen"
+    assert merged["compat"]["userExtraKey"] is True
+    assert merged["baseUrl"] == "http://127.0.0.1:8000/v1"
 
 
 def test_start_pi_missing_cli_stops_before_model_check(monkeypatch, tmp_path, capsys):
@@ -5518,6 +6023,9 @@ def test_integrate_opencode_json_uses_mtplx_owned_generation_contract(capsys):
     # codec (so reasoning_content round-trips), the family effort dial
     # (default medium) mirrored into options.reasoningEffort, and OpenCode's
     # built-in effort picker trimmed to the xhigh/medium/low family levels.
+    # Every family level gets an EXPLICIT variant (2026-08-28: OpenCode's
+    # picker only shows levels it has variants for on custom providers, so
+    # implicit builtins hid xhigh/medium/low).
     assert model["reasoning"] is True
     assert model["temperature"] is True
     assert "interleaved" not in model
@@ -5526,6 +6034,9 @@ def test_integrate_opencode_json_uses_mtplx_owned_generation_contract(capsys):
         "none": {"disabled": True},
         "minimal": {"disabled": True},
         "high": {"disabled": True},
+        "low": {"reasoningEffort": "low"},
+        "medium": {"reasoningEffort": "medium"},
+        "xhigh": {"reasoningEffort": "xhigh"},
     }
 
 
@@ -5949,7 +6460,10 @@ def test_serve_dispatches_packaged_openai_server(monkeypatch, capsys):
     assert "[2/6] Model resolved: models/example" in captured
     assert "[3/6] Runtime contract verified" in captured
     assert "Loading the model can take about a minute" in captured
-    assert calls["cmd"][1:3] == ["-m", "mtplx.server.openai"]
+    # -P is load-bearing: without it a serve launched from a directory
+    # containing an mtplx/ folder imports THAT folder's code (the 2026-08-26
+    # battery-contamination bug, commit 5b226817).
+    assert calls["cmd"][1:4] == ["-P", "-m", "mtplx.server.openai"]
     assert "--model" in calls["cmd"]
     assert calls["cmd"][calls["cmd"].index("--api-key") + 1] == "test-key"
     assert calls["cmd"][calls["cmd"].index("--rate-limit") + 1] == "120"
@@ -7686,7 +8200,7 @@ def test_inspect_human_output_is_default(tmp_path, capsys):
     assert f"model: {model}" in captured
     assert "tier: no-MTP" in captured
     assert "can_run: false" in captured
-    assert "message: Model has no MTP head." in captured
+    assert "message: this folder contains no model weights (*.safetensors)." in captured
 
 
 def test_start_gate_failure_is_human_readable_for_config_only_qwen(tmp_path, capsys):
@@ -8485,3 +8999,45 @@ def test_pi_request_policy_extension_respects_user_ownership(tmp_path):
     assert 'const mtplxModelID = "renamed-model"' in extension_path.read_text(
         encoding="utf-8"
     )
+
+
+def test_connect_opencode_actually_writes_the_config(tmp_path, monkeypatch, capsys):
+    """`mtplx connect opencode --model-id X` must register X in the provider
+    models map and set the default model — not just print a config path.
+    Found live 2026-08-27: wiring a day-0 family printed success while the
+    file kept only the old model id, and OpenCode died with
+    ProviderModelNotFoundError dressed as "Unexpected server error"."""
+    import json
+
+    from mtplx.cli import _cmd_connect, build_parser
+
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "mtplx": {"models": {"old-model": {}}},
+                    "unrelated": {"models": {"keep-me": {}}},
+                },
+                "model": "mtplx/old-model",
+            }
+        )
+    )
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(config_path))
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "connect",
+            "opencode",
+            "--port",
+            "18099",
+            "--model-id",
+            "qwen4-new-family-model",
+        ]
+    )
+    assert _cmd_connect(args) == 0
+    written = json.loads(config_path.read_text())
+    models = written["provider"]["mtplx"]["models"]
+    assert "qwen4-new-family-model" in models
+    assert written["model"] == "mtplx/qwen4-new-family-model"
+    assert "unrelated" in written["provider"], "other providers must survive"

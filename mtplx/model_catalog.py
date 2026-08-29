@@ -249,6 +249,53 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
             "Qwen 3.8 Optimized Quality FP16",
         ),
     ),
+    # Qwen 3.8 Flash-Next (day-0 native, 2026-08-26): the 125B-A6B
+    # Qwen4-generation preview (GDN hybrid MoE + Qwen Sparse Attention +
+    # n-gram memory sidecar). The 32 GB n-gram table streams from SSD by
+    # default, so resident peak is weights + MTP + working set, not the full
+    # download size. Big-Mac exclusive: the peak-memory filter hides both
+    # entries below ~96 GB unified memory. Mirrors MTPLXModelOption.
+    CatalogModel(
+        id="flash-next-bare-speed",
+        display_name="Qwen 3.8 Flash-Next Bare Speed",
+        detail="Flat 4-bit quantization. Quickest Flash-Next speeds for chat and coding.",
+        hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+        # Exact byte sum of the published HF repo (2026-08-28 audit); includes
+        # the 32 GB SSD-streamed n-gram table and the vision tower.
+        size_bytes=106_336_812_636,
+        # Weights 72.6 GB + MTP 1.7 GB resident (n-gram on SSD) plus
+        # KV/working headroom at the default profile.
+        peak_memory_gib=78.0,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=(
+            "mtplx-flash-next-bare-speed",
+            "Qwen3.8 Flash-Next Bare Speed",
+            "Flash-Next Bare Speed",
+            "Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+        ),
+    ),
+    CatalogModel(
+        id="flash-next-optimized-speed",
+        display_name="Qwen 3.8 Flash-Next Optimized Speed",
+        detail=(
+            "Dynamic 4-bit quant with 8-bit attention. Higher quality and "
+            "slightly slower. Recommended."
+        ),
+        hf_model_id="Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+        # Exact byte sum of the published HF repo (2026-08-28 audit); includes
+        # the 32 GB SSD-streamed n-gram table and the vision tower.
+        size_bytes=115_061_253_581,
+        # Weights 81.4 GB + MTP 1.7 GB resident (n-gram on SSD) plus
+        # KV/working headroom at the default profile.
+        peak_memory_gib=87.0,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=(
+            "mtplx-flash-next-optimized-speed",
+            "Qwen3.8 Flash-Next Optimized Speed",
+            "Flash-Next Optimized Speed",
+            "Qwen3.8-Flash-Next-MTPLX-Optimized-Speed",
+        ),
+    ),
     CatalogModel(
         id="optimized-speed-v2",
         display_name="Qwen 3.6 27B Optimized Speed V2",
@@ -426,6 +473,8 @@ _MODERN_TOP_RECOMMENDATION_IDS = (
     "qwen38-27b-optimized-speed",
     "qwen38-27b-bare-speed",
     "qwen38-27b-optimized-quality",
+    "flash-next-bare-speed",
+    "flash-next-optimized-speed",
     "optimized-speed-v2",
     "optimized-speed",
     "optimized-quality",
@@ -433,6 +482,14 @@ _MODERN_TOP_RECOMMENDATION_IDS = (
     "qwen36-35b-a3b-optimized-balance",
     "gemma4-optimized-speed",
     "qwen35-9b-optimized-speed",
+)
+
+# Qwen 3.8 Flash-Next pair (2026-08-27): Bare Speed first (the fast
+# flat-4-bit pick), then Optimized Speed. Modern-tier, big-Mac only.
+# Mirrors MTPLXModelOption.flashNextIDs.
+_FLASH_NEXT_IDS = (
+    "flash-next-bare-speed",
+    "flash-next-optimized-speed",
 )
 
 
@@ -546,8 +603,13 @@ def recommended_catalog_ids(
             quality27,
             *tiny_ids,
         ]
+    # Flash-Next rides right behind the 3.8 trio on big modern Macs.
+    # Modern tier only (bf16 packs, no fp16 sibling); the peak-memory
+    # filter in recommended_models hides both entries below ~96 GB.
+    flash_next = list(_FLASH_NEXT_IDS) if chip_tier != LEGACY_TIER else []
     return [
         *trio38,
+        *flash_next,
         *([speed27_v2] if speed27_v2 else []),
         speed27,
         quality27,

@@ -464,6 +464,94 @@ struct ThermalRuleBanner: View {
     }
 }
 
+// MARK: - MemoryGuardBanner
+
+/// Memory governor banner (issue #305). The pressure LEVEL alone only says
+/// the allocator ran close to its limit for a tick — the guard is
+/// edge-triggered, defers while busy, and protects the active session, so
+/// warning ticks during prefill spikes usually shed nothing. The banner
+/// claims shedding only when the guard's event ring shows a recent shed
+/// (2026-08-28: the shedding copy showed on every prefill-boundary tick
+/// with an empty ring, teaching the user that the banner CAUSES the
+/// acceptance-register dips it merely coincides with). Critical always
+/// acts, so its copy is unconditional.
+struct MemoryGuardBanner: View {
+    let pressureLevel: Int
+    let recentShed: Bool
+    /// "macos" = system-wide pressure (often another process allocating);
+    /// "allocator" = this engine's Metal footprint near its limit; nil on
+    /// pre-2.10 daemons. Lets the warning copy name the actual culprit
+    /// (2026-08-28 A/B receipt: an external 26 GB allocation storm dropped
+    /// decode 65→22 tok/s with the engine's guard doing nothing at all —
+    /// the old copy blamed the engine for weather it didn't make).
+    let pressureSource: String?
+    let plan: MemoryPlanStatus?
+
+    var body: some View {
+        if pressureLevel >= 2 {
+            let critical = pressureLevel >= 4
+            let tint = critical ? Brand.danger : Brand.warning
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "memorychip")
+                    .font(.title3)
+                    .foregroundStyle(tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title(critical: critical))
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(tint)
+                    Text(message(critical: critical))
+                        .font(.caption)
+                        .foregroundStyle(Brand.textHighlight.opacity(0.75))
+                }
+                Spacer()
+            }
+            .padding(12)
+            .background {
+                RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                    .fill(tint.opacity(0.12))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                            .strokeBorder(tint.opacity(0.45), lineWidth: Brand.hairlineStrong)
+                    }
+            }
+        }
+    }
+
+    private var externalSource: Bool { pressureSource == "macos" }
+    /// Daemon could not attribute the pressure (allocator probe bailed):
+    /// neither "another process" nor "the allocator" can be claimed.
+    private var unknownSource: Bool { pressureSource == "unknown" }
+
+    private func title(critical: Bool) -> String {
+        if critical { return "Critical memory pressure" }
+        if recentShed { return "Memory pressure — engine shedding caches" }
+        return externalSource ? "System memory pressure" : "Memory running high"
+    }
+
+    private func message(critical: Bool) -> String {
+        var text: String
+        if critical {
+            text = "The engine emptied its caches to avoid swapping. Speed is protected, but warm turns will restore from SSD."
+        } else if recentShed {
+            text = "Warm sessions are being demoted to SSD ahead of any swap. Turns may restore from disk (seconds) instead of RAM."
+        } else if externalSource {
+            text = "Another process is pushing this Mac into memory pressure. Decode can dip while the spike lasts; the engine's own footprint is steady and nothing has been evicted."
+        } else if unknownSource {
+            text = "This Mac is under memory pressure. Nothing has been evicted; caches yield to SSD before any swap if it stays here."
+        } else {
+            text = "The allocator briefly ran near its ceiling (a prefill spike does this). Nothing has been evicted; caches yield to SSD before any swap if it stays here."
+        }
+        if let plan,
+           plan.contextOvercommitted == true,
+           let resolved = plan.contextWindowResolved,
+           let fit = plan.contextWindowFit
+        {
+            text += " Context window \(resolved.formatted()) exceeds this Mac's fit of \(fit.formatted()) tokens. Lower it to stop this recurring."
+        }
+        return text
+    }
+}
+
 // MARK: - ConnectionIssueBanner
 
 /// Top-of-window banner when the SSE connection is reconnecting or failed.

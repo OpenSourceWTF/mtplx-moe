@@ -58,6 +58,29 @@ def test_version_token_refs_keep_the_family(ref: str) -> None:
 @pytest.mark.parametrize(
     "ref",
     [
+        "Qwen/Qwen3.8-Flash-Next",
+        "Qwen/Qwen3.8-Flash-Next-FP8",
+        "qwen3.8-flash-next",
+        "Qwen4-Preview",
+        "qwen4-moe",
+    ],
+)
+def test_next_generation_preview_refs_do_not_claim_the_version_family(ref: str) -> None:
+    # The Qwen4-generation previews carry "3.8" in their public names but
+    # are a different architecture generation with their own contract; the
+    # dense-27B qwen3_8 behavior contract must never claim them by name
+    # (the F21 collision class, pre-armed for the Flash-Next release).
+    assert (
+        model_family_from_inspection(
+            model_ref=ref, descriptor=QWEN3_NEXT_DESCRIPTOR
+        )
+        != "qwen3_8"
+    )
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
         "Qwen/Qwen3-8B",
         "qwen3-8b",
         "Qwen3-80B",
@@ -155,3 +178,69 @@ def test_marker_fallback_without_provenance(tmp_path) -> None:
         )
         == "qwen3_8"
     )
+
+
+# --------------------------------------------------- KV-quant policy per family
+
+
+def test_kv_quant_policy_flash_next_reason_is_specific() -> None:
+    # 2026-08-28 release QA: the app surfaced the anonymous default reason
+    # ("not supported for this model") for Flash-Next because the family had
+    # no branch in kv_quant_policy_for_model. The policy stays unsupported —
+    # the paged KV-quant lane never converts the QSA caches — but the reason
+    # must state the architecture truth, not the generic line.
+    from mtplx.backends.descriptors import kv_quant_policy_for_model
+
+    policy = kv_quant_policy_for_model(
+        model_ref="Qwen3.8-Flash-Next-MTPLX-Bare-Speed"
+    )
+    assert not policy.supported
+    assert policy.to_dict()["modes"] == ["off"]
+    reason = policy.disabled_reason or ""
+    assert "Flash-Next" in reason
+    assert "12 of 48" in reason
+    assert reason != "KV quantization is not supported for this model."
+
+
+def test_kv_quant_policy_27b_keeps_the_validated_modes() -> None:
+    # The dense-27B contract keeps the validated q8/q4 paged lane (memo +
+    # 2-pass q8 kernel, F29 routing) — the Flash-Next branch must not have
+    # narrowed it.
+    from mtplx.backends.descriptors import kv_quant_policy_for_model
+
+    policy = kv_quant_policy_for_model(
+        model_ref="Youssofal/Qwen3.8-27B-MTPLX-Bare-Speed"
+    )
+    assert policy.supported
+    assert policy.to_dict()["modes"] == ["off", "q8", "q4"]
+    assert policy.to_dict()["disabled_reason"] is None
+
+
+def test_flash_next_pack_stamp_owns_the_boot_sampler(tmp_path) -> None:
+    """qwen4_exp launch sampler comes from the artifact's mtplx_runtime.json.
+
+    After the app stopped forwarding the coding-target 0.6 pin (2026-08-28),
+    the zero-flag `mtplx serve` boot path is the ONLY thing standing between
+    an OpenCode Flash-Next launch and the generic 0.6 parser default — the
+    stamp reader must keep resolving the pack's official 1.0/0.95/20.
+    """
+    import json
+
+    from mtplx.server.openai import _model_declared_sampler_defaults
+
+    model = tmp_path / "flash-next"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    (model / "mtplx_runtime.json").write_text(
+        json.dumps({"sampler": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}})
+    )
+    assert _model_declared_sampler_defaults(str(model)) == {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+    }
+
+    # A pack without the sampler stamp falls back to None (parser default
+    # stands) instead of crashing the boot.
+    (model / "mtplx_runtime.json").write_text(json.dumps({}))
+    assert _model_declared_sampler_defaults(str(model)) is None

@@ -31,11 +31,16 @@ DEFAULT_MODEL = (
 DEFAULT_PROMPT_FILE = (
     ROOT / "mtplx/benchmarks/prompts/qwen38_naturalistic_generation_patch.jsonl"
 )
-DEFAULT_CONTEXT_FILE = ROOT / "mtplx/generation.py"
+DEFAULT_CONTEXT_FILE = (
+    ROOT / "mtplx/benchmarks/prompts/qwen38_generation_context.py"
+)
 DEFAULT_GUARD = WORKSPACE_ROOT / "bench/laguna/run_guarded.py"
 DEFAULT_PLIST = Path.home() / "Library/LaunchAgents/com.tea.qwen.plist"
 DEFAULT_LOCK = Path("/tmp/mtplx-gpu-exclusive.lock")
 _CONTENT_SENTINEL = "MTPLX_QWEN38_RESIDENT_OQ4_CONTENT_17E3A1"
+_PRODUCTION_PROMPT_TOKEN_SHA256 = (
+    "74a389866e6ae77542db2063be379cb220f6045c5c45a260f9beaec472346e26"
+)
 _SMOKE_INSTRUCTION = "Write a Python function that adds two integers."
 _PALINDROME_INSTRUCTION = '''Complete this Python function. Return only the function body, with no markdown or explanation.
 
@@ -387,6 +392,13 @@ def _run_guarded_child(args: argparse.Namespace) -> int:
                 target_tokens=args.prompt_tokens,
                 reasoning_effort=args.reasoning_effort,
             )
+            if not args.smoke:
+                prompt_digest = _token_sha256(prompt_ids)
+                if prompt_digest != _PRODUCTION_PROMPT_TOKEN_SHA256:
+                    raise RuntimeError(
+                        "production prompt digest changed: "
+                        f"{prompt_digest} != {_PRODUCTION_PROMPT_TOKEN_SHA256}"
+                    )
         sampler_contract = _sampler_contract(headline=args.headline)
         sampler = SamplerConfig(
             temperature=float(sampler_contract["temperature"]),
