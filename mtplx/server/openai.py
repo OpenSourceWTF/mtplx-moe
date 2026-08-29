@@ -16457,6 +16457,16 @@ async def _memory_pressure_loop(
             bank = getattr(getattr(state, "sessions", None), "bank", None)
             if bank is not None and getattr(bank, "dynamic_ceiling_fn", None):
                 try:
+                    # Re-stamp the activity pin for live requests first: the
+                    # pin is otherwise touched only at restore/put, so one
+                    # turn longer than its 600 s TTL would lose
+                    # protect_active mid-generation.
+                    in_flight = getattr(
+                        getattr(state, "dashboard", None), "in_flight", None
+                    )
+                    touch = getattr(bank, "touch_sessions", None)
+                    if in_flight is not None and callable(touch):
+                        touch(in_flight.session_ids())
                     ceiling = int(bank.effective_max_bytes())
                     if int(bank.total_nbytes) > ceiling + 256 * 1024**2:
                         # protect_active: the ceiling reads the working set

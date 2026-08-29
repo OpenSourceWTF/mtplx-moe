@@ -217,6 +217,17 @@ class InFlightRegistry:
         with self._lock:
             return len(self._handles)
 
+    def session_ids(self) -> list[str]:
+        """Session ids of live requests (memory guard: these sessions'
+        bank entries must keep dynamic-ceiling protection even when one
+        turn outlives the bank's activity-pin TTL)."""
+        with self._lock:
+            return [
+                handle.session_id
+                for handle in self._handles.values()
+                if handle.session_id
+            ]
+
     def _reap_stale_locked(self) -> None:
         now = time.time()
         stale = [

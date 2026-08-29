@@ -513,6 +513,18 @@ class SessionBank:
         self.last_dynamic_ceiling_bytes = ceiling
         return max(1, min(limit, ceiling))
 
+    def touch_sessions(self, session_ids: Any) -> None:
+        """Re-stamp the active pin for in-flight sessions.
+
+        The pin is otherwise touched only at restore() and put() time, so a
+        single generation longer than the 600 s TTL lost dynamic-ceiling
+        protection mid-turn — the memory guard calls this each tick with
+        the live requests' sessions (xhigh turns measured 618-624 s on
+        2026-08-28, already past the TTL).
+        """
+        for session_id in session_ids or ():
+            self._touch_session(str(session_id))
+
     def _touch_session(self, session_id: str | None) -> None:
         if not session_id or self.active_pin_ttl_s <= 0:
             return

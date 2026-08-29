@@ -158,6 +158,23 @@ def test_dynamic_ceiling_enforced_every_tick_even_at_level_normal(monkeypatch):
     assert events and events[-1]["action"] == "dynamic_ceiling"
 
 
+def test_dynamic_ceiling_tick_restamps_in_flight_sessions(monkeypatch):
+    # The activity pin is otherwise touched only at restore/put, so a turn
+    # longer than its 600 s TTL would lose protect_active mid-generation
+    # (xhigh turns measured 618-624 s on 2026-08-28). Each tick re-stamps
+    # the live requests' sessions before enforcing the ceiling.
+    bank = FakeDynamicBank(total=8 << 30, max_bytes=8 << 30, ceiling=2 << 30)
+    bank.touched = []
+    bank.touch_sessions = lambda ids: bank.touched.extend(ids)
+    state = make_state(bank)
+    state.dashboard.in_flight = SimpleNamespace(
+        session_ids=lambda: ["ses_live"]
+    )
+    run_one_tick(state, level=1, monkeypatch=monkeypatch)
+    assert bank.touched == ["ses_live"]
+    assert bank.calls == [(2 << 30, "dynamic_ceiling")]
+
+
 def test_dynamic_ceiling_within_slack_is_left_alone(monkeypatch):
     # 128 MiB over the ceiling is inside the 256 MiB slack: no churn.
     bank = FakeDynamicBank(
