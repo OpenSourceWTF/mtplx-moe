@@ -67,7 +67,7 @@ not be treated as retained work.
 | Parallel n-gram shard acquisition | Did not beat the unchanged production control | reverted |
 | Larger monolithic stage-2/stage-3 MoE fusion | Stage 3 owns a routed/shared reduction and BF16 accumulator rounding; direct fusion needs a global barrier or recomputation and can delay concurrent dispatch | investigate only with an exact arithmetic design and isolated kernel evidence |
 | Dedicated MLX/Metal stream | Upstream `mlx-serve` attempt crashed under thread-local stream behavior and was reverted | rejected; use earlier dependency-chained submission on the default stream |
-| M=2 split-K verifier QMM | Upstream's own depth-one/T=1 table reports 42.0 ms deferred baseline versus 44.6 ms with its verify kernels, despite wins at larger M | isolated exact-shape benchmark only; do not install from topology alone |
+| M=2 split-K verifier QMM | Isolated medians beat stock by 3.75% at `K2560xN13952`, 2.76% at `K2560xN16480`, and 0.60% at the LM head; forced two-way split was best for the Q4 attention output. The exact production run fell from the 69.7388 TPS frontier to 68.4443 TPS (-1.86%). Artifact inspection also proved the 36 GDN output projections are Q5/G128, so the synthetic Q4 `K7680xN2560` split sweep was not a production fit | rejected and fully reverted; isolated wins did not survive mixed scheduling |
 
 ## `mlx-serve` candidates
 
@@ -78,7 +78,7 @@ not be treated as retained work.
 | `d032c1f`, `49610d7` | Device top-k/top-p/categorical sampling with row-axis-correct top-k | Fits temperature 1/top-k 20; preserve the target/draft RNG contract and exact p/q distributions | candidate building block |
 | `1e32a74` | Batch stochastic acceptance, correction samples, and recurrent-state capture into one async submission | Strong fit for the 0.598/0.325/0.174-second decision gaps after Qwen4 state ownership is proven | high-priority |
 | `1c5c58f`, `f9648b9` | Bundle cache materialization, lazy token, and next forward in one async submission | Scheduling principle applies; Qwen4 PLE and auxiliary cache semantics differ | audit |
-| `441f718`, `49610d7` | Split-K affine quantized matmul for verifier M=2-7, including a wide-message route for N at least 100,000 | Physical M=2, K=2560, Q4/G32, and most N values fit; small N stays stock. It changes FP32 reduction order and upstream's aggregate T=1 result regressed, so only isolated per-shape evidence can promote it | highest-priority compute experiment, not yet retained |
+| `441f718`, `49610d7` | Split-K affine quantized matmul for verifier M=2-7, including a wide-message route for N at least 100,000 | Physical M=2 shapes were tested with construction-bound exact routes; despite isolated wins, the exact production lane regressed 1.86%. Larger M may still differ | rejected for Qwen4 depth-one M=2 |
 | `2d54af8` | QSA fused mask/split-row kernels | Reported gates favor qL at least 16 or qL*gqa above the M=2 Qwen4 geometry | likely no fit at depth 1 |
 | `a1abe17`, `02322db`, `b195610` | Qwen4 HC, GDN, and decode fusion | Compare field by field with MTPLX's retained hyper/GDN routes before considering any code | verifier audit |
 | `b243069` | Grouped-expert NAX experiment | Upstream measured about a 9% regression and did not ship it; MTPLX already has a fixed Qwen4 whole-MoE lane | rejected upstream |
@@ -107,7 +107,6 @@ not be treated as retained work.
 
 | Candidate | Intended reduction | Required gate |
 |---|---|---|
-| Construction-bound M=2 split-K Q4/G32 QMM | Replace stock M=2 quantized matmuls for the large Qwen4 projections; use a separate huge-N geometry for the LM head | Isolated ABBA on each actual `(K,N)` shape first, parity at the agreed ULP tolerance, then repeated exact 16K/1K TPS and utilization |
 | Fuse top-10 route normalization into the row-owned MoE router | Remove the separate FP32 `block_softmax` launch after each routed layer without building a monolithic MoE kernel | Preserve precise-softmax semantics closely enough for end-to-end parity, measure launch savings, and verify no dispatch-overlap regression |
 | Construction-bound device stochastic decision graph | Collapse p/q acceptance, residual correction, accepted-prefix selection, and the next lazy token submission | Preserve temperature-1 top-k/top-p probability and RNG laws; prove Qwen4 cache/QSA/GDN/PLE ownership at the committed prefix |
 | Draft-dependent n-gram row pipeline | Hide synchronous row acquisition behind already-enqueued draft work | Prove exact row identity and storage layout; report row-hit/miss timing outside the measured hot path and exact production TPS |
@@ -131,11 +130,11 @@ of the same pressure and must not be added to the 2.3191-second GPU-idle total.
 
 ## Next measured gates
 
-1. Isolate the M=2 split-K QMM on every actual Qwen4 projection shape; discard
-   it unless it beats stock MLX before any production wiring.
+1. Fuse selected top-10 normalization into the existing row-owned route
+   finalizer and remove only the separate tiny softmax launch.
 2. Prototype a construction-bound M=2 device p/q acceptance plus residual
    decision graph; no enabled hot-path eligibility checks or fallback.
 3. Re-profile exact 16K/1K and retain only if repeated decode TPS improves and
    GPU idle/utilization does not regress.
-4. Evaluate split-K verifier QMM only after proving which current Qwen4 M=2
-   projections it replaces and preserving the target path's arithmetic contract.
+4. Keep the rejected M=2 split-K result as a geometry warning; do not retry it
+   without a materially different mixed-scheduling design.
