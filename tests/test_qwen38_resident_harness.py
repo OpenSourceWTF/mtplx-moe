@@ -54,6 +54,7 @@ def test_production_workload_is_16k_1k_thinking_sampler_contract() -> None:
     assert (args.prompt_tokens, args.max_tokens) == (16_384, 1_024)
     assert args.ngram_cache_gib == 1
     assert harness._benchmark_lane_environment(args) == {
+        "MTPLX_COMPILED_VERIFY": "1",
         "MTPLX_FUSE_PROJ": "gdn,attn,hyper,ple",
         "MTPLX_QWEN4_WHOLE_MOE_M2": "1",
         "MTPLX_QWEN4_HYPER_M2": "1",
@@ -181,6 +182,7 @@ def test_outer_harness_forwards_explicit_stock_lane_control() -> None:
             "none",
             "--no-whole-moe-m2",
             "--no-hyper-m2",
+            "--no-compiled-verify",
         ]
     )
 
@@ -189,7 +191,10 @@ def test_outer_harness_forwards_explicit_stock_lane_control() -> None:
     assert command[command.index("--fuse-proj") + 1] == "none"
     assert "--no-whole-moe-m2" in command
     assert "--no-hyper-m2" in command
-    assert harness._benchmark_lane_environment(args) == {}
+    assert "--no-compiled-verify" in command
+    assert harness._benchmark_lane_environment(args) == {
+        "MTPLX_COMPILED_VERIFY": "0",
+    }
 
 
 def test_receipt_includes_existing_generation_timing_breakdown() -> None:

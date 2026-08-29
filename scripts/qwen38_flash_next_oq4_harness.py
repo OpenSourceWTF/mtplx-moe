@@ -61,6 +61,7 @@ _VANITY_SAMPLER = {
     "repetition_penalty": 1.0,
 }
 _BENCHMARK_LANE_ENV_KEYS = (
+    "MTPLX_COMPILED_VERIFY",
     "MTPLX_FUSE_PROJ",
     "MTPLX_QWEN4_WHOLE_MOE_M2",
     "MTPLX_QWEN4_HYPER_M2",
@@ -92,7 +93,9 @@ def _sampler_contract(*, headline: bool) -> dict[str, float | int]:
 def _benchmark_lane_environment(args: argparse.Namespace) -> dict[str, str]:
     """Resolve the construction-time lanes for this benchmark process."""
 
-    environment: dict[str, str] = {}
+    environment = {
+        "MTPLX_COMPILED_VERIFY": "1" if args.compiled_verify else "0",
+    }
     fuse_proj = str(args.fuse_proj).strip()
     if fuse_proj and fuse_proj.lower() != "none":
         environment["MTPLX_FUSE_PROJ"] = fuse_proj
@@ -534,6 +537,9 @@ def _outer_command(args: argparse.Namespace) -> list[str]:
     ]
     forwarded.append("--whole-moe-m2" if args.whole_moe_m2 else "--no-whole-moe-m2")
     forwarded.append("--hyper-m2" if args.hyper_m2 else "--no-hyper-m2")
+    forwarded.append(
+        "--compiled-verify" if args.compiled_verify else "--no-compiled-verify"
+    )
     if args.smoke:
         forwarded.append("--smoke")
     if args.headline:
@@ -626,6 +632,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--hyper-m2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--compiled-verify",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
