@@ -429,7 +429,9 @@ def plan_memory(
     )
 
 
-def transient_reserve_bytes(peak_bytes: int, active_bytes: int) -> int:
+def transient_reserve_bytes(
+    peak_bytes: int, active_bytes: int, *, play_bytes: int | None = None
+) -> int:
     """Headroom to hold back from the bank for the next allocation spike.
 
     The static RUNTIME_TRANSIENTS_BYTES (3 GiB) underestimates a deep
@@ -446,10 +448,18 @@ def transient_reserve_bytes(peak_bytes: int, active_bytes: int) -> int:
     now. Their difference overstates the instantaneous spike when active
     has since fallen — overstating is the safe direction here (an extra
     SSD restore costs seconds; a ceiling kiss costs the banner plus shed
-    churn on every long turn).
+    churn on every long turn) — but only up to a point: on a model whose
+    weights leave little play (Flash-Next: 77 G weights against a 96 GiB
+    limit leaves ~18 G), an uncapped lifetime spike would permanently eat
+    the whole bank budget after one deep turn. ``play_bytes``
+    (usable − weights) caps the reserve at half the play, so the warm
+    cache always keeps at least the other half.
     """
     spike = max(0, int(peak_bytes) - max(0, int(active_bytes)))
-    return max(RUNTIME_TRANSIENTS_BYTES, min(TRANSIENT_RESERVE_CAP_BYTES, spike))
+    cap = TRANSIENT_RESERVE_CAP_BYTES
+    if play_bytes is not None and int(play_bytes) > 0:
+        cap = min(cap, max(RUNTIME_TRANSIENTS_BYTES, int(play_bytes) // 2))
+    return max(RUNTIME_TRANSIENTS_BYTES, min(cap, spike))
 
 
 def bank_dynamic_ceiling(

@@ -284,6 +284,16 @@ def test_transient_reserve_tracks_the_observed_spike() -> None:
         transient_reserve_bytes(120 * GIB, 80 * GIB)
         == TRANSIENT_RESERVE_CAP_BYTES
     )
+    # Tight-play models (Flash-Next: 77G weights on a 96G limit leaves
+    # ~18G): the reserve never takes more than half the post-weights play,
+    # so a deep turn's lifetime spike cannot permanently eat the bank.
+    assert transient_reserve_bytes(
+        96 * GIB, 80 * GIB, play_bytes=18 * GIB
+    ) == 9 * GIB
+    # The play cap never pushes the reserve below the static floor.
+    assert transient_reserve_bytes(
+        96 * GIB, 80 * GIB, play_bytes=4 * GIB
+    ) == RUNTIME_TRANSIENTS_BYTES
 
 
 def test_dynamic_ceiling_observed_reserve_shrinks_the_bank_first() -> None:

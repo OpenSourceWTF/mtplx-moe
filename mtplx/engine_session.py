@@ -1409,7 +1409,10 @@ class EngineSessionManager:
                     # tripping the warning banner on every long coding turn
                     # (2026-08-29 receipts).
                     reserve = transient_reserve_bytes(
-                        int(mx.get_peak_memory()), active
+                        int(mx.get_peak_memory()),
+                        active,
+                        play_bytes=int(_plan.usable_bytes)
+                        - int(_plan.model_weights_bytes),
                     )
                     return bank_dynamic_ceiling(
                         _plan, max(0, working), transient_bytes=reserve
