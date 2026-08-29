@@ -39,6 +39,7 @@ STYLE = (
     "max-width:42em;margin:2em auto;padding:0 1em;line-height:1.55;"
     "background:transparent;color:#1d1d1f}"
     "h1,h2{line-height:1.2}"
+    "li{margin:.45em 0}"
     "code{background:#f2f2f4;padding:0 .25em;border-radius:4px}"
     "table{border-collapse:collapse;margin:1em 0}"
     "th,td{border:1px solid rgba(0,0,0,.18);padding:.35em .65em}"
