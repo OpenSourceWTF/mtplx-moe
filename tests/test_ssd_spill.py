@@ -122,15 +122,21 @@ def test_spill_dedupes_against_existing_blobs(tmp_path):
 
 
 def test_spill_succeeds_where_the_staged_queue_cannot(tmp_path, monkeypatch):
-    # A backlog budget of one byte makes put_entry's staged path refuse
-    # everything — the pre-spill world for >4 GiB sessions, shrunk to
-    # test scale. The streaming path must not care.
+    # A 1-byte backlog budget plus a non-empty queue makes put_entry's
+    # staged path refuse — genuine backlog pressure at test scale. (#384
+    # made a lone entry over the budget admit when the queue is EMPTY, so
+    # the refusal now needs pending bytes behind it.) The streaming path
+    # must not care either way.
     monkeypatch.setenv("MTPLX_SSD_WRITER_BACKLOG_BYTES", "1")
     cold = make_cold(tmp_path)
     try:
         bank = SessionBank()
         entry = put_small_entry(bank)
+        with cold._stats_lock:
+            cold._pending_bytes = 1
         assert not cold.put_entry(entry, capabilities=["ar_insert"])
+        with cold._stats_lock:
+            cold._pending_bytes = 0
         assert cold.spill_entry(entry, capabilities=["ar_insert"])
         assert cold.lookup([1, 2, 3, 4, 5], **LOOKUP_IDENTITY) is not None
     finally:

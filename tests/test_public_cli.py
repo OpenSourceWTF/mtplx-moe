@@ -5537,6 +5537,9 @@ def test_integrate_opencode_json_uses_mtplx_owned_generation_contract(capsys):
     # codec (so reasoning_content round-trips), the family effort dial
     # (default medium) mirrored into options.reasoningEffort, and OpenCode's
     # built-in effort picker trimmed to the xhigh/medium/low family levels.
+    # Every family level gets an EXPLICIT variant (2026-08-28: OpenCode's
+    # picker only shows levels it has variants for on custom providers, so
+    # implicit builtins hid xhigh/medium/low).
     assert model["reasoning"] is True
     assert model["temperature"] is True
     assert "interleaved" not in model
@@ -5545,6 +5548,9 @@ def test_integrate_opencode_json_uses_mtplx_owned_generation_contract(capsys):
         "none": {"disabled": True},
         "minimal": {"disabled": True},
         "high": {"disabled": True},
+        "low": {"reasoningEffort": "low"},
+        "medium": {"reasoningEffort": "medium"},
+        "xhigh": {"reasoningEffort": "xhigh"},
     }
 
 

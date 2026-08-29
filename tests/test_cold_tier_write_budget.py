@@ -111,13 +111,37 @@ class TestHourlyWriteBudget:
 
 
 class TestPutEntryIntegration:
-    def test_oversized_backlog_skips_before_serializing(self, tmp_path, monkeypatch):
+    def test_oversized_lone_entry_admits_past_the_backlog_budget(
+        self, tmp_path, monkeypatch
+    ):
+        # #384: an entry bigger than the whole backlog budget used to be
+        # rejected on every attempt even with an empty queue — the SSD tier
+        # was silently off for exactly the long sessions it serves. An empty
+        # queue is not backlog pressure: the lone entry is admitted and
+        # counted by name. (This fake entry then fails to serialize — that
+        # is fine; the admission decision is what this test pins.)
         tier = make_tier(
             tmp_path, monkeypatch, MTPLX_SSD_WRITER_BACKLOG_BYTES="1G"
         )
         try:
+            tier.put_entry(fake_entry(nbytes=2 << 30))
+            assert tier.stats()["admitted_oversized_alone"] == 1
+            assert "skipped_backlog_bytes" not in tier.stats() or (
+                tier.stats()["skipped_backlog_bytes"] == 0
+            )
+        finally:
+            tier.close()
+
+    def test_oversized_behind_pending_still_skips(self, tmp_path, monkeypatch):
+        tier = make_tier(
+            tmp_path, monkeypatch, MTPLX_SSD_WRITER_BACKLOG_BYTES="1G"
+        )
+        try:
+            with tier._stats_lock:
+                tier._pending_bytes = 512 << 20
             assert tier.put_entry(fake_entry(nbytes=2 << 30)) is False
             assert tier.stats()["skipped_backlog_bytes"] == 1
-            assert tier.stats()["writer_backlog_bytes"] == 0
         finally:
+            with tier._stats_lock:
+                tier._pending_bytes = 0
             tier.close()
